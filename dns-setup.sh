@@ -36,7 +36,7 @@ export LC_ALL=C
 export DEBIAN_FRONTEND=noninteractive
 export NEEDRESTART_MODE=a
 
-SCRIPT_VERSION="1.0.0"
+SCRIPT_VERSION="1.0.1"
 
 # ---------------------------------------------------------------------------
 # Paths (all overridable from the environment for testing)
@@ -59,6 +59,7 @@ NGINX_STREAM_CONF="${DS_NGINX_STREAM_CONF:-${NGINX_STREAM_DIR}/dns-setup-relay.c
 NGINX_HTTP_CONF="${DS_NGINX_HTTP_CONF:-/etc/nginx/conf.d/dns-setup-http.conf}"
 NGINX_MAIN="${DS_NGINX_MAIN:-/etc/nginx/nginx.conf}"
 NGINX_MARK="# dns-setup: stream configs"
+NGINX_MARK_END="# dns-setup: end of stream configs"
 
 ACME_ROOT="${DS_ACME_ROOT:-/var/www/dns-setup}"
 RENEW_HOOK="${DS_RENEW_HOOK:-/etc/letsencrypt/renewal-hooks/deploy/dns-setup-reload.sh}"
@@ -186,11 +187,18 @@ setup_logging() {
   exec > >(tee -a "$LOG_FILE") 2>&1
 }
 
+# Must run in the main shell, before anything calls agh_request from a $(...)
+# subshell: a work dir created inside a subshell is lost (and deleted by its
+# EXIT trap) as soon as that subshell returns, and so is the response body.
+init_work_dir() {
+  [[ -n $WORK_DIR ]] && return 0
+  WORK_DIR=$(mktemp -d)
+  AGH_BODY="${WORK_DIR}/agh-body.json"
+  trap 'rm -rf "${WORK_DIR:-}"' EXIT
+}
+
 work_dir() {
-  if [[ -z $WORK_DIR ]]; then
-    WORK_DIR=$(mktemp -d)
-    trap 'rm -rf "${WORK_DIR:-}"' EXIT
-  fi
+  [[ -n $WORK_DIR ]] || init_work_dir
   printf '%s\n' "$WORK_DIR"
 }
 
@@ -489,16 +497,24 @@ ensure_nginx_stream() {
   fi
 }
 
+# The relay file holds stream-context directives (map, server with
+# ssl_preread), so it has to be included inside a stream {} block.
 ensure_nginx_include() {
-  if grep -qF "$NGINX_MARK" "$NGINX_MAIN" 2> /dev/null; then
-    return 0
-  fi
   install -d -m 755 "$NGINX_STREAM_DIR"
   [[ -s $NGINX_MAIN ]] || die "Cannot read ${NGINX_MAIN}."
+  if grep -qF "$NGINX_MARK" "$NGINX_MAIN"; then
+    grep -qF "$NGINX_MARK_END" "$NGINX_MAIN" && return 0
+    # 1.0.0 wrote a bare top-level include, which nginx rejects; replace it.
+    sed -i "\\|^${NGINX_MARK}\$|,+1d" "$NGINX_MAIN"
+  fi
+  if grep -Eq '^[[:space:]]*stream[[:space:]]*\{' "$NGINX_MAIN"; then
+    die "${NGINX_MAIN} already has a stream {} block. Add 'include ${NGINX_STREAM_DIR}/*.conf;' inside it, then re-run."
+  fi
   if [[ -n $(tail -c 1 "$NGINX_MAIN") ]]; then
     printf '\n' >> "$NGINX_MAIN"
   fi
-  printf '%s\ninclude %s/*.conf;\n' "$NGINX_MARK" "$NGINX_STREAM_DIR" >> "$NGINX_MAIN"
+  printf '%s\nstream {\n    include %s/*.conf;\n}\n%s\n' \
+    "$NGINX_MARK" "$NGINX_STREAM_DIR" "$NGINX_MARK_END" >> "$NGINX_MAIN"
 }
 
 disable_stock_site() {
@@ -736,14 +752,13 @@ start_adguard() {
 # ---------------------------------------------------------------------------
 AGH_BODY=""
 
-agh_need_work_dir() {
-  work_dir > /dev/null
-  AGH_BODY="${WORK_DIR}/agh-body.json"
+agh_body() { # first bytes of the last response, for error messages
+  head -c "${1:-300}" "$AGH_BODY" 2> /dev/null || true
 }
 
 agh_request() { # method path [json] -> http code, body in $AGH_BODY
   local method=$1 path=$2 data=${3-}
-  agh_need_work_dir
+  [[ -n $AGH_BODY ]] || die "internal error: init_work_dir was not called."
   : > "$AGH_BODY"
   if [[ -n $data ]]; then
     curl -sS --max-time 30 -b "$COOKIE_FILE" -c "$COOKIE_FILE" \
@@ -761,7 +776,7 @@ agh_get_json() { # path
   local code
   code=$(agh_request GET "$1")
   if [[ $code != 200 ]]; then
-    warn "GET $1 returned HTTP $code: $(head -c 200 "$AGH_BODY" 2> /dev/null)"
+    warn "GET $1 returned HTTP $code: $(agh_body 200)"
     return 1
   fi
   cat "$AGH_BODY"
@@ -771,7 +786,7 @@ agh_post_json() { # path json
   local code
   code=$(agh_request POST "$1" "$2")
   if [[ $code != 200 ]]; then
-    warn "POST $1 returned HTTP $code: $(head -c 300 "$AGH_BODY" 2> /dev/null)"
+    warn "POST $1 returned HTTP $code: $(agh_body)"
     return 1
   fi
   cat "$AGH_BODY"
@@ -795,14 +810,27 @@ agh_login() {
 
 agh_setup_wizard() {
   local body code
+  if ((${#ADMIN_PASS} < 8)); then
+    die "The panel password must be at least 8 characters (AdGuard Home rule)."
+  fi
   say "Configuring AdGuard Home (panel on 127.0.0.1:${PANEL_PORT}, DNS on 0.0.0.0:${DNS_PORT}) ..."
-  body=$(printf '{"web":{"ip":"127.0.0.1","port":%s},"dns":{"ip":"0.0.0.0","port":%s},"username":"%s","password":"%s"}' \
+  # The wizard itself listens on 0.0.0.0:<port>. Asking for 127.0.0.1 on the
+  # same port makes AdGuard test-bind that address while its own wildcard
+  # socket still holds the port, which fails with HTTP 400 "address already in
+  # use". So keep the wizard's address here and move the panel to loopback in
+  # the YAML right after (agh_bind_panel_loopback).
+  body=$(printf '{"web":{"ip":"0.0.0.0","port":%s},"dns":{"ip":"0.0.0.0","port":%s},"username":"%s","password":"%s"}' \
     "$PANEL_PORT" "$DNS_PORT" "$(json_escape "$ADMIN_USER")" "$(json_escape "$ADMIN_PASS")")
   code=$(agh_request POST /control/install/configure "$body")
   if [[ $code != 200 ]]; then
-    die "AdGuard Home rejected the initial setup (HTTP $code): $(head -c 300 "$AGH_BODY" 2> /dev/null)"
+    if [[ $(agh_body) == *"address already in use"* ]]; then
+      warn "Something else holds a port AdGuard needs:"
+      port_holder "$DNS_PORT" udp >&2 || true
+      port_holder "$DNS_PORT" tcp >&2 || true
+    fi
+    die "AdGuard Home rejected the initial setup (HTTP $code): $(agh_body)"
   fi
-  sleep 2
+  agh_bind_panel_loopback
   for _ in {1..30}; do
     if agh_login; then
       return 0
@@ -812,78 +840,102 @@ agh_setup_wizard() {
   die "AdGuard Home did not accept the new credentials."
 }
 
-# Merge the wanted DNS settings into the current config and POST it back.
+# Called once, right after the wizard: move the plain-HTTP panel from
+# 0.0.0.0 to 127.0.0.1 (nginx is the only public entry point) and turn off
+# answering from the server's /etc/hosts. Neither is settable over the API.
+agh_bind_panel_loopback() {
+  local conf="${AGH_DIR}/AdGuardHome.yaml" i
+  for ((i = 0; i < 20; i++)); do
+    [[ -s $conf ]] && break
+    sleep 0.5
+  done
+  [[ -s $conf ]] || die "AdGuard Home did not write ${conf}."
+  systemctl stop "$AGH_UNIT" || die "Could not stop AdGuard Home."
+  sed -i -E \
+    -e '/^http:/,/^[^[:space:]]/ s/^([[:space:]]+address:[[:space:]]*)[^[:space:]]+:([0-9]+)[[:space:]]*$/\1127.0.0.1:\2/' \
+    -e '/^dns:/,/^[^[:space:]]/ s/^([[:space:]]+hostsfile_enabled:[[:space:]]*).*$/\1false/' \
+    "$conf"
+  if ! grep -Eq '^[[:space:]]+address:[[:space:]]*127\.0\.0\.1:' "$conf"; then
+    warn "Could not move the panel to 127.0.0.1 in ${conf}; port ${PANEL_PORT} may be public."
+  fi
+  systemctl start "$AGH_UNIT" || die "Could not start AdGuard Home."
+  wait_port "$PANEL_PORT" tcp 60 || die "AdGuard Home did not come back on 127.0.0.1:${PANEL_PORT}."
+}
+
+# POST only the fields we set: /control/dns_config treats every field as
+# optional and silently ignores names it does not know.
 agh_apply_dns() {
-  local cur merged
+  local payload
   work_dir > /dev/null
-  cur="${WORK_DIR}/dns-info.json"
-  merged="${WORK_DIR}/dns-config.json"
-  agh_get_json /control/dns_info > "$cur" || return 1
+  payload="${WORK_DIR}/dns-config.json"
 
   DS_UPSTREAM_DNS=$(printf '%s\n' "${UPSTREAMS[@]}")
   DS_BOOTSTRAP=$(printf '%s\n' "${BOOTSTRAPS[@]}")
-  DS_ALLOWED=$(printf '%s\n' "${ALLOWED_CIDRS[@]}")
-  export DS_UPSTREAM_DNS DS_BOOTSTRAP DS_ALLOWED
-  export DS_DNS_PORT="$DNS_PORT" DS_RATELIMIT="$RATELIMIT" DS_CACHE="$CACHE_SIZE"
+  export DS_UPSTREAM_DNS DS_BOOTSTRAP
+  export DS_RATELIMIT="$RATELIMIT" DS_CACHE="$CACHE_SIZE"
   export DS_DISABLE_AAAA="$DISABLE_AAAA"
 
-  python3 - "$cur" > "$merged" <<'PY'
+  python3 - > "$payload" <<'PY'
 import json, os, sys
-
-cur = json.load(open(sys.argv[1]))
 
 def env_list(name):
     return [x for x in os.environ.get(name, "").split("\n") if x.strip()]
 
-cur["upstream_dns"] = env_list("DS_UPSTREAM_DNS")
-cur["bootstrap_dns"] = env_list("DS_BOOTSTRAP")
-cur["fallback_dns"] = ["https://dns.google/dns-query"]
-cur["upstream_mode"] = "load_balance"
-cur["bind_hosts"] = ["0.0.0.0"]
-cur["port"] = int(os.environ["DS_DNS_PORT"])
-cur["ratelimit"] = int(os.environ["DS_RATELIMIT"])
-cur["refuse_any"] = True
-cur["cache_size"] = int(os.environ["DS_CACHE"])
-cur["cache_ttl_min"] = 60
-cur["cache_optimistic"] = True
-cur["enable_dnssec"] = True
-cur["serve_plain_dns"] = True
-cur["allowed_clients"] = env_list("DS_ALLOWED")
-cur["aaaa_disabled"] = os.environ.get("DS_DISABLE_AAAA") == "1"
-cur["hostsfile_enabled"] = False
-
-json.dump(cur, sys.stdout)
+json.dump({
+    "upstream_dns": env_list("DS_UPSTREAM_DNS"),
+    "bootstrap_dns": env_list("DS_BOOTSTRAP"),
+    "fallback_dns": ["https://dns.google/dns-query"],
+    "upstream_mode": "load_balance",
+    "ratelimit": int(os.environ["DS_RATELIMIT"]),
+    # DoH arrives through nginx, so every DoH client shows up as 127.0.0.1.
+    "ratelimit_whitelist": ["127.0.0.1", "::1"],
+    "cache_enabled": True,
+    "cache_size": int(os.environ["DS_CACHE"]),
+    "cache_ttl_min": 60,
+    "cache_optimistic": True,
+    "dnssec_enabled": True,
+    "disable_ipv6": os.environ.get("DS_DISABLE_AAAA") == "1",
+}, sys.stdout)
 PY
 
-  agh_post_json /control/dns_config "$(cat "$merged")" > /dev/null \
+  agh_post_json /control/dns_config "$(cat "$payload")" > /dev/null \
     || die "AdGuard Home rejected the DNS settings."
-  say "DNS upstream, cache and access settings applied."
+  say "DNS upstream and cache settings applied."
+  agh_apply_allowlist
 }
 
-# Push only the client allowlist, leaving upstreams and the rest untouched.
+# Push only the client allowlist (/control/access/set), keeping the
+# disallowed clients and blocked hosts that were set in the panel.
 agh_apply_allowlist() {
-  local cur merged
+  local cur payload
   work_dir > /dev/null
-  cur="${WORK_DIR}/dns-info.json"
-  merged="${WORK_DIR}/dns-allow.json"
-  agh_get_json /control/dns_info > "$cur" || return 1
+  cur="${WORK_DIR}/access-list.json"
+  payload="${WORK_DIR}/access-set.json"
+  agh_get_json /control/access/list > "$cur" || die "Could not read the AdGuard Home access list."
   DS_ALLOWED=$(printf '%s\n' "${ALLOWED_CIDRS[@]}")
   export DS_ALLOWED
-  python3 - "$cur" > "$merged" <<'PY'
+  python3 - "$cur" > "$payload" <<'PY'
 import json, os, sys
 
 cur = json.load(open(sys.argv[1]))
-cur["allowed_clients"] = [x for x in os.environ.get("DS_ALLOWED", "").split("\n") if x.strip()]
-json.dump(cur, sys.stdout)
+json.dump({
+    "allowed_clients": [x for x in os.environ.get("DS_ALLOWED", "").split("\n") if x.strip()],
+    "disallowed_clients": cur.get("disallowed_clients") or [],
+    "blocked_hosts": cur.get("blocked_hosts") or [],
+}, sys.stdout)
 PY
-  agh_post_json /control/dns_config "$(cat "$merged")" > /dev/null \
+  agh_post_json /control/access/set "$(cat "$payload")" > /dev/null \
     || die "AdGuard Home rejected the allowlist."
-  say "Client allowlist updated."
+  if ((${#ALLOWED_CIDRS[@]} > 0)); then
+    say "Client allowlist applied."
+  else
+    say "No client allowlist: every client may query this DNS."
+  fi
 }
 
 agh_apply_tls() {
   local body resp
-  body=$(printf '{"enabled":true,"server_name":"%s","force_https":false,"port_https":%s,"port_dns_over_tls":%s,"port_dns_over_quic":%s,"port_dnscrypt":0,"certificate_path":"%s","private_key_path":"%s","certificate_chain":"","private_key":"","dnscrypt_config_file":"","strict_sni_check":false,"override_tls_ciphers":[]}' \
+  body=$(printf '{"enabled":true,"server_name":"%s","force_https":false,"port_https":%s,"port_dns_over_tls":%s,"port_dns_over_quic":%s,"port_dnscrypt":0,"certificate_path":"%s","private_key_path":"%s","certificate_chain":"","private_key":"","dnscrypt_config_file":"","serve_plain_dns":true}' \
     "$DOMAIN" "$LOOPBACK_PORT" "$DOT_PORT" "$DOT_PORT" \
     "$(json_escape "$CERT_FULLCHAIN")" "$(json_escape "$CERT_PRIVKEY")")
   resp=$(agh_post_json /control/tls/configure "$body") || die "AdGuard Home rejected the TLS settings."
@@ -2103,8 +2155,10 @@ cmd_uninstall() {
 
   say "Removing the nginx configuration ..."
   rm -f "$NGINX_STREAM_CONF" "$NGINX_HTTP_CONF"
-  if grep -qF "$NGINX_MARK" "$NGINX_MAIN" 2> /dev/null; then
-    sed -i '/dns-setup: stream configs/,+1d' "$NGINX_MAIN"
+  if grep -qF "$NGINX_MARK_END" "$NGINX_MAIN" 2> /dev/null; then
+    sed -i "\\|^${NGINX_MARK}\$|,\\|^${NGINX_MARK_END}\$|d" "$NGINX_MAIN"
+  elif grep -qF "$NGINX_MARK" "$NGINX_MAIN" 2> /dev/null; then
+    sed -i "\\|^${NGINX_MARK}\$|,+1d" "$NGINX_MAIN"
   fi
   rm -f "$RENEW_HOOK"
   if nginx -t 2> /dev/null; then
@@ -2133,6 +2187,7 @@ main() {
       ;;
   esac
   require_root "$@"
+  init_work_dir
   local cmd=${1-}
   case "$cmd" in
     add | remove | import | list | sync | allow | status | test | info | renew | uninstall)
