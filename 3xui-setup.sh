@@ -28,7 +28,7 @@ export LC_ALL=C
 export DEBIAN_FRONTEND=noninteractive
 export NEEDRESTART_MODE=a
 
-VERSION="${XUI_VERSION:-v3.10.2}"
+PANEL_VERSION="${XUI_VERSION:-v3.10.2}"
 INSTALLER_URL="${XUI_INSTALLER_URL:-https://raw.githubusercontent.com/mhsanaei/3x-ui/master/install.sh}"
 XUI_DIR="${XUI_MAIN_FOLDER:-/usr/local/x-ui}"
 XUI_BIN="${XUI_DIR}/x-ui"
@@ -253,18 +253,18 @@ ensure_prereqs() {
     || die "Could not install: ${missing[*]}"
 }
 
+# os-release defines VERSION, NAME, ID, ... -- read it in a subshell so it
+# cannot overwrite this script's variables.
 load_os() {
-  if [[ -r /etc/os-release ]]; then
-    # shellcheck disable=SC1091
-    . /etc/os-release
-    say "OS: ${PRETTY_NAME:-${ID:-unknown}}"
-  elif [[ -r /usr/lib/os-release ]]; then
-    # shellcheck disable=SC1091
-    . /usr/lib/os-release
-    say "OS: ${PRETTY_NAME:-${ID:-unknown}}"
-  else
-    die "Cannot read /etc/os-release; unsupported OS."
-  fi
+  local f pretty
+  for f in /etc/os-release /usr/lib/os-release; do
+    [[ -r $f ]] || continue
+    # shellcheck disable=SC1090
+    pretty=$(. "$f" && printf '%s' "${PRETTY_NAME:-${ID:-unknown}}")
+    say "OS: ${pretty}"
+    return 0
+  done
+  die "Cannot read /etc/os-release; unsupported OS."
 }
 
 rand_hex() {
@@ -517,9 +517,9 @@ install_panel() {
     die "This installer does not support unattended mode. Set XUI_INSTALLER_URL to the v3.10.2 install.sh."
   fi
 
-  say "Installing 3x-ui ${VERSION} (unattended; this can take a few minutes) ..."
+  say "Installing 3x-ui ${PANEL_VERSION} (unattended; this can take a few minutes) ..."
   set +e
-  env "${env_args[@]}" bash "$tmp" "$VERSION"
+  env "${env_args[@]}" bash "$tmp" "$PANEL_VERSION"
   rc=$?
   set -e
   rm -f "$tmp"
@@ -1160,7 +1160,7 @@ main() {
   trap '_on_err $LINENO' ERR
 
   say "=== 3x-ui unattended setup ==="
-  say "version : ${VERSION}"
+  say "version : ${PANEL_VERSION}"
   say "domain  : ${DOMAIN}"
 
   ensure_prereqs
@@ -1185,7 +1185,7 @@ main() {
 
     if [[ $FORCE_INSTALL -eq 0 ]]; then
       warn "3x-ui is already installed at ${XUI_DIR}; skipping the install step."
-      warn "Use --force-install to reinstall version ${VERSION}."
+      warn "Use --force-install to reinstall version ${PANEL_VERSION}."
       precheck_firewall "${PANEL_PORT:-80}"
       if ! service_active; then
         warn "The panel service is not running; starting it."
