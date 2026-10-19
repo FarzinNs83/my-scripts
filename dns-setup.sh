@@ -36,7 +36,7 @@ export LC_ALL=C
 export DEBIAN_FRONTEND=noninteractive
 export NEEDRESTART_MODE=a
 
-SCRIPT_VERSION="1.0.1"
+SCRIPT_VERSION="1.0.2"
 
 # ---------------------------------------------------------------------------
 # Paths (all overridable from the environment for testing)
@@ -474,27 +474,39 @@ EOF
 # ---------------------------------------------------------------------------
 # nginx
 # ---------------------------------------------------------------------------
-ensure_nginx_stream() {
-  local v
+# Is ngx_stream_module usable: built in statically, or loaded by a
+# modules-enabled file whose .so exists? Debian/Ubuntu print
+# --with-stream=dynamic in `nginx -V` even when the module is NOT installed,
+# so that flag alone proves nothing.
+nginx_stream_loaded() {
+  local v f so
   v=$(nginx -V 2>&1) || true
-  if [[ $v == *--with-stream* ]]; then
+  if [[ $v == *--with-stream* && $v != *--with-stream=dynamic* ]]; then
     return 0
   fi
-  if ls /etc/nginx/modules-enabled/*stream* > /dev/null 2>&1; then
-    return 0
+  for f in /etc/nginx/modules-enabled/*.conf; do
+    [[ -r $f ]] || continue
+    so=$(sed -n -E 's/^[[:space:]]*load_module[[:space:]]+"?([^";[:space:]]*ngx_stream_module\.so)"?[[:space:]]*;.*/\1/p' "$f" | head -n 1)
+    [[ -n $so ]] || continue
+    [[ $so == /* ]] || so="/usr/share/nginx/${so}" # relative to the nginx prefix
+    [[ -f $so ]] && return 0
+  done
+  return 1
+}
+
+ensure_nginx_stream() {
+  nginx_stream_loaded && return 0
+  say "Installing the nginx stream module (libnginx-mod-stream) ..."
+  if ! apt-get -o DPkg::Lock::Timeout=180 install -y -qq libnginx-mod-stream > /dev/null 2>&1; then
+    apt-get -o DPkg::Lock::Timeout=180 update -qq > /dev/null 2>&1 || true
+    apt-get -o DPkg::Lock::Timeout=180 install -y -qq libnginx-mod-stream > /dev/null 2>&1 || true
   fi
-  apt-get -o DPkg::Lock::Timeout=180 install -y -qq libnginx-mod-stream > /dev/null 2>&1 || true
-  if ls /etc/nginx/modules-enabled/*stream* > /dev/null 2>&1; then
-    return 0
-  fi
+  nginx_stream_loaded && return 0
   if [[ -f /usr/lib/nginx/modules/ngx_stream_module.so ]]; then
-    if [[ -f /etc/nginx/modules-available/50-mod-stream.conf ]]; then
-      ln -sf /etc/nginx/modules-available/50-mod-stream.conf /etc/nginx/modules-enabled/50-mod-stream.conf
-    else
-      printf 'load_module /usr/lib/nginx/modules/ngx_stream_module.so;\n' \
-        > /etc/nginx/modules-enabled/00-dns-setup-stream.conf
-    fi
+    printf 'load_module /usr/lib/nginx/modules/ngx_stream_module.so;\n' \
+      > /etc/nginx/modules-enabled/00-dns-setup-stream.conf
   fi
+  nginx_stream_loaded || die "nginx has no stream module. Install it with 'apt-get install libnginx-mod-stream' and re-run."
 }
 
 # The relay file holds stream-context directives (map, server with
@@ -2154,7 +2166,7 @@ cmd_uninstall() {
   rm -rf "$AGH_DIR"
 
   say "Removing the nginx configuration ..."
-  rm -f "$NGINX_STREAM_CONF" "$NGINX_HTTP_CONF"
+  rm -f "$NGINX_STREAM_CONF" "$NGINX_HTTP_CONF" /etc/nginx/modules-enabled/00-dns-setup-stream.conf
   if grep -qF "$NGINX_MARK_END" "$NGINX_MAIN" 2> /dev/null; then
     sed -i "\\|^${NGINX_MARK}\$|,\\|^${NGINX_MARK_END}\$|d" "$NGINX_MAIN"
   elif grep -qF "$NGINX_MARK" "$NGINX_MAIN" 2> /dev/null; then
