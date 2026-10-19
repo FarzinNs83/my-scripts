@@ -58,13 +58,6 @@ field is the subdomain; override it with `XHTTP_HOST` / `WS_HOST` if needed.
 
 ### Usage
 
-Run as root:
-
-```bash
-sudo -i
-bash <(curl -Ls https://raw.githubusercontent.com/FarzinNs83/my-scripts/main/3xui-setup.sh) panel.example.com
-```
-
 Omit the domain and the script asks for it once:
 
 ```bash
