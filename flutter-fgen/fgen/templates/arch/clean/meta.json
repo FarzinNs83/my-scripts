@@ -1,0 +1,13 @@
+{
+  "label": "Clean Architecture: domain / data / presentation",
+  "order": 1,
+  "uses_result": true,
+  "item": "{pascal}Entity",
+  "item_path": "domain/entities/{snake}_entity.dart",
+  "dep": {
+    "type": "Get{pascal}ListUseCase",
+    "var": "get{pascal}List",
+    "path": "domain/usecases/get_{snake}_list_usecase.dart",
+    "call": "$v()"
+  }
+}

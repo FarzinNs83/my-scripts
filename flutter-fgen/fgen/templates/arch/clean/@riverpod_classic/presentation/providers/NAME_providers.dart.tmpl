@@ -1,0 +1,19 @@
+import 'package:flutter_riverpod/flutter_riverpod.dart';
+
+import '{{ core }}/network/dio_service.dart';
+import '{{ fimport }}/data/datasources/{{ snake }}_remote_data_source.dart';
+import '{{ fimport }}/data/repositories/{{ snake }}_repository_impl.dart';
+import '{{ fimport }}/domain/repositories/{{ snake }}_repository.dart';
+import '{{ fimport }}/domain/usecases/get_{{ snake }}_list_usecase.dart';
+
+final {{ camel }}RemoteDataSourceProvider = Provider<{{ pascal }}RemoteDataSource>(
+  (ref) => {{ pascal }}RemoteDataSourceImpl(ref.watch(dioProvider)),
+);
+
+final {{ camel }}RepositoryProvider = Provider<{{ pascal }}Repository>(
+  (ref) => {{ pascal }}RepositoryImpl(ref.watch({{ camel }}RemoteDataSourceProvider)),
+);
+
+final get{{ pascal }}ListUseCaseProvider = Provider<Get{{ pascal }}ListUseCase>(
+  (ref) => Get{{ pascal }}ListUseCase(ref.watch({{ camel }}RepositoryProvider)),
+);

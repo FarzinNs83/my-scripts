@@ -1,0 +1,8 @@
+{
+  "label": "Simple: model + presentation only (small features)",
+  "order": 3,
+  "uses_result": false,
+  "item": "{pascal}Model",
+  "item_path": "models/{snake}_model.dart",
+  "dep": null
+}

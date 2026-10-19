@@ -1,0 +1,7 @@
+{
+  "label": "flutter_bloc: Cubit, DI with get_it",
+  "order": 4,
+  "controller": "{pascal}Cubit",
+  "controller_path": "presentation/cubit/{snake}_cubit.dart",
+  "notes": ["In main(): call setupCoreDependencies() once, then init{pascal}Feature() (from {snake}_injection.dart) before runApp()."]
+}

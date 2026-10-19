@@ -1,0 +1,19 @@
+import 'package:dio/dio.dart';
+import 'package:get/get.dart';
+
+import '{{ fimport }}/data/datasources/{{ snake }}_remote_data_source.dart';
+import '{{ fimport }}/data/repositories/{{ snake }}_repository_impl.dart';
+import '{{ fimport }}/domain/repositories/{{ snake }}_repository.dart';
+import '{{ fimport }}/domain/usecases/get_{{ snake }}_list_usecase.dart';
+import '{{ controller_import }}';
+
+class {{ pascal }}Binding extends Bindings {
+  @override
+  void dependencies() {
+    Get
+      ..lazyPut<{{ pascal }}RemoteDataSource>(() => {{ pascal }}RemoteDataSourceImpl(Get.find<Dio>()))
+      ..lazyPut<{{ pascal }}Repository>(() => {{ pascal }}RepositoryImpl(Get.find()))
+      ..lazyPut(() => Get{{ pascal }}ListUseCase(Get.find()))
+      ..lazyPut(() => {{ controller }}(Get.find()));
+  }
+}

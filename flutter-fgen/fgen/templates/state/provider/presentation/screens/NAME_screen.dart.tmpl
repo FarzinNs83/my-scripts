@@ -1,0 +1,37 @@
+import 'package:flutter/material.dart';
+import 'package:provider/provider.dart';
+
+import '{{ core }}/di/injection.dart';
+import '{{ controller_import }}';
+
+class {{ pascal }}Screen extends StatelessWidget {
+  const {{ pascal }}Screen({super.key});
+
+  @override
+  Widget build(BuildContext context) {
+    return ChangeNotifierProvider(
+      create: (_) => sl<{{ pascal }}Notifier>()..load(),
+      child: Scaffold(
+        appBar: AppBar(title: const Text('{{ title }}')),
+        body: Consumer<{{ pascal }}Notifier>(
+          builder: (context, notifier, _) {
+            if (notifier.isLoading) {
+              return const Center(child: CircularProgressIndicator());
+            }
+            final error = notifier.error;
+            if (error != null) {
+              return Center(child: Text(error));
+            }
+            return RefreshIndicator(
+              onRefresh: notifier.load,
+              child: ListView.builder(
+                itemCount: notifier.items.length,
+                itemBuilder: (context, index) => ListTile(title: Text(notifier.items[index].id)),
+              ),
+            );
+          },
+        ),
+      ),
+    );
+  }
+}

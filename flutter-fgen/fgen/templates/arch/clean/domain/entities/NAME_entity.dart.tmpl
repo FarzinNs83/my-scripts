@@ -1,0 +1,16 @@
+{% if freezed %}
+import 'package:freezed_annotation/freezed_annotation.dart';
+
+part '{{ snake }}_entity.freezed.dart';
+
+@freezed
+abstract class {{ pascal }}Entity with _${{ pascal }}Entity {
+  const factory {{ pascal }}Entity({required String id}) = _{{ pascal }}Entity;
+}
+{% else %}
+class {{ pascal }}Entity {
+  const {{ pascal }}Entity({required this.id});
+
+  final String id;
+}
+{% endif %}

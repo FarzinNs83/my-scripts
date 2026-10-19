@@ -1,0 +1,12 @@
+import '{{ core }}/di/injection.dart';
+import '{{ fimport }}/data/repositories/{{ snake }}_repository.dart';
+import '{{ fimport }}/data/services/{{ snake }}_api_service.dart';
+import '{{ controller_import }}';
+
+/// Registers everything the {{ title }} feature needs. Call once at startup.
+void init{{ pascal }}Feature() {
+  sl
+    ..registerLazySingleton(() => {{ pascal }}ApiService(sl()))
+    ..registerLazySingleton<{{ pascal }}Repository>(() => {{ pascal }}RepositoryImpl(sl()))
+    ..registerFactory(() => {{ controller }}(sl()));
+}

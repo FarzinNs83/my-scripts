@@ -1,0 +1,13 @@
+{
+  "label": "MVVM: data (models / services / repositories) + presentation",
+  "order": 2,
+  "uses_result": true,
+  "item": "{pascal}Model",
+  "item_path": "data/models/{snake}_model.dart",
+  "dep": {
+    "type": "{pascal}Repository",
+    "var": "repository",
+    "path": "data/repositories/{snake}_repository.dart",
+    "call": "$v.getAll()"
+  }
+}

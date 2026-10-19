@@ -1,0 +1,29 @@
+{% if result != "future" %}
+import 'package:dio/dio.dart';
+{% endif %}
+{{ result_imports }}
+import '{{ item_import }}';
+import '{{ fimport }}/data/datasources/{{ snake }}_remote_data_source.dart';
+import '{{ fimport }}/data/models/{{ snake }}_model.dart';
+import '{{ fimport }}/domain/repositories/{{ snake }}_repository.dart';
+
+class {{ pascal }}RepositoryImpl implements {{ pascal }}Repository {
+  const {{ pascal }}RepositoryImpl(this._remote);
+
+  final {{ pascal }}RemoteDataSource _remote;
+
+  @override
+  Future<{{ ret }}> getAll() async {
+{% if result == "future" %}
+    final models = await _remote.getAll();
+    return models.map((model) => model.toEntity()).toList();
+{% else %}
+    try {
+      final models = await _remote.getAll();
+      return {{ ok("models.map((model) => model.toEntity()).toList()") }};
+    } on DioException catch (e) {
+      return {{ err("ServerFailure(e.message ?? 'Network error')") }};
+    }
+{% endif %}
+  }
+}

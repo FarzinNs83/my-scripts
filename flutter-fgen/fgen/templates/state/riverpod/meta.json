@@ -1,0 +1,7 @@
+{
+  "label": "Riverpod with code generation (riverpod_annotation)",
+  "order": 1,
+  "controller": "{pascal}Controller",
+  "controller_path": "presentation/controllers/{snake}_controller.dart",
+  "notes": ["Wrap your app in ProviderScope and run build_runner after generating."]
+}

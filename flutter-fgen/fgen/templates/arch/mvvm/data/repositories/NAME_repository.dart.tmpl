@@ -1,0 +1,29 @@
+{% if result != "future" %}
+import 'package:dio/dio.dart';
+{% endif %}
+{{ result_imports }}
+import '{{ item_import }}';
+import '{{ fimport }}/data/services/{{ snake }}_api_service.dart';
+
+abstract interface class {{ pascal }}Repository {
+  Future<{{ ret }}> getAll();
+}
+
+class {{ pascal }}RepositoryImpl implements {{ pascal }}Repository {
+  const {{ pascal }}RepositoryImpl(this._service);
+
+  final {{ pascal }}ApiService _service;
+
+  @override
+  Future<{{ ret }}> getAll() async {
+{% if result == "future" %}
+    return _service.getAll();
+{% else %}
+    try {
+      return {{ ok("await _service.getAll()") }};
+    } on DioException catch (e) {
+      return {{ err("ServerFailure(e.message ?? 'Network error')") }};
+    }
+{% endif %}
+  }
+}

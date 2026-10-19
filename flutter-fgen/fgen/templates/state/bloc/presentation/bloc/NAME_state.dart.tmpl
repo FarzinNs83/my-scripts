@@ -1,0 +1,25 @@
+part of '{{ snake }}_bloc.dart';
+
+sealed class {{ pascal }}State {
+  const {{ pascal }}State();
+}
+
+final class {{ pascal }}Initial extends {{ pascal }}State {
+  const {{ pascal }}Initial();
+}
+
+final class {{ pascal }}Loading extends {{ pascal }}State {
+  const {{ pascal }}Loading();
+}
+
+final class {{ pascal }}Loaded extends {{ pascal }}State {
+  const {{ pascal }}Loaded(this.items);
+
+  final List<{{ item }}> items;
+}
+
+final class {{ pascal }}Error extends {{ pascal }}State {
+  const {{ pascal }}Error(this.message);
+
+  final String message;
+}

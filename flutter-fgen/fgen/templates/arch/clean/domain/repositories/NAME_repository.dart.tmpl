@@ -1,0 +1,6 @@
+{{ result_imports }}
+import '{{ item_import }}';
+
+abstract interface class {{ pascal }}Repository {
+  Future<{{ ret }}> getAll();
+}

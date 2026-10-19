@@ -1,0 +1,7 @@
+{
+  "label": "GetX: GetxController + Bindings",
+  "order": 6,
+  "controller": "{pascal}Controller",
+  "controller_path": "presentation/controllers/{snake}_controller.dart",
+  "notes": ["Use GetMaterialApp(initialBinding: InitialBinding()) and register {pascal}Screen with binding: {pascal}Binding() in your GetPage."]
+}

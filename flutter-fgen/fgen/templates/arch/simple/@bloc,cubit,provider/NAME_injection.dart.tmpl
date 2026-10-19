@@ -1,0 +1,7 @@
+import '{{ core }}/di/injection.dart';
+import '{{ controller_import }}';
+
+/// Registers everything the {{ title }} feature needs. Call once at startup.
+void init{{ pascal }}Feature() {
+  sl.registerFactory({{ controller }}.new);
+}

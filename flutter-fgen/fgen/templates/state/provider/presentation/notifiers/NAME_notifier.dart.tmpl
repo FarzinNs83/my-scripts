@@ -1,0 +1,39 @@
+import 'package:flutter/foundation.dart';
+
+{% if dep %}
+{{ result_imports }}
+import '{{ dep.uri }}';
+{% endif %}
+import '{{ item_import }}';
+
+class {{ pascal }}Notifier extends ChangeNotifier {
+{% if dep %}
+  {{ pascal }}Notifier(this._{{ dep.var }});
+
+  final {{ dep.type }} _{{ dep.var }};
+
+{% endif %}
+  List<{{ item }}> _items = const [];
+  bool _isLoading = false;
+  String? _error;
+
+  List<{{ item }}> get items => _items;
+  bool get isLoading => _isLoading;
+  String? get error => _error;
+
+  Future<void> load() async {
+    _isLoading = true;
+    _error = null;
+    notifyListeners();
+
+{% if dep %}
+    {{ handle("_items = data;", "_error = message;") }}
+{% else %}
+    // TODO: load the data.
+    _items = const [];
+{% endif %}
+
+    _isLoading = false;
+    notifyListeners();
+  }
+}

@@ -1,0 +1,16 @@
+import 'package:dio/dio.dart';
+import 'package:get/get.dart';
+
+import '{{ fimport }}/data/repositories/{{ snake }}_repository.dart';
+import '{{ fimport }}/data/services/{{ snake }}_api_service.dart';
+import '{{ controller_import }}';
+
+class {{ pascal }}Binding extends Bindings {
+  @override
+  void dependencies() {
+    Get
+      ..lazyPut(() => {{ pascal }}ApiService(Get.find<Dio>()))
+      ..lazyPut<{{ pascal }}Repository>(() => {{ pascal }}RepositoryImpl(Get.find()))
+      ..lazyPut(() => {{ controller }}(Get.find()));
+  }
+}

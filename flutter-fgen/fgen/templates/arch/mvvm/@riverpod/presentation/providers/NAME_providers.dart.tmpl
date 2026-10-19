@@ -1,0 +1,14 @@
+import 'package:riverpod_annotation/riverpod_annotation.dart';
+
+import '{{ core }}/network/dio_service.dart';
+import '{{ fimport }}/data/repositories/{{ snake }}_repository.dart';
+import '{{ fimport }}/data/services/{{ snake }}_api_service.dart';
+
+part '{{ snake }}_providers.g.dart';
+
+@riverpod
+{{ pascal }}ApiService {{ camel }}ApiService(Ref ref) => {{ pascal }}ApiService(ref.watch(dioProvider));
+
+@riverpod
+{{ pascal }}Repository {{ camel }}Repository(Ref ref) =>
+    {{ pascal }}RepositoryImpl(ref.watch({{ camel }}ApiServiceProvider));

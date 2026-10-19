@@ -1,0 +1,29 @@
+import 'package:flutter_bloc/flutter_bloc.dart';
+
+{% if dep %}
+{{ result_imports }}
+import '{{ dep.uri }}';
+{% endif %}
+import '{{ item_import }}';
+
+part '{{ snake }}_state.dart';
+
+class {{ pascal }}Cubit extends Cubit<{{ pascal }}State> {
+{% if dep %}
+  {{ pascal }}Cubit(this._{{ dep.var }}) : super(const {{ pascal }}Initial());
+
+  final {{ dep.type }} _{{ dep.var }};
+{% else %}
+  {{ pascal }}Cubit() : super(const {{ pascal }}Initial());
+{% endif %}
+
+  Future<void> load() async {
+    emit(const {{ pascal }}Loading());
+{% if dep %}
+    {{ handle("emit({pascal}Loaded(data));", "emit({pascal}Error(message));") }}
+{% else %}
+    // TODO: load the data.
+    emit(const {{ pascal }}Loaded([]));
+{% endif %}
+  }
+}

@@ -1,0 +1,29 @@
+import 'package:flutter/material.dart';
+import 'package:flutter_bloc/flutter_bloc.dart';
+
+import '{{ core }}/di/injection.dart';
+import '{{ controller_import }}';
+
+class {{ pascal }}Screen extends StatelessWidget {
+  const {{ pascal }}Screen({super.key});
+
+  @override
+  Widget build(BuildContext context) {
+    return BlocProvider(
+      create: (_) => sl<{{ pascal }}Bloc>()..add(const {{ pascal }}Started()),
+      child: Scaffold(
+        appBar: AppBar(title: const Text('{{ title }}')),
+        body: BlocBuilder<{{ pascal }}Bloc, {{ pascal }}State>(
+          builder: (context, state) => switch (state) {
+            {{ pascal }}Initial() || {{ pascal }}Loading() => const Center(child: CircularProgressIndicator()),
+            {{ pascal }}Loaded(:final items) => ListView.builder(
+              itemCount: items.length,
+              itemBuilder: (context, index) => ListTile(title: Text(items[index].id)),
+            ),
+            {{ pascal }}Error(:final message) => Center(child: Text(message)),
+          },
+        ),
+      ),
+    );
+  }
+}

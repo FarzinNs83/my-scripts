@@ -1,0 +1,31 @@
+import 'package:flutter/material.dart';
+import 'package:get/get.dart';
+
+import '{{ controller_import }}';
+
+class {{ pascal }}Screen extends GetView<{{ pascal }}Controller> {
+  const {{ pascal }}Screen({super.key});
+
+  @override
+  Widget build(BuildContext context) {
+    return Scaffold(
+      appBar: AppBar(title: const Text('{{ title }}')),
+      body: Obx(() {
+        if (controller.isLoading.value) {
+          return const Center(child: CircularProgressIndicator());
+        }
+        final error = controller.error.value;
+        if (error != null) {
+          return Center(child: Text(error));
+        }
+        return RefreshIndicator(
+          onRefresh: controller.load,
+          child: ListView.builder(
+            itemCount: controller.items.length,
+            itemBuilder: (context, index) => ListTile(title: Text(controller.items[index].id)),
+          ),
+        );
+      }),
+    );
+  }
+}

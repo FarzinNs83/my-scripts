@@ -1,0 +1,7 @@
+{
+  "label": "Riverpod without code generation (AsyncNotifierProvider)",
+  "order": 2,
+  "controller": "{pascal}Controller",
+  "controller_path": "presentation/controllers/{snake}_controller.dart",
+  "notes": ["Wrap your app in ProviderScope."]
+}

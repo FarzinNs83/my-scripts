@@ -1,0 +1,11 @@
+import 'package:dio/dio.dart';
+import 'package:get/get.dart';
+
+/// App-wide services. Pass to GetMaterialApp(initialBinding: InitialBinding()).
+class InitialBinding extends Bindings {
+  @override
+  void dependencies() {
+    // TODO: set your base URL, interceptors, timeouts...
+    Get.put<Dio>(Dio(BaseOptions(baseUrl: '')), permanent: true);
+  }
+}

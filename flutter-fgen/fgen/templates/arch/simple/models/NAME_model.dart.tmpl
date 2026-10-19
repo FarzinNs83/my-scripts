@@ -1,0 +1,25 @@
+{% if freezed %}
+import 'package:freezed_annotation/freezed_annotation.dart';
+
+part '{{ snake }}_model.freezed.dart';
+part '{{ snake }}_model.g.dart';
+
+@freezed
+abstract class {{ pascal }}Model with _${{ pascal }}Model {
+  const factory {{ pascal }}Model({required String id}) = _{{ pascal }}Model;
+
+  factory {{ pascal }}Model.fromJson(Map<String, dynamic> json) =>
+      _${{ pascal }}ModelFromJson(json);
+}
+{% else %}
+class {{ pascal }}Model {
+  const {{ pascal }}Model({required this.id});
+
+  factory {{ pascal }}Model.fromJson(Map<String, dynamic> json) =>
+      {{ pascal }}Model(id: json['id'] as String);
+
+  final String id;
+
+  Map<String, dynamic> toJson() => {'id': id};
+}
+{% endif %}

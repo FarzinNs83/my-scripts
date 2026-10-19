@@ -1,0 +1,7 @@
+{
+  "label": "provider: ChangeNotifier, DI with get_it",
+  "order": 5,
+  "controller": "{pascal}Notifier",
+  "controller_path": "presentation/notifiers/{snake}_notifier.dart",
+  "notes": ["In main(): call setupCoreDependencies() once, then init{pascal}Feature() (from {snake}_injection.dart) before runApp()."]
+}

@@ -1,0 +1,13 @@
+import 'package:flutter_riverpod/flutter_riverpod.dart';
+
+import '{{ core }}/network/dio_service.dart';
+import '{{ fimport }}/data/repositories/{{ snake }}_repository.dart';
+import '{{ fimport }}/data/services/{{ snake }}_api_service.dart';
+
+final {{ camel }}ApiServiceProvider = Provider<{{ pascal }}ApiService>(
+  (ref) => {{ pascal }}ApiService(ref.watch(dioProvider)),
+);
+
+final {{ camel }}RepositoryProvider = Provider<{{ pascal }}Repository>(
+  (ref) => {{ pascal }}RepositoryImpl(ref.watch({{ camel }}ApiServiceProvider)),
+);

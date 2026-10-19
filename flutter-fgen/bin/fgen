@@ -1,0 +1,4 @@
+#!/usr/bin/env sh
+# Run fgen from a clone without installing it: put this bin folder on PATH.
+DIR="$(cd "$(dirname "$0")/.." && pwd)"
+PYTHONPATH="$DIR${PYTHONPATH:+:$PYTHONPATH}" exec python3 -m fgen "$@"

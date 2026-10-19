@@ -1,0 +1,7 @@
+{
+  "label": "flutter_bloc: Bloc + events, DI with get_it",
+  "order": 3,
+  "controller": "{pascal}Bloc",
+  "controller_path": "presentation/bloc/{snake}_bloc.dart",
+  "notes": ["In main(): call setupCoreDependencies() once, then init{pascal}Feature() (from {snake}_injection.dart) before runApp()."]
+}

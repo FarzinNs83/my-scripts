@@ -1,0 +1,39 @@
+import 'package:get/get.dart';
+
+{% if dep %}
+{{ result_imports }}
+import '{{ dep.uri }}';
+{% endif %}
+import '{{ item_import }}';
+
+class {{ pascal }}Controller extends GetxController {
+{% if dep %}
+  {{ pascal }}Controller(this._{{ dep.var }});
+
+  final {{ dep.type }} _{{ dep.var }};
+
+{% endif %}
+  final items = <{{ item }}>[].obs;
+  final isLoading = false.obs;
+  final error = RxnString();
+
+  @override
+  void onInit() {
+    super.onInit();
+    load();
+  }
+
+  Future<void> load() async {
+    isLoading.value = true;
+    error.value = null;
+
+{% if dep %}
+    {{ handle("items.assignAll(data);", "error.value = message;") }}
+{% else %}
+    // TODO: load the data.
+    items.clear();
+{% endif %}
+
+    isLoading.value = false;
+  }
+}

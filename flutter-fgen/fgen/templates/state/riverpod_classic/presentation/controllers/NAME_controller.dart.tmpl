@@ -1,0 +1,32 @@
+import 'package:flutter_riverpod/flutter_riverpod.dart';
+
+{% if dep %}
+{{ result_imports }}
+{% endif %}
+import '{{ item_import }}';
+{% if dep %}
+import '{{ fimport }}/presentation/providers/{{ snake }}_providers.dart';
+{% endif %}
+
+final {{ camel }}ControllerProvider =
+    AsyncNotifierProvider<{{ pascal }}Controller, List<{{ item }}>>({{ pascal }}Controller.new);
+
+class {{ pascal }}Controller extends AsyncNotifier<List<{{ item }}>> {
+  @override
+  Future<List<{{ item }}>> build() => _fetch();
+
+  Future<void> refresh() async {
+    state = const AsyncLoading();
+    state = await AsyncValue.guard(_fetch);
+  }
+
+  Future<List<{{ item }}>> _fetch() async {
+{% if dep %}
+    final {{ dep.var }} = ref.read({{ dep.provider }});
+    {{ fetch_return(dep.var) }}
+{% else %}
+    // TODO: load the data.
+    return const [];
+{% endif %}
+  }
+}

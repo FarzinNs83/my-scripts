@@ -1,0 +1,7 @@
+import 'package:dio/dio.dart';
+import 'package:flutter_riverpod/flutter_riverpod.dart';
+
+final dioProvider = Provider<Dio>((ref) {
+  // TODO: set your base URL, interceptors, timeouts...
+  return Dio(BaseOptions(baseUrl: ''));
+});

@@ -1,0 +1,28 @@
+import 'package:flutter/material.dart';
+import 'package:flutter_riverpod/flutter_riverpod.dart';
+
+import '{{ controller_import }}';
+
+class {{ pascal }}Screen extends ConsumerWidget {
+  const {{ pascal }}Screen({super.key});
+
+  @override
+  Widget build(BuildContext context, WidgetRef ref) {
+    final state = ref.watch({{ camel }}ControllerProvider);
+
+    return Scaffold(
+      appBar: AppBar(title: const Text('{{ title }}')),
+      body: switch (state) {
+        AsyncData(:final value) => RefreshIndicator(
+          onRefresh: () => ref.read({{ camel }}ControllerProvider.notifier).refresh(),
+          child: ListView.builder(
+            itemCount: value.length,
+            itemBuilder: (context, index) => ListTile(title: Text(value[index].id)),
+          ),
+        ),
+        AsyncError(:final error) => Center(child: Text('$error')),
+        _ => const Center(child: CircularProgressIndicator()),
+      },
+    );
+  }
+}

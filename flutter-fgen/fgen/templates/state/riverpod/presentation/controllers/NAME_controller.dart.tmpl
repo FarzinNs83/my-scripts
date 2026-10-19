@@ -1,0 +1,32 @@
+import 'package:riverpod_annotation/riverpod_annotation.dart';
+
+{% if dep %}
+{{ result_imports }}
+{% endif %}
+import '{{ item_import }}';
+{% if dep %}
+import '{{ fimport }}/presentation/providers/{{ snake }}_providers.dart';
+{% endif %}
+
+part '{{ snake }}_controller.g.dart';
+
+@riverpod
+class {{ pascal }}Controller extends _${{ pascal }}Controller {
+  @override
+  Future<List<{{ item }}>> build() => _fetch();
+
+  Future<void> refresh() async {
+    state = const AsyncLoading();
+    state = await AsyncValue.guard(_fetch);
+  }
+
+  Future<List<{{ item }}>> _fetch() async {
+{% if dep %}
+    final {{ dep.var }} = ref.read({{ dep.provider }});
+    {{ fetch_return(dep.var) }}
+{% else %}
+    // TODO: load the data.
+    return const [];
+{% endif %}
+  }
+}

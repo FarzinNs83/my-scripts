@@ -1,0 +1,34 @@
+import 'package:flutter_bloc/flutter_bloc.dart';
+
+{% if dep %}
+{{ result_imports }}
+import '{{ dep.uri }}';
+{% endif %}
+import '{{ item_import }}';
+
+part '{{ snake }}_event.dart';
+part '{{ snake }}_state.dart';
+
+class {{ pascal }}Bloc extends Bloc<{{ pascal }}Event, {{ pascal }}State> {
+{% if dep %}
+  {{ pascal }}Bloc(this._{{ dep.var }}) : super(const {{ pascal }}Initial()) {
+{% else %}
+  {{ pascal }}Bloc() : super(const {{ pascal }}Initial()) {
+{% endif %}
+    on<{{ pascal }}Started>(_onStarted);
+  }
+{% if dep %}
+
+  final {{ dep.type }} _{{ dep.var }};
+{% endif %}
+
+  Future<void> _onStarted({{ pascal }}Started event, Emitter<{{ pascal }}State> emit) async {
+    emit(const {{ pascal }}Loading());
+{% if dep %}
+    {{ handle("emit({pascal}Loaded(data));", "emit({pascal}Error(message));") }}
+{% else %}
+    // TODO: load the data.
+    emit(const {{ pascal }}Loaded([]));
+{% endif %}
+  }
+}

@@ -1,0 +1,11 @@
+{{ result_imports }}
+import '{{ item_import }}';
+import '{{ fimport }}/domain/repositories/{{ snake }}_repository.dart';
+
+class Get{{ pascal }}ListUseCase {
+  const Get{{ pascal }}ListUseCase(this._repository);
+
+  final {{ pascal }}Repository _repository;
+
+  Future<{{ ret }}> call() => _repository.getAll();
+}
