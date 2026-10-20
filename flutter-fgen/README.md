@@ -4,9 +4,9 @@ Feature generator for Flutter: Clean / MVVM / Simple architecture with
 Riverpod / Bloc / Cubit / Provider / GetX. Requires Python 3.9+.
 
 ## Install
-
+Go to flutter-fgen folder and use the command below:
 ```bash
-pip install ./flutter-fgen
+pip install .
 ```
 
 Or without installing: add `flutter-fgen/bin` to your `PATH`.
