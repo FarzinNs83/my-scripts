@@ -20,6 +20,9 @@
 #
 #  This file is independent from 3xui-setup.sh: it owns its own paths, ports,
 #  unit, log and state, and it never touches /usr/local/x-ui or its inbounds.
+#  Other sites on :443 through nginx (n8n-setup.sh) move behind the relay: the
+#  SNI map includes /etc/nginx/sni-routes.d/*.map, and `n8nctl nginx` moves
+#  n8n to a loopback port (and back to :443 on uninstall).
 #
 #  Usage:
 #    bash dns-setup.sh                      (asks for the domain)
@@ -37,7 +40,7 @@ export LC_ALL=C
 export DEBIAN_FRONTEND=noninteractive
 export NEEDRESTART_MODE=a
 
-SCRIPT_VERSION="1.1.0"
+SCRIPT_VERSION="1.2.0"
 SELF_URL="${DS_SELF_URL:-https://raw.githubusercontent.com/FarzinNs83/my-scripts/main/dns-setup.sh}"
 
 # ---------------------------------------------------------------------------
@@ -60,6 +63,9 @@ NGINX_STREAM_DIR="${DS_NGINX_STREAM_DIR:-/etc/nginx/stream.d}"
 NGINX_STREAM_CONF="${DS_NGINX_STREAM_CONF:-${NGINX_STREAM_DIR}/dns-setup-relay.conf}"
 NGINX_HTTP_CONF="${DS_NGINX_HTTP_CONF:-/etc/nginx/conf.d/dns-setup-http.conf}"
 NGINX_MAIN="${DS_NGINX_MAIN:-/etc/nginx/nginx.conf}"
+SNI_ROUTES_DIR="${DS_SNI_ROUTES_DIR:-/etc/nginx/sni-routes.d}" # other setups' SNI routes
+N8N_NGINX_CONF="${DS_N8N_NGINX_CONF:-/etc/nginx/conf.d/n8n-setup.conf}"
+N8N_CTL="${DS_N8N_CTL:-/usr/local/bin/n8nctl}"
 NGINX_MARK="# dns-setup: stream configs"
 NGINX_MARK_END="# dns-setup: end of stream configs"
 
@@ -164,6 +170,11 @@ How the relay works:
 
 Ports: 53/udp+tcp (AdGuard), 80/tcp (ACME + redirect), 443/tcp (nginx),
        853/tcp (DoT) and 853/udp (DoQ).
+
+Same server as 3xui-setup.sh / n8n-setup.sh: give each one its own
+subdomain. n8n moves behind the relay (its domain is routed by SNI to
+127.0.0.1:10443) and back to :443 on uninstall; 3x-ui renews its certificate
+through nginx when 3xui-setup.sh runs after this script.
 EOF
 }
 
@@ -413,16 +424,58 @@ precheck_ports() {
   fi
 
   if port_in_use 443 tcp; then
+    local others
     if [[ -f $NGINX_STREAM_CONF ]]; then
       say "TCP/443 is already served by this setup; continuing (idempotent re-run)."
+    elif [[ $(port_holder 443 tcp || true) == *'"nginx"'* ]] && others=$(foreign_443_sites) && [[ -z $others ]]; then
+      say "TCP/443 is served by n8n through nginx; it moves behind the SNI relay."
+    elif [[ -n ${others:-} ]]; then
+      die "nginx serves :443 from ${others//$'\n'/, }. Move that site off :443 and re-run."
     else
-      die "TCP/443 is in use: $(port_holder 443 tcp || true). Free it (another web server?) and re-run."
+      die "TCP/443 is in use: $(port_holder 443 tcp || true). Free it (another web server? an x-ui inbound?) and re-run."
     fi
+  fi
+  if [[ -f $N8N_NGINX_CONF ]] && ! grep -qs '^cmd_nginx' "$(readlink -f "$N8N_CTL" 2> /dev/null || printf '%s' "$N8N_CTL")"; then
+    die "n8n-setup.sh is installed here, but ${N8N_CTL} is missing or too old to move behind the relay. Re-run the current n8n-setup.sh first, then this script."
   fi
 
   if [[ $PANEL_PORT -eq 80 || $LOOPBACK_PORT -eq 80 ]]; then
     die "Port 80 must stay free for ACME; choose another --loopback-port."
   fi
+}
+
+# nginx sites, other than n8n-setup.sh's, that listen on :443 themselves.
+foreign_443_sites() {
+  local f
+  for f in /etc/nginx/conf.d/*.conf /etc/nginx/sites-enabled/*; do
+    [[ -f $f && $f != "$N8N_NGINX_CONF" && $f != "$NGINX_HTTP_CONF" ]] || continue
+    if grep -Eq '^[[:space:]]*listen[[:space:]]+([^;[:space:]]*:)?443[[:space:];]' "$f"; then
+      printf '%s\n' "$f"
+    fi
+  done
+  return 0
+}
+
+# Every setup on the server needs its own subdomain: one certificate lineage
+# and one nginx server per name.
+precheck_domain_free() {
+  local entry f key owner d
+  for entry in "/opt/n8n/.env|N8N_DOMAIN|n8n-setup.sh" "/root/3xui-info.env|XUI_DOMAIN|3xui-setup.sh"; do
+    IFS='|' read -r f key owner <<< "$entry"
+    [[ -r $f ]] || continue
+    d=$(sed -n -E "s/^${key}='?([^']*)'?$/\1/p" "$f" | sed -n '1p')
+    if [[ $d == "$DOMAIN" ]]; then
+      die "${DOMAIN} is already used by ${owner}. Give the DNS its own subdomain (e.g. dns.example.com)."
+    fi
+  done
+}
+
+# n8n-setup.sh follows the relay: on :443 without it, on a loopback port
+# behind it. `n8nctl nginx` re-renders its site for the current layout.
+refresh_n8n() {
+  [[ -f $N8N_NGINX_CONF && -x $N8N_CTL ]] || return 0
+  say "Updating the n8n site for the new :443 layout ..."
+  "$N8N_CTL" nginx || warn "'n8nctl nginx' failed; run it by hand and check 'nginx -t'."
 }
 
 precheck_disk() {
@@ -436,6 +489,9 @@ precheck_disk() {
 precheck_3xui() {
   if [[ -x /usr/local/x-ui/x-ui ]]; then
     say "3x-ui detected; this script does not touch /usr/local/x-ui or its inbounds."
+    if [[ ! -f /etc/nginx/conf.d/3xui-setup.conf ]]; then
+      say "Re-run 3xui-setup.sh afterwards so its certificate renews through nginx (TCP/80)."
+    fi
   fi
   local p holder
   for p in 53 80 443 853; do
@@ -571,20 +627,29 @@ relay_domains() {
     | sort -u
 }
 
+# The list as nginx should relay it: nothing with --no-relay.
+active_relay_domains() {
+  [[ $RELAY -eq 1 ]] || return 0
+  relay_domains
+}
+
 render_nginx_stream() {
   local e line count
-  count=$(relay_domains | wc -l)
-  install -d -m 755 "$(dirname "$NGINX_STREAM_CONF")"
+  count=$(active_relay_domains | wc -l)
+  install -d -m 755 "$(dirname "$NGINX_STREAM_CONF")" "$SNI_ROUTES_DIR"
   {
     printf '# Managed by dns-setup.sh -- do not edit, use: dnsctl add|remove <domain>\n'
     printf '# %s domains in %s\n' "$count" "$DOMAINS_FILE"
     printf 'map $ssl_preread_server_name $dns_setup_backend {\n'
     printf '    "%s"   127.0.0.1:%s;\n' "$DOMAIN" "$LOOPBACK_PORT"
+    printf '    # sites of other setups on this server (n8n-setup.sh): "name" 127.0.0.1:port;\n'
+    printf '    # exact names win over the relay patterns below\n'
+    printf '    include %s/*.map;\n' "$SNI_ROUTES_DIR"
     while IFS= read -r e; do
       [[ -n $e ]] || continue
       line='    "~*^'"$(relay_regex "$e")"'\.?$"   $ssl_preread_server_name:443;'
       printf '%s\n' "$line"
-    done < <(relay_domains)
+    done < <(active_relay_domains)
     printf '    default   127.0.0.1:1;\n'
     printf '}\n\n'
     printf 'server {\n'
@@ -615,7 +680,7 @@ render_nginx_http() {
       [[ -n $e ]] || continue
       line='    "~*^'"$(relay_regex "$e")"'\.?$" 1;'
       printf '%s\n' "$line"
-    done < <(relay_domains)
+    done < <(active_relay_domains)
     printf '}\n\n'
     printf 'server {\n'
     printf '    listen      80 default_server;\n'
@@ -2268,6 +2333,7 @@ install_all() {
   ensure_packages
   precheck_disk
   precheck_dns
+  precheck_domain_free
   precheck_3xui
   fix_systemd_resolved
   precheck_ports
@@ -2344,12 +2410,12 @@ install_all() {
 
   seed_default_list
   [[ -n $CUSTOM_LIST ]] && seed_custom_list "$CUSTOM_LIST"
-  if [[ $RELAY -eq 1 ]]; then
-    sync_rewrites
-    render_nginx_stream
-    render_nginx_http
-    apply_nginx
-  fi
+  [[ $RELAY -eq 1 ]] && sync_rewrites
+  # :443 carries the panel and DoH even with --no-relay
+  render_nginx_stream
+  render_nginx_http
+  refresh_n8n # moves n8n off :443, so nginx loads both changes at once
+  apply_nginx
 
   if [[ $OPEN_FIREWALL -eq 1 ]]; then
     open_firewall_rules
@@ -2702,6 +2768,8 @@ cmd_uninstall() {
       warn "nginx -t fails after the cleanup; check it with: nginx -t"
     fi
   fi
+  refresh_n8n # back to :443 now that the relay is gone
+  rmdir "$SNI_ROUTES_DIR" 2> /dev/null || true
 
   say "Removing the certificate ..."
   rm -f "$RENEW_HOOK"

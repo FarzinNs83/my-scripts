@@ -15,8 +15,10 @@
 #       backup and uninstall, then prints the login link
 #
 #  This file is independent from dns-setup.sh and 3xui-setup.sh: it owns its
-#  own paths, nginx file, renew hook and log. It needs TCP 80 and 443 through
-#  nginx, so it cannot share a server with dns-setup.sh (nginx stream on 443).
+#  own paths, nginx file, renew hook and log. It serves TCP 80 and 443 through
+#  nginx. When dns-setup.sh owns 443 (nginx stream SNI relay), n8n listens on
+#  127.0.0.1:10443 instead and the relay forwards its domain there; dns-setup.sh
+#  switches it back and forth with `n8nctl nginx`.
 #
 #  Usage:
 #    bash n8n-setup.sh n8n.example.com
@@ -33,7 +35,7 @@ export LC_ALL=C
 export DEBIAN_FRONTEND=noninteractive
 export NEEDRESTART_MODE=a
 
-SCRIPT_VERSION="1.0.0"
+SCRIPT_VERSION="1.1.0"
 
 # ---------------------------------------------------------------------------
 # Paths (all overridable from the environment for testing)
@@ -50,6 +52,8 @@ ACME_ROOT="${NS_ACME_ROOT:-/var/www/n8n-setup}"
 RENEW_HOOK="${NS_RENEW_HOOK:-/etc/letsencrypt/renewal-hooks/deploy/n8n-setup-reload.sh}"
 TLS_DIR="${NS_TLS_DIR:-/etc/letsencrypt/live}"
 DS_STREAM_CONF="/etc/nginx/stream.d/dns-setup-relay.conf"   # dns-setup.sh owns :443
+SNI_ROUTES_DIR="${NS_SNI_ROUTES_DIR:-/etc/nginx/sni-routes.d}" # included by its SNI map
+SNI_MAP="${SNI_ROUTES_DIR}/n8n-setup.map"
 
 COMPOSE_PROJECT="n8n"
 DEFAULT_IMAGE="docker.n8n.io/n8nio/n8n"
@@ -65,6 +69,7 @@ IMAGE_TAG=""
 IMAGE_REF=""
 TIMEZONE=""
 LOCAL_PORT=""
+TLS_PORT=""
 MAX_BODY=""
 REGISTRY_MIRROR=""
 OWNER_EMAIL=""
@@ -81,6 +86,7 @@ ENCRYPTION_KEY=""
 POSTGRES_PASSWORD=""
 PUBLIC_IPV4=""
 COMPOSE_BIN=()
+NGINX_RESTART=0
 
 say() { printf '[+] %s\n' "$*"; }
 warn() { printf '[!] %s\n' "$*" >&2; }
@@ -105,6 +111,8 @@ Install options:
                             (switches the default image to n8nio/n8n)
       --timezone <tz>       GENERIC_TIMEZONE, e.g. Asia/Tehran (default: server zone)
       --port <n>            local port n8n listens on behind nginx (default: 5678)
+      --tls-port <n>        loopback HTTPS port when dns-setup.sh owns :443
+                            (default: 10443)
       --max-body <MB>       nginx upload limit in MB (default: 100)
       --owner-email <addr>  create the owner account now instead of in the browser
       --owner-pass <pass>   owner password (default: random; needs --owner-email)
@@ -122,6 +130,8 @@ Commands (same as n8nctl):
   update [<tag>]      back up, pull the image (optionally a new tag) and restart
   backup              archive data, .env and the database to /root/n8n-backups
   renew               force a certificate renewal and reload nginx
+  nginx               re-render the nginx site (:443, or behind the dns-setup.sh
+                      relay when it is installed); dns-setup.sh calls this
   uninstall [--yes] [--purge]
                       remove containers, nginx config and n8nctl
                       (--purge also deletes /opt/n8n with all workflows)
@@ -352,10 +362,37 @@ EOF
   say "DNS OK: ${DOMAIN} -> ${PUBLIC_IPV4}"
 }
 
+relay_active() {
+  [[ -f $DS_STREAM_CONF ]]
+}
+
+# Every setup on the server needs its own subdomain: one certificate lineage
+# and one nginx server per name.
+precheck_domain_free() {
+  local entry f key owner d
+  for entry in "/etc/dns-setup/state.env|DS_DOMAIN|dns-setup.sh" "/root/3xui-info.env|XUI_DOMAIN|3xui-setup.sh"; do
+    IFS='|' read -r f key owner <<< "$entry"
+    [[ -r $f ]] || continue
+    d=$(sed -n -E "s/^${key}='?([^']*)'?$/\1/p" "$f" | sed -n '1p')
+    if [[ $d == "$DOMAIN" ]]; then
+      die "${DOMAIN} is already used by ${owner}. Give n8n its own subdomain (e.g. n8n.example.com)."
+    fi
+  done
+}
+
 precheck_ports() {
   local p holder
-  if [[ -f $DS_STREAM_CONF ]]; then
-    die "dns-setup.sh owns TCP/443 on this server (nginx stream relay); n8n needs a server of its own."
+  if relay_active; then
+    if ! grep -qF "$SNI_ROUTES_DIR" "$DS_STREAM_CONF"; then
+      die "The dns-setup.sh relay on this server predates n8n support. Re-run the current dns-setup.sh first, then this script."
+    fi
+    say "dns-setup.sh owns TCP/443; n8n goes behind its SNI relay (127.0.0.1:${TLS_PORT})."
+    if port_in_use "$TLS_PORT"; then
+      holder=$(port_holder "$TLS_PORT") || true
+      if [[ $holder != *'"nginx"'* ]]; then
+        die "TCP/${TLS_PORT} is in use: ${holder:-unknown}. Pick another one with --tls-port."
+      fi
+    fi
   fi
   for p in 80 443; do
     port_in_use "$p" || continue
@@ -541,6 +578,7 @@ prepare_settings() {
     [[ -n $IMAGE_REF ]] || IMAGE_REF="${N8N_SETUP_IMAGE:-}"
     [[ -n $TIMEZONE ]] || TIMEZONE="${N8N_TZ:-}"
     [[ -n $LOCAL_PORT ]] || LOCAL_PORT="${N8N_LOCAL_PORT:-}"
+    [[ -n $TLS_PORT ]] || TLS_PORT="${N8N_SETUP_TLS_PORT:-}"
     [[ -n $MAX_BODY ]] || MAX_BODY="${N8N_SETUP_MAX_BODY:-}"
     [[ -n $EMAIL ]] || EMAIL="${N8N_SETUP_EMAIL:-}"
     [[ -n $OWNER_EMAIL ]] || OWNER_EMAIL="${N8N_SETUP_OWNER_EMAIL:-}"
@@ -579,6 +617,7 @@ prepare_settings() {
   fi
   [[ -n $TIMEZONE ]] || TIMEZONE=$(detect_timezone)
   [[ -n $LOCAL_PORT ]] || LOCAL_PORT=5678
+  [[ -n $TLS_PORT ]] || TLS_PORT=10443
   [[ -n $MAX_BODY ]] || MAX_BODY=100
 
   [[ $IMAGE_TAG =~ ^[A-Za-z0-9_.-]+$ ]] || die "Invalid --tag '${IMAGE_TAG}'."
@@ -586,6 +625,9 @@ prepare_settings() {
   [[ $TIMEZONE =~ ^[A-Za-z0-9_+/-]+$ ]] || die "Invalid --timezone '${TIMEZONE}'."
   is_port "$LOCAL_PORT" || die "Invalid --port '${LOCAL_PORT}'."
   ((LOCAL_PORT != 80 && LOCAL_PORT != 443)) || die "--port must not be 80 or 443 (nginx uses them)."
+  is_port "$TLS_PORT" || die "Invalid --tls-port '${TLS_PORT}'."
+  ((TLS_PORT != 80 && TLS_PORT != 443 && TLS_PORT != LOCAL_PORT)) \
+    || die "--tls-port must differ from 80, 443 and --port."
   [[ $MAX_BODY =~ ^[0-9]+$ ]] && ((MAX_BODY > 0)) || die "Invalid --max-body '${MAX_BODY}'."
   if [[ -n $OWNER_EMAIL ]]; then
     is_email "$OWNER_EMAIL" || die "Invalid --owner-email '${OWNER_EMAIL}'."
@@ -620,6 +662,7 @@ write_env() {
     printf 'N8N_SETUP_TAG=%s\n' "$IMAGE_TAG"
     printf 'N8N_SETUP_IMAGE=%s\n' "$IMAGE_REF"
     printf 'N8N_SETUP_MAX_BODY=%s\n' "$MAX_BODY"
+    printf 'N8N_SETUP_TLS_PORT=%s\n' "$TLS_PORT"
     printf 'N8N_SETUP_EMAIL=%s\n' "$EMAIL"
     printf 'N8N_SETUP_STAGING=%s\n' "$STAGING"
     printf 'N8N_SETUP_OWNER_EMAIL=%s\n' "$OWNER_EMAIL"
@@ -802,9 +845,35 @@ nginx_version_ge() { # x.y.z
   [[ $(printf '%s\n%s\n' "$1" "$v" | sort -V | head -n 1) == "$1" ]]
 }
 
+listen_mode() { # what NGINX_CONF serves TLS on: public | loopback | none
+  if grep -Eqs '^[[:space:]]*listen[[:space:]]+443[[:space:];]' "$NGINX_CONF"; then
+    printf 'public\n'
+  elif grep -Eqs '^[[:space:]]*listen[[:space:]]+127\.0\.0\.1:[0-9]+[[:space:]]+ssl' "$NGINX_CONF"; then
+    printf 'loopback\n'
+  else
+    printf 'none\n'
+  fi
+}
+
+# dns-setup.sh owns :443 with an nginx stream SNI relay; its map includes the
+# files in SNI_ROUTES_DIR, so this one sends our domain to the loopback
+# listener. n8n then sees 127.0.0.1 as the client address.
+sync_sni_route() { # http | https
+  if [[ $1 == https ]] && relay_active; then
+    install -d -m 755 "$SNI_ROUTES_DIR"
+    {
+      printf '# Managed by n8n-setup.sh -- SNI route for the dns-setup.sh relay\n'
+      printf '"%s" 127.0.0.1:%s;\n' "$DOMAIN" "$TLS_PORT"
+    } > "$SNI_MAP"
+  else
+    rm -f "$SNI_MAP"
+  fi
+}
+
 render_nginx() { # http | https
-  local mode=$1 v6=0 h2_listen="" h2_line=""
+  local mode=$1 v6=0 h2_listen="" h2_line="" before after
   ipv6_enabled && v6=1
+  before=$(listen_mode)
   if nginx_version_ge 1.25.1; then
     h2_line='    http2 on;'
   else
@@ -833,8 +902,12 @@ render_nginx() { # http | https
     printf '}\n'
     if [[ $mode == https ]]; then
       printf '\nserver {\n'
-      printf '    listen 443 ssl%s;\n' "$h2_listen"
-      ((v6)) && printf '    listen [::]:443 ssl%s;\n' "$h2_listen"
+      if relay_active; then
+        printf '    listen 127.0.0.1:%s ssl%s;\n' "$TLS_PORT" "$h2_listen"
+      else
+        printf '    listen 443 ssl%s;\n' "$h2_listen"
+        ((v6)) && printf '    listen [::]:443 ssl%s;\n' "$h2_listen"
+      fi
       [[ -n $h2_line ]] && printf '%s\n' "$h2_line"
       printf '    server_name %s;\n\n' "$DOMAIN"
       printf '    ssl_certificate     %s;\n' "$CERT_FULLCHAIN"
@@ -862,6 +935,14 @@ render_nginx() { # http | https
       printf '}\n'
     fi
   } > "$NGINX_CONF"
+  sync_sni_route "$mode"
+
+  # :443 moves between this http server and the stream relay: a reload would
+  # have to hand the socket from one module to the other, a restart is safer
+  after=$(listen_mode)
+  if [[ $before != none && $after != none && $before != "$after" ]]; then
+    NGINX_RESTART=1
+  fi
 }
 
 apply_nginx() {
@@ -871,11 +952,12 @@ apply_nginx() {
     die "nginx configuration test failed (see the output above)."
   fi
   systemctl enable nginx > /dev/null 2>&1 || true
-  if svc_active nginx; then
+  if svc_active nginx && ((NGINX_RESTART == 0)); then
     systemctl reload nginx || die "Could not reload nginx."
   else
-    systemctl start nginx || die "Could not start nginx."
+    systemctl restart nginx || die "Could not start nginx."
   fi
+  NGINX_RESTART=0
 }
 
 # ---------------------------------------------------------------------------
@@ -1041,6 +1123,9 @@ print_summary() {
   printf ' Data        : %s/data (files for nodes: %s/files -> /files)\n' "$N8N_DIR" "$N8N_DIR"
   printf ' Settings    : %s\n' "$ENV_FILE"
   printf ' Certificate : %s (expires %s, renews automatically)\n' "$CERT_FULLCHAIN" "${expires:-unknown}"
+  if [[ $(listen_mode) == loopback ]]; then
+    printf ' HTTPS       : 127.0.0.1:%s, reached through the dns-setup.sh relay on :443\n' "$TLS_PORT"
+  fi
   printf '%s\n' '--------------------------------------------------------------'
   printf ' Back up N8N_ENCRYPTION_KEY from %s: saved\n' "$ENV_FILE"
   printf ' credentials cannot be decrypted without it.\n\n'
@@ -1091,6 +1176,11 @@ parse_args() {
       --port)
         (($# >= 2)) || die "Option $1 needs a value."
         LOCAL_PORT="$2"
+        shift 2
+        ;;
+      --tls-port)
+        (($# >= 2)) || die "Option $1 needs a value."
+        TLS_PORT="$2"
         shift 2
         ;;
       --max-body)
@@ -1177,6 +1267,7 @@ install_all() {
   say "image  : ${IMAGE_REF}:${IMAGE_TAG} (${DB_TYPE}, timezone ${TIMEZONE})"
   precheck_disk
   precheck_dns
+  precheck_domain_free
   precheck_ports
   ensure_swap
   set_cert_paths
@@ -1229,6 +1320,7 @@ load_installed() {
   IMAGE_TAG="${N8N_SETUP_TAG:-${N8N_TAG:-latest}}"
   TIMEZONE="${N8N_TZ:-UTC}"
   LOCAL_PORT="${N8N_LOCAL_PORT:-5678}"
+  TLS_PORT="${N8N_SETUP_TLS_PORT:-10443}"
   ENCRYPTION_KEY="${N8N_ENCRYPTION_KEY:-}"
   POSTGRES_PASSWORD="${N8N_POSTGRES_PASSWORD:-}"
   DB_TYPE="${N8N_SETUP_DB:-sqlite}"
@@ -1256,6 +1348,11 @@ cmd_status() {
   printf 'Local health: %s\n' "$(n8n_healthy && printf 'OK (127.0.0.1:%s)' "$LOCAL_PORT" || printf 'FAIL')"
   printf 'HTTPS health: %s\n' "$(verify_https && printf OK || printf FAIL)"
   printf 'nginx       : %s\n' "$(svc_active nginx && printf active || printf inactive)"
+  if [[ $(listen_mode) == loopback ]]; then
+    printf 'HTTPS on    : 127.0.0.1:%s (behind the dns-setup.sh relay on :443)\n' "$TLS_PORT"
+  else
+    printf 'HTTPS on    : :443\n'
+  fi
   printf 'Certificate : %s\n' "${expires:-missing}"
   printf 'Disk (data) : %s\n' "$(du -sh "$N8N_DIR" 2> /dev/null | awk '{print $1}')"
 }
@@ -1358,6 +1455,23 @@ cmd_renew() {
   say "Certificate renewed and nginx reloaded."
 }
 
+# dns-setup.sh calls this when its relay takes :443 over or gives it back.
+cmd_nginx() {
+  load_installed
+  if cert_valid; then
+    render_nginx https
+  else
+    warn "No valid certificate for ${DOMAIN}; rendering the HTTP-only site."
+    render_nginx http
+  fi
+  apply_nginx
+  if [[ $(listen_mode) == loopback ]]; then
+    say "n8n now serves HTTPS on 127.0.0.1:${TLS_PORT} behind the dns-setup.sh relay."
+  else
+    say "n8n now serves HTTPS on :443."
+  fi
+}
+
 cmd_uninstall() {
   local yes=0 purge=0 a ans=""
   for a in "$@"; do
@@ -1385,7 +1499,7 @@ cmd_uninstall() {
   fi
 
   say "Removing the nginx configuration ..."
-  rm -f "$NGINX_CONF" "$RENEW_HOOK"
+  rm -f "$NGINX_CONF" "$RENEW_HOOK" "$SNI_MAP"
   rm -rf "$ACME_ROOT"
   if command -v nginx > /dev/null 2>&1 && nginx -t > /dev/null 2>&1; then
     systemctl reload nginx > /dev/null 2>&1 || true
@@ -1414,7 +1528,7 @@ main() {
   require_root "$@"
   local cmd=${1-}
   case "$cmd" in
-    status | info | logs | restart | update | backup | renew | uninstall)
+    status | info | logs | restart | update | backup | renew | nginx | uninstall)
       shift
       "cmd_${cmd}" "$@"
       ;;
@@ -1426,6 +1540,6 @@ main() {
 
 if [[ ${BASH_SOURCE[0]} == "$0" ]]; then
   # untouched defaults, used to rebuild n8nctl after a piped run
-  PRISTINE_VARS=$(declare -p SCRIPT_VERSION N8N_DIR ENV_FILE COMPOSE_FILE LOG_FILE     BACKUP_DIR BACKUP_KEEP NGINX_CONF ACME_ROOT RENEW_HOOK TLS_DIR DS_STREAM_CONF     COMPOSE_PROJECT DEFAULT_IMAGE HUB_IMAGE POSTGRES_IMAGE DOMAIN EMAIL IMAGE_TAG     IMAGE_REF TIMEZONE LOCAL_PORT MAX_BODY REGISTRY_MIRROR OWNER_EMAIL OWNER_PASS     DB_TYPE SKIP_DNS OPEN_FIREWALL SWAP STAGING WANT_POSTGRES ENCRYPTION_KEY     POSTGRES_PASSWORD PUBLIC_IPV4 COMPOSE_BIN OS_ID OS_CODENAME CERT_FULLCHAIN CERT_PRIVKEY)
+  PRISTINE_VARS=$(declare -p SCRIPT_VERSION N8N_DIR ENV_FILE COMPOSE_FILE LOG_FILE     BACKUP_DIR BACKUP_KEEP NGINX_CONF ACME_ROOT RENEW_HOOK TLS_DIR DS_STREAM_CONF     SNI_ROUTES_DIR SNI_MAP COMPOSE_PROJECT DEFAULT_IMAGE HUB_IMAGE POSTGRES_IMAGE     DOMAIN EMAIL IMAGE_TAG IMAGE_REF TIMEZONE LOCAL_PORT TLS_PORT MAX_BODY     REGISTRY_MIRROR OWNER_EMAIL OWNER_PASS DB_TYPE SKIP_DNS OPEN_FIREWALL SWAP     STAGING WANT_POSTGRES ENCRYPTION_KEY POSTGRES_PASSWORD PUBLIC_IPV4 COMPOSE_BIN     NGINX_RESTART OS_ID OS_CODENAME CERT_FULLCHAIN CERT_PRIVKEY)
   main "$@"
 fi

@@ -83,9 +83,9 @@ bash <(curl -Ls https://raw.githubusercontent.com/FarzinNs83/my-scripts/main/dns
 ```
 
 Ports: TCP 53/80/443/853 and UDP 53/853. The script keeps its own paths
-(`/etc/dns-setup`, `/opt/AdGuardHome`, `/root/dns-info.env`) and shares nothing
-with `3xui-setup.sh`, so both can live on the same server as long as their
-ports do not collide.
+(`/etc/dns-setup`, `/opt/AdGuardHome`, `/root/dns-info.env`). It can share a
+server with `3xui-setup.sh` and `n8n-setup.sh`, see
+[All three on one VPS](#all-three-on-one-vps).
 
 ## n8n-setup.sh
 
@@ -132,8 +132,46 @@ bash <(curl -Ls https://raw.githubusercontent.com/FarzinNs83/my-scripts/main/n8n
 ```
 
 Ports: TCP 80/443. Back up `N8N_ENCRYPTION_KEY` from `/opt/n8n/.env`: saved
-credentials cannot be decrypted without it. `dns-setup.sh` also needs :443
-for its relay, so the two cannot run on the same server.
+credentials cannot be decrypted without it. Next to `dns-setup.sh`, n8n
+sits behind its relay on :443, see
+[All three on one VPS](#all-three-on-one-vps).
+
+## All three on one VPS
+
+`dns-setup.sh`, `n8n-setup.sh` and `3xui-setup.sh` can run on the same
+server, in any order. Give each one its own subdomain (for example `dns.`,
+`n8n.` and `panel.` of your domain), each with an A record to the server
+(Cloudflare: DNS only). The scripts refuse a subdomain that another one
+already uses. The smoothest order is dns-setup, then n8n, then 3x-ui.
+
+| Port | Owner |
+| --- | --- |
+| TCP+UDP 53 | AdGuard Home (dns-setup) |
+| TCP 80 | nginx: ACME challenges for all three, http to https redirects |
+| TCP 443 | nginx SNI relay (dns-setup): the DNS domain goes to AdGuard, the n8n domain to n8n on `127.0.0.1:10443`, the relay list to the real sites. Without dns-setup, n8n's own nginx site |
+| TCP+UDP 853 | DoT / DoQ (AdGuard Home) |
+| random TCP 20000-40000 | 3x-ui panel |
+| TCP 8080, 8585, 2096, UDP 8443 | 3x-ui inbounds and subscription |
+| loopback only | 3000 and 18443 (AdGuard), 5678 and 10443 (n8n) |
+
+How the overlaps are handled:
+
+- **443, DNS and n8n**: `dns-setup.sh` moves n8n behind its relay (it runs
+  `n8nctl nginx`, which puts n8n on `127.0.0.1:10443` and adds its domain to
+  `/etc/nginx/sni-routes.d/`). `dnsctl uninstall` moves n8n back to :443.
+  Behind the relay, n8n sees `127.0.0.1` as the client address. Change the
+  loopback port with `--tls-port`.
+- **80 and 3x-ui certificates**: when nginx already owns TCP/80,
+  `3xui-setup.sh` gets the panel certificate from certbot through a small
+  nginx site (`/etc/nginx/conf.d/3xui-setup.conf`), and a renewal hook
+  restarts x-ui. If 3x-ui was installed first (acme.sh on TCP/80), its
+  renewals stop nginx for a few seconds and start it again. Re-run
+  `3xui-setup.sh` after the others to move it to certbot. On such a server,
+  do not use the certificate entries of the `x-ui` menu, because they need
+  TCP/80 free.
+- **Servers set up with older versions of these scripts**: first re-run the
+  current version of the script that is already installed, then install the
+  new one. Each script stops with that hint when the other one is too old.
 
 ## flutter-fgen
 

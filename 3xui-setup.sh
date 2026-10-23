@@ -15,6 +15,12 @@
 #  It stops before touching the server when DNS or TCP/80 is not ready,
 #  because Let's Encrypt cannot validate the domain in that case.
 #
+#  Sharing a server with dns-setup.sh / n8n-setup.sh: when nginx already owns
+#  TCP/80, the certificate comes from certbot through a small nginx site for
+#  the panel domain (no port 80 fight, renewals keep working). Without nginx,
+#  acme.sh renews on TCP/80 and pauses nginx for those seconds if it shows up
+#  later; re-running this script after the others moves it to certbot.
+#
 #  Usage:
 #    bash 3xui-setup.sh panel.example.com
 #    bash <(curl -Ls https://raw.githubusercontent.com/USER/REPO/main/3xui-setup.sh) panel.example.com
@@ -36,6 +42,14 @@ MENU_BIN="/usr/bin/x-ui"
 INFO_FILE="${XUI_INFO_FILE:-/root/3xui-info.env}"
 LOG_FILE="${XUI_LOG_FILE:-/var/log/3xui-setup.log}"
 CERT_ROOT="/root/cert"
+
+# Used only when nginx owns TCP/80 (dns-setup.sh / n8n-setup.sh on this server)
+NGINX_CONF="${XUI_NGINX_CONF:-/etc/nginx/conf.d/3xui-setup.conf}"
+ACME_ROOT="${XUI_ACME_ROOT:-/var/www/3xui-setup}"
+LE_LIVE="/etc/letsencrypt/live"
+LE_HOOK="/etc/letsencrypt/renewal-hooks/deploy/3xui-setup-restart.sh"
+ACME_HOOK="/usr/local/sbin/3xui-acme-hook"
+ACME_MODE="standalone" # standalone: acme.sh on TCP/80, nginx: certbot through nginx
 
 DOMAIN=""
 SKIP_DNS=0
@@ -104,6 +118,12 @@ Options:
       --inbounds-tls    Use the panel certificate for XHTTP/WS inbounds
   -h, --help            Show this help
 
+Certificate:
+  TCP/80 free       acme.sh (standalone, the x-ui default) in /root/cert/<domain>
+  nginx on TCP/80   certbot through nginx (dns-setup.sh / n8n-setup.sh on the
+                    same server) in /etc/letsencrypt/live/<domain>; use a
+                    subdomain of its own, not the DNS or n8n one
+
 Default inbounds (created through the panel API at the end):
   VLESS + XHTTP  TCP 8080  (path /ananas, host = subdomain)
   VLESS + WS     TCP 8585  (path /popcorn, host = subdomain)
@@ -115,6 +135,7 @@ Environment:
   XUI_INSTALLER_URL    install.sh URL                (default: upstream master)
   XUI_INFO_FILE        panel info file               (default: /root/3xui-info.env)
   XUI_LOG_FILE         log file                      (default: /var/log/3xui-setup.log)
+  XUI_ACME_EMAIL       certbot account email         (default: none; nginx mode only)
   INBOUND_XHTTP_PORT   XHTTP inbound port            (default: 8080)
   INBOUND_WS_PORT      WebSocket inbound port        (default: 8585)
   INBOUND_MKCP_PORT    mKCP UDP port                 (default: 8443)
@@ -355,15 +376,43 @@ EOF
 }
 
 precheck_port80() {
-  if port_in_use 80; then
-    local who=""
-    who=$(ss -ltnp 2> /dev/null | awk '$4 ~ /:80$/ {print; exit}') || true
-    if [[ -n $who ]]; then
-      die "TCP/80 is already in use: ${who} -- stop that service (nginx/apache) and re-run."
-    fi
-    die "TCP/80 is already in use -- stop the service using it and re-run."
+  if ! port_in_use 80; then
+    say "TCP/80 is free."
+    return 0
   fi
-  say "TCP/80 is free."
+  local who=""
+  who=$(ss -ltnp 2> /dev/null | awk '$4 ~ /:80$/ {print; exit}') || true
+  if [[ $who == *'"nginx"'* ]]; then
+    ACME_MODE=nginx
+    say "nginx owns TCP/80; the certificate will come from certbot through nginx."
+    return 0
+  fi
+  if [[ -n $who ]]; then
+    die "TCP/80 is already in use: ${who} -- stop that service (apache?) and re-run."
+  fi
+  die "TCP/80 is already in use -- stop the service using it and re-run."
+}
+
+# Every setup on the server needs its own subdomain: one certificate lineage
+# and one nginx server per name.
+precheck_domain_free() {
+  local entry f key owner d re
+  for entry in "/etc/dns-setup/state.env|DS_DOMAIN|dns-setup.sh" "/opt/n8n/.env|N8N_DOMAIN|n8n-setup.sh"; do
+    IFS='|' read -r f key owner <<< "$entry"
+    [[ -r $f ]] || continue
+    d=$(sed -n -E "s/^${key}='?([^']*)'?$/\1/p" "$f" | sed -n '1p')
+    if [[ $d == "$DOMAIN" ]]; then
+      die "${DOMAIN} is already used by ${owner}. Give 3x-ui its own subdomain (e.g. panel.example.com)."
+    fi
+  done
+  [[ $ACME_MODE == nginx ]] || return 0
+  re="^[[:space:]]*server_name[^;]*[[:space:]]$(printf '%s' "$DOMAIN" | sed 's/[.]/\\./g')[[:space:];]"
+  for f in /etc/nginx/conf.d/*.conf /etc/nginx/sites-enabled/*; do
+    [[ -f $f && $f != "$NGINX_CONF" ]] || continue
+    if grep -Eq "$re" "$f"; then
+      die "${DOMAIN} is already served by ${f}. Give 3x-ui its own subdomain."
+    fi
+  done
 }
 
 precheck_disk() {
@@ -492,13 +541,16 @@ install_panel() {
   local tmp rc
   local env_args=(
     XUI_NONINTERACTIVE=1
-    XUI_SSL_MODE=domain
-    XUI_DOMAIN="$DOMAIN"
-    XUI_ACME_HTTP_PORT=80
     XUI_DB_TYPE=sqlite
     XUI_PANEL_PORT="$PANEL_PORT"
     XUI_WEB_BASE_PATH="$WEB_PATH"
   )
+  if [[ $ACME_MODE == nginx ]]; then
+    # acme.sh standalone cannot bind TCP/80 next to nginx; certbot does it later
+    env_args+=(XUI_SSL_MODE=none)
+  else
+    env_args+=(XUI_SSL_MODE=domain XUI_DOMAIN="$DOMAIN" XUI_ACME_HTTP_PORT=80)
+  fi
   [[ -n $PANEL_USER ]] && env_args+=(XUI_USERNAME="$PANEL_USER")
   [[ -n $PANEL_PASS ]] && env_args+=(XUI_PASSWORD="$PANEL_PASS")
 
@@ -589,6 +641,14 @@ cert_valid() {
 }
 
 ensure_ssl() {
+  if [[ $ACME_MODE == nginx ]]; then
+    ensure_ssl_nginx
+    configure_panel_cert
+    drop_acme_renewal
+    verify_https
+    return 0
+  fi
+
   if cert_valid; then
     say "A valid certificate for ${DOMAIN} is already present."
   elif [[ -s $CERT_FILE && -s $KEY_FILE ]]; then
@@ -607,8 +667,150 @@ ensure_ssl() {
     die "Could not obtain a valid certificate for ${DOMAIN}. Check DNS, TCP/80 and /root/.acme.sh/acme.sh.log"
   fi
 
+  install_acme_hooks
   configure_panel_cert
   verify_https
+}
+
+# acme.sh renews in standalone mode on TCP/80. If nginx arrives later
+# (dns-setup.sh / n8n-setup.sh), these hooks stop it for the few seconds the
+# renewal needs and start it again.
+install_acme_hooks() {
+  local f="" dir
+  for dir in "/root/.acme.sh/${DOMAIN}_ecc" "/root/.acme.sh/${DOMAIN}"; do
+    if [[ -f ${dir}/${DOMAIN}.conf ]]; then
+      f="${dir}/${DOMAIN}.conf"
+      break
+    fi
+  done
+  if [[ -z $f ]]; then
+    warn "No acme.sh config for ${DOMAIN}; renewals cannot pause nginx if it is installed later."
+    return 0
+  fi
+  cat > "$ACME_HOOK" << 'EOF'
+#!/bin/sh
+# Added by 3xui-setup.sh: acme.sh renews the panel certificate on TCP/80
+# (standalone). Free the port from nginx for the renewal, then bring it back.
+flag=/run/3xui-acme-stopped-nginx
+case "$1" in
+  pre)
+    if systemctl is-active --quiet nginx 2> /dev/null; then
+      systemctl stop nginx && touch "$flag"
+    fi
+    ;;
+  post)
+    if [ -f "$flag" ]; then
+      rm -f "$flag"
+      systemctl start nginx
+    fi
+    ;;
+esac
+exit 0
+EOF
+  chmod 755 "$ACME_HOOK"
+  # acme.sh reads plain values as well as its base64-wrapped ones
+  set_acme_conf "$f" Le_PreHook "${ACME_HOOK} pre"
+  set_acme_conf "$f" Le_PostHook "${ACME_HOOK} post"
+}
+
+set_acme_conf() { # file key value
+  local f=$1 k=$2 v=$3
+  if grep -q "^${k}=" "$f"; then
+    sed -i "s|^${k}=.*|${k}='${v}'|" "$f"
+  else
+    printf "%s='%s'\n" "$k" "$v" >> "$f"
+  fi
+}
+
+# ---------------------------------------------------------------------------
+# Certificate through nginx (dns-setup.sh / n8n-setup.sh own TCP/80)
+# ---------------------------------------------------------------------------
+render_nginx_acme() {
+  local out
+  [[ -d /etc/nginx/conf.d ]] || die "/etc/nginx/conf.d is missing; unexpected nginx layout."
+  grep -rqs 'conf\.d/\*\.conf' /etc/nginx/nginx.conf \
+    || die "/etc/nginx/nginx.conf does not include conf.d/*.conf; add it and re-run."
+  mkdir -p "${ACME_ROOT}/.well-known/acme-challenge"
+  chmod 755 "$ACME_ROOT" "${ACME_ROOT}/.well-known" "${ACME_ROOT}/.well-known/acme-challenge"
+  {
+    printf '# Managed by 3xui-setup.sh -- ACME challenges for the 3x-ui panel domain\n'
+    printf 'server {\n'
+    printf '    listen 80;\n'
+    if [[ -f /proc/net/if_inet6 ]]; then
+      printf '    listen [::]:80;\n'
+    fi
+    printf '    server_name %s;\n\n' "$DOMAIN"
+    printf '    location ^~ /.well-known/acme-challenge/ {\n'
+    printf '        root %s;\n' "${ACME_ROOT%/}"
+    printf '        default_type "text/plain";\n'
+    printf '    }\n'
+    printf '    location / {\n'
+    printf '        return 444;\n'
+    printf '    }\n'
+    printf '}\n'
+  } > "$NGINX_CONF"
+  if ! out=$(nginx -t 2>&1); then
+    printf '%s\n' "$out" >&2
+    rm -f "$NGINX_CONF"
+    die "nginx rejected ${NGINX_CONF} (see the output above)."
+  fi
+  systemctl reload nginx || die "Could not reload nginx."
+}
+
+ensure_ssl_nginx() {
+  if ! command -v certbot > /dev/null 2>&1; then
+    say "Installing certbot ..."
+    apt-get -o DPkg::Lock::Timeout=180 install -y -qq certbot \
+      || die "Could not install certbot."
+  fi
+  render_nginx_acme
+
+  if cert_valid; then
+    say "A valid certificate for ${DOMAIN} is already present."
+  else
+    local args=(
+      certonly --webroot -w "$ACME_ROOT"
+      -d "$DOMAIN" --cert-name "$DOMAIN"
+      --agree-tos --no-eff-email
+      --non-interactive --keep-until-expiring
+    )
+    if [[ -n ${XUI_ACME_EMAIL:-} ]]; then
+      args+=(--email "$XUI_ACME_EMAIL")
+    else
+      args+=(--register-unsafely-without-email)
+    fi
+    say "Requesting a certificate for ${DOMAIN} (certbot, HTTP-01 through nginx) ..."
+    certbot "${args[@]}" \
+      || die "certbot failed for ${DOMAIN}. Check DNS (grey cloud), TCP/80 in the provider firewall and /var/log/letsencrypt/letsencrypt.log"
+  fi
+  cert_valid || die "Could not obtain a valid certificate for ${DOMAIN}."
+
+  install -d -m 755 "$(dirname "$LE_HOOK")"
+  cat > "$LE_HOOK" << EOF
+#!/bin/sh
+# Added by 3xui-setup.sh: restart x-ui after certbot renews ${DOMAIN}.
+case " \$RENEWED_DOMAINS " in
+  *" ${DOMAIN} "*) systemctl restart x-ui 2> /dev/null || rc-service x-ui restart 2> /dev/null || true ;;
+esac
+EOF
+  chmod 755 "$LE_HOOK"
+  systemctl enable --now certbot.timer > /dev/null 2>&1 || true
+}
+
+# The panel now uses the certbot files; stop acme.sh from renewing the old
+# certificate on TCP/80 (it would fail, or pause nginx through the hook).
+drop_acme_renewal() {
+  local acme dir
+  acme=$(acme_bin) || return 0
+  for dir in "/root/.acme.sh/${DOMAIN}_ecc" "/root/.acme.sh/${DOMAIN}"; do
+    [[ -f ${dir}/${DOMAIN}.conf ]] || continue
+    if [[ $dir == *_ecc ]]; then
+      "$acme" --remove -d "$DOMAIN" --ecc > /dev/null 2>&1 || true
+    else
+      "$acme" --remove -d "$DOMAIN" > /dev/null 2>&1 || true
+    fi
+    say "acme.sh no longer renews ${DOMAIN}; certbot does."
+  done
 }
 
 configure_panel_cert() {
@@ -1119,7 +1321,11 @@ print_summary() {
     printf ' Credentials : unchanged / unknown (existing installation)\n'
   fi
   printf ' Certificate : %s\n' "$CERT_FILE"
-  printf ' Expires     : %s\n' "${expires:-unknown}"
+  if [[ $ACME_MODE == nginx ]]; then
+    printf ' Expires     : %s (certbot renews it through nginx)\n' "${expires:-unknown}"
+  else
+    printf ' Expires     : %s (acme.sh renews it on TCP/80)\n' "${expires:-unknown}"
+  fi
   printf ' Info file   : %s\n' "$INFO_FILE"
   printf '%s\n' '--------------------------------------------------------------'
   if [[ $SKIP_INBOUNDS -eq 0 ]]; then
@@ -1167,6 +1373,7 @@ main() {
   load_os
   precheck_dns
   precheck_port80
+  precheck_domain_free
   precheck_disk
 
   local installed=0
@@ -1224,8 +1431,13 @@ main() {
   fi
   [[ -n $ACTUAL_PORT ]] || die "Could not read the panel port from ${XUI_BIN} setting -show."
 
-  CERT_FILE="${CERT_ROOT}/${DOMAIN}/fullchain.pem"
-  KEY_FILE="${CERT_ROOT}/${DOMAIN}/privkey.pem"
+  if [[ $ACME_MODE == nginx ]]; then
+    CERT_FILE="${LE_LIVE}/${DOMAIN}/fullchain.pem"
+    KEY_FILE="${LE_LIVE}/${DOMAIN}/privkey.pem"
+  else
+    CERT_FILE="${CERT_ROOT}/${DOMAIN}/fullchain.pem"
+    KEY_FILE="${CERT_ROOT}/${DOMAIN}/privkey.pem"
+  fi
 
   ensure_ssl
 
