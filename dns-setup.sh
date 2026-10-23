@@ -22,9 +22,10 @@
 #  unit, log and state, and it never touches /usr/local/x-ui or its inbounds.
 #
 #  Usage:
-#    bash dns-setup.sh dns.example.com
-#    bash dns-setup.sh --open-firewall --email me@example.com dns.example.com
-#    bash <(curl -Ls https://raw.githubusercontent.com/USER/REPO/main/dns-setup.sh) dns.example.com
+#    bash dns-setup.sh                      (asks for the domain)
+#    bash dns-setup.sh --open-firewall --email me@example.com
+#    bash <(curl -Ls https://raw.githubusercontent.com/USER/REPO/main/dns-setup.sh)
+#    bash <(curl -Ls https://raw.githubusercontent.com/USER/REPO/main/dns-setup.sh) --uninstall
 #    dnsctl add registry.npmjs.org
 #    dnsctl status
 #
@@ -36,7 +37,8 @@ export LC_ALL=C
 export DEBIAN_FRONTEND=noninteractive
 export NEEDRESTART_MODE=a
 
-SCRIPT_VERSION="1.0.2"
+SCRIPT_VERSION="1.1.0"
+SELF_URL="${DS_SELF_URL:-https://raw.githubusercontent.com/FarzinNs83/my-scripts/main/dns-setup.sh}"
 
 # ---------------------------------------------------------------------------
 # Paths (all overridable from the environment for testing)
@@ -81,6 +83,7 @@ CACHE_SIZE="${DS_CACHE_SIZE:-4194304}"
 SKIP_DNS=0
 OPEN_FIREWALL=0
 RELAY=1
+DEFAULT_LIST="" # 1 = seed the built-in sanctioned list, 0 = start empty, "" = ask
 STAGING=0
 FORCE=0
 DISABLE_AAAA="${DS_DISABLE_AAAA:-0}"
@@ -99,6 +102,9 @@ PUBLIC_IPV6=""
 AGH_URL=""
 WORK_DIR=""
 
+C_GREEN=""
+C_RESET=""
+
 say() { printf '[+] %s\n' "$*"; }
 warn() { printf '[!] %s\n' "$*" >&2; }
 die() { printf '[x] %s\n' "$*" >&2; exit 1; }
@@ -108,7 +114,7 @@ usage() {
 dns-setup.sh -- self-hosted anti-sanction DNS: AdGuard Home + SNI relay.
 
 Usage:
-  sudo bash dns-setup.sh [options] <domain>
+  sudo bash dns-setup.sh [options]          (asks for the domain)
   dnsctl <command> [args]
 
 Install options:
@@ -117,6 +123,8 @@ Install options:
       --skip-dns-check    do not verify that the domain points to this server
       --open-firewall     open 53/tcp, 53/udp, 80, 443, 853/tcp, 853/udp (ufw, firewalld)
       --no-relay          DNS only: no SNI relay and no rewrite list
+      --default-list      seed the built-in sanctioned-domain list (no question)
+      --no-default-list   start with an empty relay list (no question)
       --relay-list <file> seed the relay list from a file (one domain per line)
       --upstream <url>    AdGuard upstream (DoH/DoT/plain); repeatable, replaces the default
       --ir-upstream <ip>  resolve *.ir through this resolver instead
@@ -127,6 +135,7 @@ Install options:
       --loopback-port <n> local HTTPS port behind :443 (default: 18443)
       --staging           Let's Encrypt staging CA (testing only)
       --force             reinstall AdGuard Home / refresh everything
+      --uninstall [--yes] remove everything this script set up (see below)
   -h, --help              show this help
 
 Commands (same as dnsctl):
@@ -134,7 +143,8 @@ Commands (same as dnsctl):
   remove <domain>...  remove domains from the relay list
   import <file|url>   bulk-add domains from a community list
                       (e.g. the sanctioned-domain lists on GitHub)
-  list                show the relay list
+  defaults            merge the built-in sanctioned list into the relay list
+  list               show the relay list
   sync                re-apply list, rewrites and nginx after manual edits
   allow [<cidr>...]   show or set the client allowlist (no arguments = show)
   allow --clear       serve every client again
@@ -142,7 +152,9 @@ Commands (same as dnsctl):
   test                end-to-end checks: DoH, DoT, relay, rewrite
   info                client settings: DoH URL, DoT host, DNS stamps, QR code
   renew               force a certificate renewal and reload the services
-  uninstall [--yes]   remove everything this script installed
+  uninstall [--yes]   remove AdGuard Home, the certificate, the nginx relay
+                      configs, the relay list and all state; nginx, certbot
+                      and the other packages stay installed
 
 How the relay works:
   A client that uses this DNS resolves a relay-list domain to THIS server.
@@ -1205,12 +1217,65 @@ PY
 # ---------------------------------------------------------------------------
 # Verification
 # ---------------------------------------------------------------------------
+# RFC 8484 GET through nginx; prints the A/AAAA answers, one per line.
+# AdGuard Home only speaks the wire format on /dns-query (no JSON API).
+doh_query() { # name [A|AAAA]
+  local name=$1 qtype=${2:-A} q resp
+  work_dir > /dev/null
+  resp="${WORK_DIR}/doh-response.bin"
+  q=$(python3 - "$name" "$qtype" <<'PY'
+import base64, struct, sys
+
+name, qtype = sys.argv[1], {"A": 1, "AAAA": 28}[sys.argv[2]]
+msg = struct.pack(">HHHHHH", 0, 0x0100, 1, 0, 0, 0)
+for label in name.strip(".").split("."):
+    msg += bytes([len(label)]) + label.encode()
+msg += b"\x00" + struct.pack(">HH", qtype, 1)
+print(base64.urlsafe_b64encode(msg).decode().rstrip("="))
+PY
+  ) || return 1
+  : > "$resp"
+  curl -sS --max-time 12 --resolve "${DOMAIN}:443:127.0.0.1" \
+    -H 'accept: application/dns-message' -o "$resp" \
+    "https://${DOMAIN}/dns-query?dns=${q}" 2> /dev/null || return 1
+  python3 - "$resp" <<'PY'
+import ipaddress, struct, sys
+
+data = open(sys.argv[1], "rb").read()
+
+def skip_name(i):
+    while True:
+        n = data[i]
+        if n == 0:
+            return i + 1
+        if n & 0xC0 == 0xC0:
+            return i + 2
+        i += n + 1
+
+try:
+    qd, an = struct.unpack(">HH", data[4:8])
+    i = 12
+    for _ in range(qd):
+        i = skip_name(i) + 4
+    for _ in range(an):
+        i = skip_name(i)
+        rtype, _, _, rdlen = struct.unpack(">HHIH", data[i:i + 10])
+        i += 10
+        rdata = data[i:i + rdlen]
+        i += rdlen
+        if rtype == 1 and rdlen == 4:
+            print(ipaddress.IPv4Address(rdata))
+        elif rtype == 28 and rdlen == 16:
+            print(ipaddress.IPv6Address(rdata))
+except (IndexError, struct.error):
+    sys.exit(1)
+PY
+}
+
 verify_doh() {
-  local body
-  body=$(curl -sS --max-time 12 --resolve "${DOMAIN}:443:127.0.0.1" \
-    -H 'accept: application/dns-json' \
-    "https://${DOMAIN}/dns-query?name=example.com&type=A" 2> /dev/null || true)
-  [[ $body == *'"Answer"'* ]]
+  local out
+  out=$(doh_query example.com A) || return 1
+  [[ -n $out ]]
 }
 
 verify_dot() {
@@ -1228,12 +1293,9 @@ verify_relay() {
 }
 
 verify_rewrite() {
-  local d=$1 body
-  body=$(curl -sS --max-time 12 --resolve "${DOMAIN}:443:127.0.0.1" \
-    -H 'accept: application/dns-json' \
-    "https://${DOMAIN}/dns-query?name=${d}&type=A" 2> /dev/null || true)
-  body=${body//[[:space:]]/}
-  [[ $body == *"\"data\":\"${PUBLIC_IPV4}\""* ]]
+  local d=$1 out
+  out=$(doh_query "$d" A) || return 1
+  grep -qxF "$PUBLIC_IPV4" <<< "$out"
 }
 
 # Does any relay entry cover this hostname?
@@ -1252,6 +1314,10 @@ relay_matches_host() {
 run_checks() {
   local failures=0 probe="" c
   local candidates=(registry.npmjs.org pypi.org huggingface.co github.com docker.io steampowered.com)
+  # fall back to the first plain entries of a custom list
+  while IFS= read -r c; do
+    candidates+=("$c")
+  done < <(relay_domains | grep -v '^\*' | head -n 3)
 
   if verify_doh; then
     say "DoH through nginx ..... OK"
@@ -1267,7 +1333,9 @@ run_checks() {
     failures=$((failures + 1))
   fi
 
-  if [[ $RELAY -eq 1 ]]; then
+  if [[ $RELAY -eq 1 && -z $(relay_domains) ]]; then
+    say "TLS relay ............. skipped (the relay list is empty)"
+  elif [[ $RELAY -eq 1 ]]; then
     for c in "${candidates[@]}"; do
       relay_matches_host "$c" || continue
       if verify_relay "$c"; then
@@ -1295,10 +1363,8 @@ run_checks() {
 # ---------------------------------------------------------------------------
 # Relay list seeding
 # ---------------------------------------------------------------------------
-seed_default_list() {
-  install -d -m 700 "$DS_DIR"
-  [[ -s $DOMAINS_FILE ]] && return 0
-  cat > "$DOMAINS_FILE" <<'EOF'
+list_header() {
+  cat <<'EOF'
 # dns-setup relay list
 #
 # Every domain here is answered with THIS server's address and then relayed by
@@ -1309,17 +1375,27 @@ seed_default_list() {
 #   dnsctl add    example.com      add one or more domains
 #   dnsctl remove example.com      remove them
 #   dnsctl import <file|url>       bulk-add a community list
+#   dnsctl defaults                merge the built-in sanctioned list
 #   dnsctl sync                    re-apply after editing this file by hand
 #
 # The list is also visible and editable in the panel's DNS rewrites page.
 # The relay does not hide the TLS SNI, so sites filtered inside Iran by SNI
 # still need a proxy; here we fix geo-blocks and IP-based blocks.
 # Delete the categories you do not use.
+EOF
+}
 
-# ---- package registries / build tooling --------------------------------
+# The built-in sanctioned-domain list, grouped by category.
+default_domains() {
+  cat <<'EOF'
+
+# ---- package registries / languages / build tooling --------------------
 npmjs.org
 npmjs.com
 yarnpkg.com
+pnpm.io
+bun.sh
+jsr.io
 nodejs.org
 nodesource.com
 pypi.org
@@ -1332,62 +1408,193 @@ rust-lang.org
 rustup.rs
 golang.org
 go.dev
+godoc.org
 gopkg.in
 rubygems.org
+ruby-doc.org
 packagist.org
+packagist.com
 getcomposer.org
+php.net
+laravel.com
+symfony.com
+zend.com
 nuget.org
+dot.net
 maven.org
 mvnrepository.com
-repo.maven.apache.org
+apache.org
 gradle.org
 jitpack.io
+jfrog.io
+jfrog.com
+conan.io
+packagecloud.io
+sonatype.com
 bazel.build
 hex.pm
 pub.dev
 dart.dev
+dartlang.org
 flutter.dev
+flutter.io
+android.com
+kotlinlang.org
+swift.org
+cocoapods.org
+spring.io
+oracle.com
+java.com
+java.net
+azul.com
+gluonhq.com
+qt.io
 deno.land
+deno.com
+nextjs.org
+reactjs.org
+react.dev
+vuejs.org
+nestjs.com
+expressjs.com
+eslint.org
+graphql.org
+socket.io
+djangoproject.com
+chocolatey.org
+sourceforge.net
+fsdn.com
+curl.se
+chromium.org
+googlesource.com
+pkg.dev
+genymotion.com
 
 # ---- AI / machine learning ---------------------------------------------
 huggingface.co
 hf.co
+hf.space
 pytorch.org
 tensorflow.org
 kaggle.com
 kaggleusercontent.com
+kaggle.io
 wandb.ai
+paperswithcode.com
 storage.googleapis.com
 openai.com
 chatgpt.com
+sora.com
 oaistatic.com
 oaiusercontent.com
 anthropic.com
 claude.ai
+claude.com
 perplexity.ai
 deepmind.com
+ai.google
+ai.google.dev
 aistudio.google.com
+gemini.google.com
+notebooklm.google.com
+labs.google
 generativelanguage.googleapis.com
 colab.research.google.com
+x.ai
+grok.com
+mistral.ai
+cohere.com
+groq.com
+together.ai
+replicate.com
+openrouter.ai
+ollama.com
+midjourney.com
+runwayml.com
+stability.ai
+civitai.com
+elevenlabs.io
+suno.com
+poe.com
+character.ai
+deepl.com
+krisp.ai
+cursor.com
+cursor.sh
+codeium.com
+windsurf.com
+githubcopilot.com
+v0.dev
+lovable.dev
+bolt.new
+nvcr.io
+runpod.io
+vast.ai
+lambdalabs.com
+modal.com
 
 # ---- source hosts, CI and hosting --------------------------------------
 github.com
 githubusercontent.com
 githubassets.com
 github.io
+github.dev
 ghcr.io
 gitlab.com
 gitlab.io
+gitlab-static.net
 bitbucket.org
+bitbucket.io
 atlassian.com
 atlassian.net
+atl-paas.net
 travis-ci.com
+travis-ci.org
+circleci.com
+codecov.io
+snyk.io
+sonarcloud.io
 heroku.com
 vercel.com
+netlify.com
+netlify.app
+render.com
+fly.io
+railway.app
+supabase.com
+supabase.co
+glitch.com
+glitch.me
+stackblitz.com
+csb.app
 firebase.com
 firebase.google.com
 firebaseio.com
+firebaseinstallations.googleapis.com
+firebaseremoteconfig.googleapis.com
+firebasestorage.googleapis.com
+crashlytics.com
 expo.dev
+expo.io
+gitbook.com
+gitbook.io
+browserstack.com
+
+# ---- google developer services -----------------------------------------
+developers.google.com
+code.google.com
+issuetracker.google.com
+dl-ssl.google.com
+admob.com
+ads.google.com
+analytics.google.com
+marketingplatform.google.com
+web.dev
+material.io
+
+# ---- apple developer ---------------------------------------------------
+developer.apple.com
+appstoreconnect.apple.com
 
 # ---- containers / cloud / devops ---------------------------------------
 docker.com
@@ -1397,35 +1604,116 @@ quay.io
 gcr.io
 k8s.io
 kubernetes.io
-registry.k8s.io
 helm.sh
+goharbor.io
 terraform.io
 hashicorp.com
-releases.hashicorp.com
+vagrantup.com
+consul.io
+vaultproject.io
+nomadproject.io
+packer.io
+pulumi.com
+ansible.com
+redhat.com
+redhat.io
+openshift.com
+vmware.com
+broadcom.com
+virtualbox.org
+ubuntu.com
+snapcraft.io
+snapcraftcontent.com
+launchpad.net
+almalinux.org
+cloudlinux.com
 aws.amazon.com
 amazonaws.com
+awsstatic.com
 cloud.google.com
 dl.google.com
 maven.google.com
 play.google.com
 azure.com
 visualstudio.com
+vsassets.io
+vscode.dev
+vscode-cdn.net
+aka.ms
+ibm.com
+oraclecloud.com
 digitalocean.com
 linode.com
 vultr.com
 hetzner.com
 hetzner.cloud
 paperspace.com
+kinsta.com
+siteground.com
 namecheap.com
 godaddy.com
+cpanel.net
+plesk.com
+webmin.com
+virtualmin.com
+nginx.com
+caddyserver.com
 grafana.com
 grafana.net
 elastic.co
 sentry.io
+newrelic.com
+datadoghq.com
+splunk.com
+solarwinds.com
+zabbix.com
+netdata.cloud
+victoriametrics.com
+launchdarkly.com
 mongodb.com
+mongodb.org
 redis.io
+redis.com
 mysql.com
 mariadb.com
+percona.com
+enterprisedb.com
+rabbitmq.com
+min.io
+maxmind.com
+ipinfo.io
+cisco.com
+netacad.com
+fortinet.com
+teamviewer.com
+anydesk.com
+
+# ---- APIs, email and SaaS for developers -------------------------------
+auth0.com
+twilio.com
+sendgrid.com
+mailgun.com
+mailchimp.com
+mandrillapp.com
+sendinblue.com
+brevo.com
+rapidapi.com
+swaggerhub.com
+algolia.com
+algolia.net
+algolianet.com
+cloudinary.com
+imgix.net
+segment.com
+segment.io
+bugsnag.com
+statuspage.io
+intercom.io
+intercomcdn.com
+zendesk.com
+salesforce.com
+zoho.com
+mapbox.com
 
 # ---- games, stores and launchers ---------------------------------------
 steampowered.com
@@ -1465,6 +1753,7 @@ nintendo.net
 roblox.com
 rbxcdn.com
 minecraft.net
+minecraftservices.com
 mojang.com
 gog.com
 gog-statics.com
@@ -1478,12 +1767,38 @@ respawn.com
 garena.com
 garenanow.com
 supercell.com
+hoyoverse.com
+mihoyo.com
+bethesda.net
+cdprojektred.com
+wargaming.net
+2k.com
+faceit.com
+curseforge.com
+overwolf.com
 geforce.com
 nvidia.com
 amd.com
 intel.com
 
-# ---- microsoft / adobe / mathworks --------------------------------------
+# ---- hardware and electronics ------------------------------------------
+dell.com
+lenovo.com
+hpe.com
+xilinx.com
+altera.com
+ti.com
+st.com
+microchip.com
+digikey.com
+element14.com
+keil.com
+mbed.com
+ni.com
+wd.com
+wdc.com
+
+# ---- microsoft / adobe / autodesk / mathworks ---------------------------
 microsoft.com
 office.com
 live.com
@@ -1491,33 +1806,79 @@ skype.com
 adobe.com
 adobelogin.com
 adobeexchange.com
+behance.net
+typekit.com
+typekit.net
+autodesk.com
 unity.com
 unity3d.com
 jetbrains.com
+intellij.net
 mathworks.com
 
-# ---- design and productivity -------------------------------------------
+# ---- design, media and productivity ------------------------------------
 figma.com
+framer.com
+webflow.com
+sketch.com
+spline.design
+lottiefiles.com
 miro.com
 notion.so
 trello.com
+asana.com
+clickup.com
+monday.com
+airtable.com
+smartsheet.com
+zapier.com
+calendly.com
+docusign.com
+typeform.com
+loom.com
+todoist.com
+evernote.com
+toggl.com
 slack.com
 zoom.us
+zoom.com
 webex.com
+jitsi.org
+prezi.com
 grammarly.com
 quillbot.com
 wordtune.com
 zeplin.io
 invisionapp.com
+invis.io
 remove.bg
 tinypng.com
+tinyjpg.com
+tinify.com
+shortpixel.com
+smallpdf.com
 ilovepdf.com
 convertio.co
 freepik.com
-envato.com
-themeforest.net
-graphicriver.net
+freepikcompany.com
 flaticon.com
+slidesgo.com
+envato.com
+envato-static.com
+themeforest.net
+codecanyon.net
+graphicriver.net
+audiojungle.net
+videohive.net
+photodune.net
+3docean.net
+motionarray.com
+creativemarket.com
+shutterstock.com
+fontawesome.com
+sketchfab.com
+cgtrader.com
+grabcad.com
 canva.com
 medium.com
 dev.to
@@ -1532,25 +1893,84 @@ gitpod.io
 godbolt.org
 overleaf.com
 
+# ---- wordpress ecosystem ------------------------------------------------
+elementor.com
+woocommerce.com
+wordfence.com
+wpml.org
+wp-rocket.me
+wpastra.com
+wpbakery.com
+rankmath.com
+jetpack.com
+akismet.com
+gravatar.com
+gravityforms.com
+yithemes.com
+theme-fusion.com
+crocoblock.com
+oxygenbuilder.com
+bricksbuilder.io
+monsterinsights.com
+wpmudev.com
+
 # ---- learning -----------------------------------------------------------
 coursera.org
+coursera.com
 udemy.com
+udacity.com
 edx.org
 khanacademy.org
 datacamp.com
+codecademy.com
 freecodecamp.org
+skillshare.com
+brilliant.org
+frontendmasters.com
+educative.io
 teamtreehouse.com
 pluralsight.com
+acloudguru.com
+acloud.guru
+cybrary.it
+codewithmosh.com
+hackerrank.com
+hackthebox.com
 packtpub.com
 oreilly.com
+safaribooksonline.com
+ieee.org
+mendeley.com
+coursehero.com
+mit.edu
 
-# ---- payments and accounts ---------------------------------------------
+# ---- freelancing, payments and accounts --------------------------------
+upwork.com
+fiverr.com
+freelancer.com
 paypal.com
 paypalobjects.com
 stripe.com
+stripe.network
+paddle.com
 binance.com
 coinbase.com
 EOF
+}
+
+seed_default_list() {
+  install -d -m 700 "$DS_DIR"
+  [[ -s $DOMAINS_FILE ]] && return 0
+  if [[ $DEFAULT_LIST == 0 ]]; then
+    list_header > "$DOMAINS_FILE"
+    chmod 600 "$DOMAINS_FILE"
+    say "Started with an empty relay list (add domains with: dnsctl add|defaults)."
+    return 0
+  fi
+  {
+    list_header
+    default_domains
+  } > "$DOMAINS_FILE"
   chmod 600 "$DOMAINS_FILE"
   say "Seeded the relay list ($(relay_domains | wc -l) domains) at ${DOMAINS_FILE}."
 }
@@ -1632,6 +2052,7 @@ print_summary() {
   printf '==============================================================\n'
   printf ' Anti-sanction DNS is ready\n'
   printf '==============================================================\n'
+  printf '%s' "$C_GREEN"
   printf ' Panel URL   : https://%s/\n' "$DOMAIN"
   printf ' Username    : %s\n' "$ADMIN_USER"
   printf ' Password    : %s\n' "$ADMIN_PASS"
@@ -1643,6 +2064,7 @@ print_summary() {
   printf ' Relay list  : %s domains (%s)\n' "$count" "$DOMAINS_FILE"
   printf ' In panel    : DNS rewrites page (one entry per domain)\n'
   printf ' Info file   : %s\n' "$INFO_FILE"
+  printf '%s' "$C_RESET"
   printf '%s\n' '--------------------------------------------------------------'
   if [[ $RELAY -eq 1 ]]; then
     printf ' Traffic for the relayed domains leaves this server; everything\n'
@@ -1651,7 +2073,8 @@ print_summary() {
     printf ' Relay disabled (--no-relay): this is a plain encrypted DNS server.\n'
   fi
   printf '\n Open in your provider firewall: TCP 53, 80, 443, 853 + UDP 53, 853.\n'
-  printf ' Manage the list with: dnsctl add|remove <domain>, dnsctl status\n'
+  printf ' Manage the list with: dnsctl add|remove <domain>, dnsctl defaults\n'
+  printf ' Status / removal    : dnsctl status, dnsctl uninstall\n'
   printf '==============================================================\n'
 }
 
@@ -1681,6 +2104,14 @@ parse_args() {
         ;;
       --no-relay)
         RELAY=0
+        shift
+        ;;
+      --default-list)
+        DEFAULT_LIST=1
+        shift
+        ;;
+      --no-default-list)
+        DEFAULT_LIST=0
         shift
         ;;
       --relay-list)
@@ -1766,6 +2197,25 @@ resolve_domain() {
   fi
 }
 
+# Asked right after the domain: seed the built-in sanctioned list or start
+# with an empty relay list. Default yes; skipped when the answer is already
+# known (flags, --no-relay, --relay-list, an existing list, no terminal).
+resolve_default_list() {
+  local ans="" count
+  [[ -n $DEFAULT_LIST ]] && return 0
+  if [[ $RELAY -eq 0 || -n $CUSTOM_LIST || -s $DOMAINS_FILE || ! -t 0 ]]; then
+    DEFAULT_LIST=1
+    return 0
+  fi
+  count=$(default_domains | sed -e 's/#.*//' -e 's/[[:space:]]//g' | grep -c .)
+  printf 'Add the built-in list of sanctioned domains (%s domains) to the relay? [Y/n]: ' "$count"
+  read -r ans || ans=""
+  case "${ans,,}" in
+    n | no) DEFAULT_LIST=0 ;;
+    *) DEFAULT_LIST=1 ;;
+  esac
+}
+
 prepare_credentials() {
   if [[ -r $INFO_FILE ]]; then
     # shellcheck disable=SC1090
@@ -1801,6 +2251,7 @@ install_adguard_and_configure() {
 install_all() {
   parse_args "$@"
   resolve_domain
+  resolve_default_list
   EMAIL="${EMAIL:-admin@${DOMAIN}}"
   setup_logging
   trap '_on_err $LINENO' ERR
@@ -1902,6 +2353,8 @@ install_all() {
 
   if [[ $OPEN_FIREWALL -eq 1 ]]; then
     open_firewall_rules
+    install -d -m 700 "$DS_DIR"
+    : > "${DS_DIR}/firewall-opened"
   else
     warn "Firewall not touched. Open TCP 53/80/443/853 and UDP 53/853 (or use --open-firewall)."
   fi
@@ -1923,9 +2376,14 @@ install_self() {
   local src
   src=$(readlink -f "$0" 2> /dev/null || printf '%s' "$0")
   case "$src" in
-    /dev/fd/* | /proc/* | /dev/stdin)
-      warn "Running from a pipe; skipping the dnsctl installation."
-      return 0
+    /dev/fd/* | /proc/* | /dev/stdin | pipe:*)
+      # bash <(curl ...) cannot be re-read; fetch a copy for dnsctl instead
+      src="$(work_dir)/dns-setup.sh"
+      if ! curl -fsSL --max-time 60 -o "$src" "$SELF_URL" \
+        || ! head -n 1 "$src" | grep -q '^#!.*bash' || ! bash -n "$src" 2> /dev/null; then
+        warn "Running from a pipe and could not download ${SELF_URL}; skipping the dnsctl installation."
+        return 0
+      fi
       ;;
   esac
   [[ -f $src ]] || return 0
@@ -2026,6 +2484,24 @@ cmd_import() {
     die "Re-run with --force if that is really what you want."
   fi
   say "Imported ${added} new domain(s) from ${seen} line(s); list size: ${total}."
+  sync_all
+}
+
+cmd_defaults() {
+  local d added=0
+  load_state || exit 1
+  if [[ $RELAY -eq 0 ]]; then
+    die "The relay is disabled (installed with --no-relay)."
+  fi
+  install -d -m 700 "$DS_DIR"
+  [[ -s $DOMAINS_FILE ]] || list_header > "$DOMAINS_FILE"
+  while IFS= read -r d; do
+    grep -qxF "$d" "$DOMAINS_FILE" && continue
+    printf '%s\n' "$d" >> "$DOMAINS_FILE"
+    added=$((added + 1))
+  done < <(default_domains | sed -e 's/#.*//' -e 's/[[:space:]]//g' | grep -v '^$')
+  chmod 600 "$DOMAINS_FILE"
+  say "Added ${added} built-in domain(s); list size: $(relay_domains | wc -l)."
   sync_all
 }
 
@@ -2151,44 +2627,140 @@ cmd_renew() {
   say "Certificate renewed and services reloaded."
 }
 
+# Undo everything the installer did. Packages (nginx, certbot,
+# libnginx-mod-stream, python3, qrencode, ...) stay installed.
 cmd_uninstall() {
-  local ans=""
-  if [[ ${1-} != "--yes" ]]; then
-    printf 'This removes AdGuard Home, the nginx relay config and %s. Type "yes": ' "$DS_DIR"
-    read -r ans || true
-    [[ $ans == yes ]] || die "Aborted."
+  local ans="" yes=0 fw=0 p
+  while (($# > 0)); do
+    case "$1" in
+      -y | --yes) yes=1 ;;
+      -d | --domain)
+        (($# >= 2)) || die "Option $1 needs a value."
+        DOMAIN=$(normalize_domain "$2")
+        shift
+        ;;
+      *) die "Unknown uninstall option: $1 (use --yes, --domain <name>)." ;;
+    esac
+    shift
+  done
+
+  # the domain (for the certificate) comes from the state, the info file or
+  # the nginx config, whichever survived
+  if [[ -z $DOMAIN && -r $STATE_FILE ]]; then
+    DOMAIN=$(sed -n "s/^DS_DOMAIN='\\(.*\\)'\$/\\1/p" "$STATE_FILE" | head -n 1)
+  fi
+  if [[ -z $DOMAIN && -r $INFO_FILE ]]; then
+    DOMAIN=$(sed -n "s/^DNS_DOMAIN='\\(.*\\)'\$/\\1/p" "$INFO_FILE" | head -n 1)
+  fi
+  if [[ -z $DOMAIN && -r $NGINX_STREAM_CONF ]]; then
+    DOMAIN=$(sed -n 's/^[[:space:]]*"\([^"~]*\)"[[:space:]]*127\.0\.0\.1:.*/\1/p' "$NGINX_STREAM_CONF" | head -n 1)
+  fi
+  [[ -f ${DS_DIR}/firewall-opened ]] && fw=1
+
+  if ((yes == 0)); then
+    [[ -t 0 ]] || die "Not a terminal; re-run with --uninstall --yes."
+    printf 'This removes AdGuard Home, the nginx relay configs, the relay list and all dns-setup state.\n'
+    [[ -n $DOMAIN ]] && printf 'The Let'\''s Encrypt certificate for %s is deleted too.\n' "$DOMAIN"
+    printf 'nginx, certbot and the other packages stay installed. Continue? [y/N]: '
+    read -r ans || ans=""
+    case "${ans,,}" in
+      y | yes) ;;
+      *) die "Aborted." ;;
+    esac
   fi
 
-  say "Stopping AdGuard Home ..."
+  say "Removing AdGuard Home ..."
   systemctl disable --now "$AGH_UNIT" > /dev/null 2>&1 || true
-  rm -f "/etc/systemd/system/${AGH_UNIT}" "/lib/systemd/system/${AGH_UNIT}"
+  rm -f "/etc/systemd/system/${AGH_UNIT}" "/lib/systemd/system/${AGH_UNIT}" \
+    "/usr/lib/systemd/system/${AGH_UNIT}"
   systemctl daemon-reload 2> /dev/null || true
+  systemctl reset-failed "$AGH_UNIT" > /dev/null 2>&1 || true
   rm -rf "$AGH_DIR"
 
   say "Removing the nginx configuration ..."
   rm -f "$NGINX_STREAM_CONF" "$NGINX_HTTP_CONF" /etc/nginx/modules-enabled/00-dns-setup-stream.conf
+  rmdir "$NGINX_STREAM_DIR" 2> /dev/null || true
   if grep -qF "$NGINX_MARK_END" "$NGINX_MAIN" 2> /dev/null; then
     sed -i "\\|^${NGINX_MARK}\$|,\\|^${NGINX_MARK_END}\$|d" "$NGINX_MAIN"
   elif grep -qF "$NGINX_MARK" "$NGINX_MAIN" 2> /dev/null; then
     sed -i "\\|^${NGINX_MARK}\$|,+1d" "$NGINX_MAIN"
   fi
-  rm -f "$RENEW_HOOK"
-  if nginx -t 2> /dev/null; then
-    systemctl reload nginx > /dev/null 2>&1 || true
+  # bring back the stock site the installer disabled, unless it now clashes
+  if [[ ! -e /etc/nginx/sites-enabled/default && -f /etc/nginx/sites-available/default ]] \
+    && grep -q 'root /var/www/html' /etc/nginx/sites-available/default 2> /dev/null; then
+    ln -s /etc/nginx/sites-available/default /etc/nginx/sites-enabled/default 2> /dev/null || true
+    if ! nginx -t > /dev/null 2>&1; then
+      rm -f /etc/nginx/sites-enabled/default
+    fi
+  fi
+  if command -v nginx > /dev/null 2>&1; then
+    if nginx -t > /dev/null 2>&1; then
+      if svc_active nginx; then
+        systemctl reload nginx > /dev/null 2>&1 || true
+      fi
+    else
+      warn "nginx -t fails after the cleanup; check it with: nginx -t"
+    fi
   fi
 
-  say "Removing state ..."
+  say "Removing the certificate ..."
+  rm -f "$RENEW_HOOK"
+  if [[ -n $DOMAIN ]] && command -v certbot > /dev/null 2>&1 \
+    && [[ -e ${DS_TLS_DIR}/${DOMAIN} || -e /etc/letsencrypt/renewal/${DOMAIN}.conf ]]; then
+    certbot delete --non-interactive --cert-name "$DOMAIN" > /dev/null 2>&1 \
+      || warn "certbot could not delete ${DOMAIN}; run: certbot delete --cert-name ${DOMAIN}"
+  elif [[ -z $DOMAIN ]]; then
+    warn "Domain unknown; no certificate removed (use --uninstall --domain <name>)."
+  fi
+  rm -rf "$ACME_ROOT"
+
+  if ((fw == 1)); then
+    say "Closing the DNS ports opened by --open-firewall (80/443 stay open) ..."
+    if ufw_is_active; then
+      for p in 53/tcp 53/udp 853/tcp 853/udp; do
+        ufw delete allow "$p" > /dev/null 2>&1 || true
+      done
+    fi
+    if firewalld_is_active; then
+      for p in 53/tcp 53/udp 853/tcp 853/udp; do
+        firewall-cmd --permanent --remove-port="$p" > /dev/null 2>&1 || true
+      done
+      firewall-cmd --reload > /dev/null 2>&1 || true
+    fi
+  fi
+
+  say "Restoring the system resolver ..."
+  # the backup may be a symlink and /etc/resolv.conf may point into /run:
+  # copy next to it and rename, never write through the current link
+  if [[ -e /etc/resolv.conf.dns-setup.bak || -L /etc/resolv.conf.dns-setup.bak ]]; then
+    if cp -P /etc/resolv.conf.dns-setup.bak /etc/resolv.conf.dns-setup.tmp 2> /dev/null \
+      && mv -f /etc/resolv.conf.dns-setup.tmp /etc/resolv.conf; then
+      rm -f /etc/resolv.conf.dns-setup.bak
+    else
+      rm -f /etc/resolv.conf.dns-setup.tmp
+      warn "Could not restore /etc/resolv.conf; the original is in /etc/resolv.conf.dns-setup.bak."
+    fi
+  fi
+  if [[ -f /etc/systemd/resolved.conf.d/99-dns-setup.conf ]]; then
+    rm -f /etc/systemd/resolved.conf.d/99-dns-setup.conf
+    systemctl restart systemd-resolved > /dev/null 2>&1 || true
+  fi
+
+  say "Removing state, dnsctl and logs ..."
   rm -f /usr/local/sbin/dns-setup /usr/local/bin/dnsctl
   rm -rf "$DS_DIR" "$INFO_FILE" "$COOKIE_FILE"
-  if [[ -f /etc/resolv.conf.dns-setup.bak ]]; then
-    cp -P /etc/resolv.conf.dns-setup.bak /etc/resolv.conf 2> /dev/null || true
-    rm -f /etc/resolv.conf.dns-setup.bak
-  fi
-  rm -f /etc/systemd/resolved.conf.d/99-dns-setup.conf
-  systemctl restart systemd-resolved > /dev/null 2>&1 || true
+  rm -f "$LOG_FILE"
 
-  say "Uninstalled. Certificates stay in ${DS_TLS_DIR}/${DOMAIN}; remove them with:"
-  say "  certbot delete --cert-name ${DOMAIN}"
+  printf '%s' "$C_GREEN"
+  say "dns-setup is uninstalled. nginx, certbot and the other packages were kept."
+  printf '%s' "$C_RESET"
+}
+
+init_colors() {
+  if [[ -t 1 && -z ${NO_COLOR:-} && ${TERM:-dumb} != dumb ]]; then
+    C_GREEN=$'\033[1;32m'
+    C_RESET=$'\033[0m'
+  fi
 }
 
 main() {
@@ -2199,10 +2771,22 @@ main() {
       ;;
   esac
   require_root "$@"
+  init_colors # before setup_logging turns stdout into a pipe
   init_work_dir
-  local cmd=${1-}
+  local cmd=${1-} a
+  # --uninstall may come anywhere on the installer's command line
+  for a in "$@"; do
+    [[ $a == --uninstall ]] && cmd=uninstall
+  done
   case "$cmd" in
-    add | remove | import | list | sync | allow | status | test | info | renew | uninstall)
+    uninstall)
+      local rest=()
+      for a in "$@"; do
+        [[ $a == --uninstall || $a == uninstall ]] || rest+=("$a")
+      done
+      cmd_uninstall ${rest[@]+"${rest[@]}"}
+      ;;
+    add | remove | import | defaults | list | sync | allow | status | test | info | renew)
       shift
       "cmd_${cmd}" "$@"
       ;;

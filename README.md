@@ -30,12 +30,16 @@ cache, stats) with a Let's Encrypt certificate and puts nginx in front of it:
   that geo-block Iranian IPs or are blocked by IP in Iran keep working
 - everything else is dropped
 
-The relay list ships with ~215 domains, grouped by category: package
-registries, AI/ML, source hosts and CI, containers/cloud, games and launchers
-(Steam, Epic, EA, Ubisoft, Battle.net, Riot, PlayStation, Xbox, Nintendo, GOG,
-Roblox, ...), Microsoft/Adobe/JetBrains/Unity/NVIDIA, design and productivity
-tools, learning platforms and payments. It is managed with `dnsctl` and is
-also visible in the panel's DNS rewrites page.
+The relay list ships with ~540 domains, grouped by category: package
+registries and languages, AI/ML (OpenAI, Claude, Gemini, Grok, Cursor, Hugging
+Face, ...), source hosts and CI, Google/Apple developer services,
+containers/cloud/devops, developer SaaS, games and launchers (Steam, Epic, EA,
+Ubisoft, Battle.net, Riot, PlayStation, Xbox, Nintendo, GOG, Roblox, ...),
+hardware vendors, Microsoft/Adobe/Autodesk/JetBrains/Unity/NVIDIA, design and
+productivity tools, WordPress plugins, learning platforms, freelancing and
+payments. Right after the domain the installer asks whether to add this list
+(default: yes); answer `n` to start with an empty list. It is managed with
+`dnsctl` and is also visible in the panel's DNS rewrites page.
 
 ```bash
 bash <(curl -Ls https://raw.githubusercontent.com/FarzinNs83/my-scripts/main/dns-setup.sh)
@@ -48,11 +52,21 @@ dnsctl list                      # domains that go through the relay
 dnsctl add registry.npmjs.org    # add one or more domains
 dnsctl remove registry.npmjs.org
 dnsctl import <file|url>         # bulk-add a community list (--force above 600)
+dnsctl defaults                  # merge the built-in list (e.g. after an update)
 dnsctl status                    # services, ports, certificate
 dnsctl test                      # DoH, DoT, relay and rewrite checks
 dnsctl info                      # client settings, DNS stamps, QR code
 dnsctl allow 203.0.113.0/24      # restrict who may use the resolver
-dnsctl uninstall
+dnsctl uninstall                 # remove everything (see below)
+```
+
+Uninstall removes AdGuard Home, the Let's Encrypt certificate, the nginx relay
+configs, the relay list, state, logs and `dnsctl`, and restores the system
+resolver; nginx, certbot and the other packages stay installed. It also works
+without `dnsctl`:
+
+```bash
+bash <(curl -Ls https://raw.githubusercontent.com/FarzinNs83/my-scripts/main/dns-setup.sh) --uninstall
 ```
 
 Community lists you can feed to `dnsctl import`:
