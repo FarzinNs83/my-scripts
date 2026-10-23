@@ -1317,7 +1317,7 @@ run_checks() {
   # fall back to the first plain entries of a custom list
   while IFS= read -r c; do
     candidates+=("$c")
-  done < <(relay_domains | grep -v '^\*' | head -n 3)
+  done < <(relay_domains | awk '!/^\*/ && n < 3 {print; n++}') # no head: SIGPIPE under pipefail
 
   if verify_doh; then
     say "DoH through nginx ..... OK"
