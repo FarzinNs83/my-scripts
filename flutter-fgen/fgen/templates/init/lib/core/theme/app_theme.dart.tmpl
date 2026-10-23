@@ -1,0 +1,36 @@
+import 'package:flutter/material.dart';
+
+import '{{ core }}/theme/app_colors.dart';
+import '{{ core }}/theme/app_text_styles.dart';
+
+abstract final class AppTheme {
+  static ThemeData get light => _build(Brightness.light);
+  static ThemeData get dark => _build(Brightness.dark);
+
+  static ThemeData _build(Brightness brightness) {
+    final colors = ColorScheme.fromSeed(seedColor: AppColors.seed, brightness: brightness);
+    final base = ThemeData(colorScheme: colors);
+    final radius = BorderRadius.circular(12);
+
+    return base.copyWith(
+      textTheme: AppTextStyles.apply(base.textTheme),
+      appBarTheme: const AppBarTheme(centerTitle: true),
+      inputDecorationTheme: InputDecorationTheme(
+        filled: true,
+        border: OutlineInputBorder(borderRadius: radius),
+      ),
+      filledButtonTheme: FilledButtonThemeData(
+        style: FilledButton.styleFrom(
+          minimumSize: const Size.fromHeight(48),
+          shape: RoundedRectangleBorder(borderRadius: radius),
+        ),
+      ),
+      outlinedButtonTheme: OutlinedButtonThemeData(
+        style: OutlinedButton.styleFrom(
+          minimumSize: const Size.fromHeight(48),
+          shape: RoundedRectangleBorder(borderRadius: radius),
+        ),
+      ),
+    );
+  }
+}

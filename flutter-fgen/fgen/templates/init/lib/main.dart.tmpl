@@ -1,0 +1,23 @@
+import 'package:flutter/material.dart';
+{% if riverpod %}
+import 'package:flutter_riverpod/flutter_riverpod.dart';
+{% endif %}
+
+import 'package:{{ pkg }}/app.dart';
+{% if uses_sl %}
+import '{{ core }}/di/injection.dart';
+{% endif %}
+// fgen:imports
+
+void main() {
+  WidgetsFlutterBinding.ensureInitialized();
+{% if uses_sl %}
+  setupCoreDependencies();
+{% endif %}
+  // fgen:features
+{% if riverpod %}
+  runApp(const ProviderScope(child: App()));
+{% else %}
+  runApp(const App());
+{% endif %}
+}

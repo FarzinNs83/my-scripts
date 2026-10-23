@@ -1,11 +1,13 @@
 import 'package:dio/dio.dart';
 import 'package:get/get.dart';
 
+import '{{ core }}/network/dio_client.dart';
+
 /// App-wide services. Pass to GetMaterialApp(initialBinding: InitialBinding()).
 class InitialBinding extends Bindings {
   @override
   void dependencies() {
-    // TODO: set your base URL, interceptors, timeouts...
-    Get.put<Dio>(Dio(BaseOptions(baseUrl: '')), permanent: true);
+    // TODO: pass readToken / onUnauthorized once you store an auth token.
+    Get.put<Dio>(createDio(), permanent: true);
   }
 }

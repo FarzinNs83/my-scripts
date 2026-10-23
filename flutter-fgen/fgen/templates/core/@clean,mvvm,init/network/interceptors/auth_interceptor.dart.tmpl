@@ -1,0 +1,30 @@
+import 'dart:async';
+
+import 'package:dio/dio.dart';
+
+typedef TokenReader = FutureOr<String?> Function();
+
+/// Adds `Authorization: Bearer <token>` to every request and reports 401 responses.
+class AuthInterceptor extends Interceptor {
+  AuthInterceptor({this.readToken, this.onUnauthorized});
+
+  final TokenReader? readToken;
+  final void Function()? onUnauthorized;
+
+  @override
+  Future<void> onRequest(RequestOptions options, RequestInterceptorHandler handler) async {
+    final token = await readToken?.call();
+    if (token != null && token.isNotEmpty) {
+      options.headers['Authorization'] = 'Bearer $token';
+    }
+    handler.next(options);
+  }
+
+  @override
+  void onError(DioException err, ErrorInterceptorHandler handler) {
+    if (err.response?.statusCode == 401) {
+      onUnauthorized?.call();
+    }
+    handler.next(err);
+  }
+}

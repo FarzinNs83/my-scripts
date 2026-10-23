@@ -1,0 +1,14 @@
+{% if router == "go_router" %}
+import 'package:go_router/go_router.dart';
+
+import '{{ core }}/router/app_routes.dart';
+// fgen:imports
+
+/// 'fgen page' and feature generation register their screens above the markers.
+final appRouter = GoRouter(
+  initialLocation: AppRoutes.home,
+  routes: [
+    // fgen:routes
+  ],
+);
+{% endif %}

@@ -1,0 +1,19 @@
+import 'package:flutter/material.dart';
+{% if riverpod %}
+import 'package:flutter_riverpod/flutter_riverpod.dart';
+{% endif %}
+import 'package:flutter_test/flutter_test.dart';
+
+import '{{ home_import }}';
+
+void main() {
+  testWidgets('home screen shows its title', (tester) async {
+{% if riverpod %}
+    await tester.pumpWidget(const ProviderScope(child: MaterialApp(home: HomeScreen())));
+{% else %}
+    await tester.pumpWidget(const MaterialApp(home: HomeScreen()));
+{% endif %}
+
+    expect(find.text('Home'), findsWidgets);
+  });
+}

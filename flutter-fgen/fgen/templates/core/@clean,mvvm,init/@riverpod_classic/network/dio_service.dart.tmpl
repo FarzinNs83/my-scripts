@@ -1,7 +1,9 @@
 import 'package:dio/dio.dart';
 import 'package:flutter_riverpod/flutter_riverpod.dart';
 
+import '{{ core }}/network/dio_client.dart';
+
 final dioProvider = Provider<Dio>((ref) {
-  // TODO: set your base URL, interceptors, timeouts...
-  return Dio(BaseOptions(baseUrl: ''));
+  // TODO: pass readToken / onUnauthorized once you store an auth token.
+  return createDio();
 });

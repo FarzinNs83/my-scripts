@@ -1,10 +1,12 @@
 import 'package:dio/dio.dart';
 import 'package:riverpod_annotation/riverpod_annotation.dart';
 
+import '{{ core }}/network/dio_client.dart';
+
 part 'dio_service.g.dart';
 
 @Riverpod(keepAlive: true)
 Dio dio(Ref ref) {
-  // TODO: set your base URL, interceptors, timeouts...
-  return Dio(BaseOptions(baseUrl: ''));
+  // TODO: pass readToken / onUnauthorized once you store an auth token.
+  return createDio();
 }

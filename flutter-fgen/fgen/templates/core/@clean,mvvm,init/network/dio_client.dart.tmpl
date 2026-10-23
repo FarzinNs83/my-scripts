@@ -1,0 +1,24 @@
+import 'package:dio/dio.dart';
+import 'package:flutter/foundation.dart';
+
+import '{{ core }}/config/env.dart';
+import '{{ core }}/network/interceptors/auth_interceptor.dart';
+import '{{ core }}/network/interceptors/retry_interceptor.dart';
+
+/// Builds the app's [Dio] instance. Create it once and share it (see the DI setup).
+Dio createDio({TokenReader? readToken, VoidCallback? onUnauthorized}) {
+  final dio = Dio(
+    BaseOptions(
+      baseUrl: Env.baseUrl,
+      connectTimeout: const Duration(seconds: 15),
+      receiveTimeout: const Duration(seconds: 30),
+      headers: {'Accept': 'application/json'},
+    ),
+  );
+  dio.interceptors.addAll([
+    AuthInterceptor(readToken: readToken, onUnauthorized: onUnauthorized),
+    RetryInterceptor(dio),
+    if (kDebugMode) LogInterceptor(requestBody: true, responseBody: true),
+  ]);
+  return dio;
+}

@@ -1,0 +1,35 @@
+import 'package:flutter/material.dart';
+{% if consumer %}
+import 'package:flutter_riverpod/flutter_riverpod.dart';
+{% endif %}
+
+{% if stateful %}
+class {{ pascal }}Screen extends {{ "ConsumerStatefulWidget" if consumer else "StatefulWidget" }} {
+  const {{ pascal }}Screen({super.key});
+
+  @override
+  {{ "ConsumerState" if consumer else "State" }}<{{ pascal }}Screen> createState() => _{{ pascal }}ScreenState();
+}
+
+class _{{ pascal }}ScreenState extends {{ "ConsumerState" if consumer else "State" }}<{{ pascal }}Screen> {
+  @override
+  Widget build(BuildContext context) {
+    return Scaffold(
+      appBar: AppBar(title: const Text('{{ title }}')),
+      body: const Center(child: Text('{{ title }}')),
+    );
+  }
+}
+{% else %}
+class {{ pascal }}Screen extends {{ "ConsumerWidget" if consumer else "StatelessWidget" }} {
+  const {{ pascal }}Screen({super.key});
+
+  @override
+  Widget build(BuildContext context{{ ", WidgetRef ref" if consumer else "" }}) {
+    return Scaffold(
+      appBar: AppBar(title: const Text('{{ title }}')),
+      body: const Center(child: Text('{{ title }}')),
+    );
+  }
+}
+{% endif %}

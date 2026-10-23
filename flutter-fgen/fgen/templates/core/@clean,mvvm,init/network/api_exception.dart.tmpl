@@ -1,0 +1,64 @@
+import 'package:dio/dio.dart';
+
+enum ApiErrorType { network, timeout, cancelled, badRequest, unauthorized, forbidden, notFound, server, unknown }
+
+/// A network error in a shape the UI can show. Build it with [ApiException.fromDio].
+class ApiException implements Exception {
+  const ApiException(this.message, {this.type = ApiErrorType.unknown, this.statusCode});
+
+  factory ApiException.fromDio(DioException e) {
+    final status = e.response?.statusCode;
+    final type = switch (e.type) {
+      DioExceptionType.connectionTimeout ||
+      DioExceptionType.sendTimeout ||
+      DioExceptionType.receiveTimeout => ApiErrorType.timeout,
+      DioExceptionType.connectionError => ApiErrorType.network,
+      DioExceptionType.cancel => ApiErrorType.cancelled,
+      DioExceptionType.badResponse => switch (status) {
+        401 => ApiErrorType.unauthorized,
+        403 => ApiErrorType.forbidden,
+        404 => ApiErrorType.notFound,
+        final int code when code >= 500 => ApiErrorType.server,
+        _ => ApiErrorType.badRequest,
+      },
+      _ => ApiErrorType.unknown,
+    };
+    return ApiException(
+      _serverMessage(e.response?.data) ?? _defaultMessages[type]!,
+      type: type,
+      statusCode: status,
+    );
+  }
+
+  final String message;
+  final ApiErrorType type;
+  final int? statusCode;
+
+  static const _defaultMessages = {
+    ApiErrorType.network: 'No internet connection.',
+    ApiErrorType.timeout: 'The server took too long to respond.',
+    ApiErrorType.cancelled: 'The request was cancelled.',
+    ApiErrorType.badRequest: 'The request was not accepted.',
+    ApiErrorType.unauthorized: 'Please sign in again.',
+    ApiErrorType.forbidden: 'You do not have access to this.',
+    ApiErrorType.notFound: 'Not found.',
+    ApiErrorType.server: 'Server error. Please try again later.',
+    ApiErrorType.unknown: 'Something went wrong.',
+  };
+
+  /// Reads `message`, `error` or `detail` from a JSON error body.
+  static String? _serverMessage(Object? data) {
+    if (data is Map) {
+      for (final key in const ['message', 'error', 'detail']) {
+        final value = data[key];
+        if (value is String && value.isNotEmpty) {
+          return value;
+        }
+      }
+    }
+    return null;
+  }
+
+  @override
+  String toString() => message;
+}

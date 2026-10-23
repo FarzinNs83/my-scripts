@@ -1,15 +1,19 @@
-{% if arch != "simple" %}
+{% if arch != "simple" or init %}
 import 'package:dio/dio.dart';
 {% endif %}
 import 'package:get_it/get_it.dart';
+{% if arch != "simple" or init %}
+
+import '{{ core }}/network/dio_client.dart';
+{% endif %}
 
 final sl = GetIt.instance;
 
 /// Registers app-wide services. Call once in main(), before the feature initialisers.
 void setupCoreDependencies() {
-{% if arch != "simple" %}
-  // TODO: set your base URL, interceptors, timeouts...
-  sl.registerLazySingleton<Dio>(() => Dio(BaseOptions(baseUrl: '')));
+{% if arch != "simple" or init %}
+  // TODO: pass readToken / onUnauthorized once you store an auth token.
+  sl.registerLazySingleton<Dio>(createDio);
 {% else %}
   // Register app-wide services here.
 {% endif %}

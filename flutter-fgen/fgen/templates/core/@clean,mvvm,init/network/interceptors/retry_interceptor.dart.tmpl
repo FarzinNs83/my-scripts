@@ -1,0 +1,45 @@
+import 'package:dio/dio.dart';
+
+/// Retries idempotent requests (GET / HEAD / OPTIONS) after network errors,
+/// timeouts and 5xx responses, waiting a little longer before each attempt.
+class RetryInterceptor extends Interceptor {
+  RetryInterceptor(this._dio, {this.retries = 2, this.delay = const Duration(milliseconds: 800)});
+
+  final Dio _dio;
+  final int retries;
+  final Duration delay;
+
+  static const _attemptKey = 'retry_attempt';
+  static const _methods = {'GET', 'HEAD', 'OPTIONS'};
+
+  @override
+  Future<void> onError(DioException err, ErrorInterceptorHandler handler) async {
+    final options = err.requestOptions;
+    final attempt = (options.extra[_attemptKey] as int?) ?? 0;
+    if (attempt >= retries || !_shouldRetry(err)) {
+      handler.next(err);
+      return;
+    }
+    await Future<void>.delayed(delay * (attempt + 1));
+    options.extra[_attemptKey] = attempt + 1;
+    try {
+      handler.resolve(await _dio.fetch<dynamic>(options));
+    } on DioException catch (e) {
+      handler.next(e);
+    }
+  }
+
+  bool _shouldRetry(DioException err) {
+    if (!_methods.contains(err.requestOptions.method.toUpperCase())) {
+      return false;
+    }
+    return switch (err.type) {
+      DioExceptionType.connectionTimeout ||
+      DioExceptionType.sendTimeout ||
+      DioExceptionType.receiveTimeout ||
+      DioExceptionType.connectionError => true,
+      DioExceptionType.badResponse => (err.response?.statusCode ?? 0) >= 500,
+      _ => false,
+    };
+  }
+}

@@ -1,0 +1,13 @@
+{% if router == "getx" %}
+import 'package:get/get.dart';
+
+import '{{ core }}/router/app_routes.dart';
+// fgen:imports
+
+/// 'fgen page' and feature generation register their screens above the markers.
+abstract final class AppPages {
+  static final pages = <GetPage<dynamic>>[
+    // fgen:routes
+  ];
+}
+{% endif %}

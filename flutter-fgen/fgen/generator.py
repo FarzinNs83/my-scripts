@@ -225,6 +225,8 @@ def build_context(project: Project, names: Names, opts: Options, catalog: Catalo
         "core": core,
         "arch": opts.arch,
         "state": opts.state,
+        "init": False,  # True while rendering for 'fgen init'
+        "riverpod": opts.state in ("riverpod", "riverpod_classic"),
         "result": result,
         "model": opts.model,
         "freezed": opts.model == "freezed",
@@ -251,8 +253,9 @@ class PlannedFile:
     rel: str            # path relative to the project root (posix)
     content: str
     layer: str
-    action: str         # create | overwrite | skip
+    action: str         # create | overwrite | update | skip
     core: bool = False
+    newline: str = "\n"  # line ending used when writing (kept for edited files)
 
 
 def _resolve_path(rel: str, conditions: set[str], snake: str) -> str | None:
@@ -344,7 +347,7 @@ def write(files: list[PlannedFile]) -> None:
         if f.action == "skip":
             continue
         f.path.parent.mkdir(parents=True, exist_ok=True)
-        with open(f.path, "w", encoding="utf-8", newline="\n") as handle:
+        with open(f.path, "w", encoding="utf-8", newline=f.newline) as handle:
             handle.write(f.content)
 
 
