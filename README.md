@@ -89,14 +89,14 @@ Installs [n8n](https://n8n.io) behind nginx with a Let's Encrypt certificate:
   pass `--owner-email` so the script creates it for you
 
 ```bash
-bash <(curl -Ls https://raw.githubusercontent.com/FarzinNs83/my-scripts/main/n8n-setup.sh) n8n.example.com
+bash <(curl -Ls https://raw.githubusercontent.com/FarzinNs83/my-scripts/main/n8n-setup.sh)
 ```
 
 Docker Hub and docker.n8n.io block Iranian IPs. On a server in Iran, pull
 through a mirror:
 
 ```bash
-bash <(curl -Ls https://raw.githubusercontent.com/FarzinNs83/my-scripts/main/n8n-setup.sh) --registry-mirror https://docker.arvancloud.ir n8n.example.com
+bash <(curl -Ls https://raw.githubusercontent.com/FarzinNs83/my-scripts/main/n8n-setup.sh) --registry-mirror https://docker.arvancloud.ir
 ```
 
 After the install:
