@@ -20,9 +20,10 @@
 #
 #  This file is independent from 3xui-setup.sh: it owns its own paths, ports,
 #  unit, log and state, and it never touches /usr/local/x-ui or its inbounds.
-#  Other sites on :443 through nginx (n8n-setup.sh) move behind the relay: the
-#  SNI map includes /etc/nginx/sni-routes.d/*.map, and `n8nctl nginx` moves
-#  n8n to a loopback port (and back to :443 on uninstall).
+#  Other sites on :443 through nginx (n8n-setup.sh, front-deploy.sh) move
+#  behind the relay: the SNI map includes /etc/nginx/sni-routes.d/*.map, and
+#  `n8nctl nginx` / `front-update nginx` move them to a loopback port (and
+#  back to :443 on uninstall).
 #
 #  Usage:
 #    bash dns-setup.sh                      (asks for the domain)
@@ -66,6 +67,8 @@ NGINX_MAIN="${DS_NGINX_MAIN:-/etc/nginx/nginx.conf}"
 SNI_ROUTES_DIR="${DS_SNI_ROUTES_DIR:-/etc/nginx/sni-routes.d}" # other setups' SNI routes
 N8N_NGINX_CONF="${DS_N8N_NGINX_CONF:-/etc/nginx/conf.d/n8n-setup.conf}"
 N8N_CTL="${DS_N8N_CTL:-/usr/local/bin/n8nctl}"
+FRONT_CTL="${DS_FRONT_CTL:-/usr/local/bin/front-update}"  # front-deploy.sh sites
+FRONT_SITES_DIR="${DS_FRONT_SITES_DIR:-/etc/front-deploy/sites}"
 NGINX_MARK="# dns-setup: stream configs"
 NGINX_MARK_END="# dns-setup: end of stream configs"
 
@@ -171,10 +174,11 @@ How the relay works:
 Ports: 53/udp+tcp (AdGuard), 80/tcp (ACME + redirect), 443/tcp (nginx),
        853/tcp (DoT) and 853/udp (DoQ).
 
-Same server as 3xui-setup.sh / n8n-setup.sh: give each one its own
-subdomain. n8n moves behind the relay (its domain is routed by SNI to
-127.0.0.1:10443) and back to :443 on uninstall; 3x-ui renews its certificate
-through nginx when 3xui-setup.sh runs after this script.
+Same server as 3xui-setup.sh / n8n-setup.sh / front-deploy.sh: give each one
+its own subdomain. n8n and the front-deploy sites move behind the relay (their
+domains are routed by SNI to 127.0.0.1:10443 and 127.0.0.1:10444) and back to
+:443 on uninstall; 3x-ui renews its certificate through nginx when
+3xui-setup.sh runs after this script.
 EOF
 }
 
@@ -428,7 +432,7 @@ precheck_ports() {
     if [[ -f $NGINX_STREAM_CONF ]]; then
       say "TCP/443 is already served by this setup; continuing (idempotent re-run)."
     elif [[ $(port_holder 443 tcp || true) == *'"nginx"'* ]] && others=$(foreign_443_sites) && [[ -z $others ]]; then
-      say "TCP/443 is served by n8n through nginx; it moves behind the SNI relay."
+      say "TCP/443 is served by n8n / front-deploy sites through nginx; they move behind the SNI relay."
     elif [[ -n ${others:-} ]]; then
       die "nginx serves :443 from ${others//$'\n'/, }. Move that site off :443 and re-run."
     else
@@ -438,17 +442,22 @@ precheck_ports() {
   if [[ -f $N8N_NGINX_CONF ]] && ! grep -qs '^cmd_nginx' "$(readlink -f "$N8N_CTL" 2> /dev/null || printf '%s' "$N8N_CTL")"; then
     die "n8n-setup.sh is installed here, but ${N8N_CTL} is missing or too old to move behind the relay. Re-run the current n8n-setup.sh first, then this script."
   fi
+  if front_sites_present && ! grep -qs '^cmd_nginx' "$(readlink -f "$FRONT_CTL" 2> /dev/null || printf '%s' "$FRONT_CTL")"; then
+    die "front-deploy.sh sites are on this server, but ${FRONT_CTL} is missing or too old to move behind the relay. Re-run the current front-deploy.sh first, then this script."
+  fi
 
   if [[ $PANEL_PORT -eq 80 || $LOOPBACK_PORT -eq 80 ]]; then
     die "Port 80 must stay free for ACME; choose another --loopback-port."
   fi
 }
 
-# nginx sites, other than n8n-setup.sh's, that listen on :443 themselves.
+# nginx sites, other than n8n-setup.sh's and front-deploy.sh's, that listen
+# on :443 themselves.
 foreign_443_sites() {
   local f
   for f in /etc/nginx/conf.d/*.conf /etc/nginx/sites-enabled/*; do
     [[ -f $f && $f != "$N8N_NGINX_CONF" && $f != "$NGINX_HTTP_CONF" ]] || continue
+    [[ ${f##*/} == front-deploy-*.conf ]] && continue
     if grep -Eq '^[[:space:]]*listen[[:space:]]+([^;[:space:]]*:)?443[[:space:];]' "$f"; then
       printf '%s\n' "$f"
     fi
@@ -468,14 +477,36 @@ precheck_domain_free() {
       die "${DOMAIN} is already used by ${owner}. Give the DNS its own subdomain (e.g. dns.example.com)."
     fi
   done
+  if [[ -f ${FRONT_SITES_DIR}/${DOMAIN}.conf ]]; then
+    die "${DOMAIN} is already used by front-deploy.sh. Give the DNS its own subdomain (e.g. dns.example.com)."
+  fi
 }
 
-# n8n-setup.sh follows the relay: on :443 without it, on a loopback port
-# behind it. `n8nctl nginx` re-renders its site for the current layout.
+front_sites_present() {
+  compgen -G "${FRONT_SITES_DIR}/*.conf" > /dev/null
+}
+
+# n8n-setup.sh and front-deploy.sh follow the relay: on :443 without it, on a
+# loopback port behind it. `n8nctl nginx` / `front-update nginx` re-render
+# their sites for the current layout. The front-deploy sites are rendered
+# first without a reload, so a single restart picks up every change.
 refresh_n8n() {
-  [[ -f $N8N_NGINX_CONF && -x $N8N_CTL ]] || return 0
-  say "Updating the n8n site for the new :443 layout ..."
-  "$N8N_CTL" nginx || warn "'n8nctl nginx' failed; run it by hand and check 'nginx -t'."
+  local front=0
+  if front_sites_present && [[ -x $FRONT_CTL ]]; then
+    say "Updating the front-deploy sites for the new :443 layout ..."
+    if "$FRONT_CTL" nginx --no-reload; then
+      front=1
+    else
+      warn "'front-update nginx' failed; run it by hand and check 'nginx -t'."
+    fi
+  fi
+  if [[ -f $N8N_NGINX_CONF && -x $N8N_CTL ]]; then
+    say "Updating the n8n site for the new :443 layout ..."
+    "$N8N_CTL" nginx || warn "'n8nctl nginx' failed; run it by hand and check 'nginx -t'."
+  elif ((front)) && nginx -t > /dev/null 2>&1; then
+    # :443 changes between the http and stream modules: restart, not reload
+    systemctl restart nginx || warn "Could not restart nginx; run: systemctl restart nginx"
+  fi
 }
 
 precheck_disk() {

@@ -378,6 +378,9 @@ precheck_domain_free() {
       die "${DOMAIN} is already used by ${owner}. Give n8n its own subdomain (e.g. n8n.example.com)."
     fi
   done
+  if [[ -f /etc/front-deploy/sites/${DOMAIN}.conf ]]; then
+    die "${DOMAIN} is already used by front-deploy.sh. Give n8n its own subdomain (e.g. n8n.example.com)."
+  fi
 }
 
 precheck_ports() {

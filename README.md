@@ -136,6 +136,65 @@ credentials cannot be decrypted without it. Next to `dns-setup.sh`, n8n
 sits behind its relay on :443, see
 [All three on one VPS](#all-three-on-one-vps).
 
+## front-deploy.sh / front-update.sh
+
+Deploys a React (or any static) frontend from its git repository behind nginx
+with a Let's Encrypt certificate, and updates it with one command after each
+push.
+
+- asks for the domain and the repository. A public repository is cloned over
+  HTTPS. For a private one the script creates a read-only deploy key, shows it
+  (with the GitHub link where to add it) and waits until it works. GitHub over
+  SSH port 443 is tried when port 22 is blocked
+- instead of a repository you can give a path on the server to a ready build
+  (folder, `.zip` or `.tar.gz`), for servers too small to build on
+- picks the Node.js major from `.nvmrc` / `.node-version` / `engines.node`
+  (default 24) and installs it from the official tarballs, with
+  npmmirror as a fallback. npm, pnpm or yarn is chosen from the lockfile; a
+  frontend in a sub-folder (monorepo) is found automatically
+- finds the build folder (`dist` for Vite, `build` for Create React App, or
+  wherever the build wrote `index.html`) and asks you to confirm it once
+- nginx: SPA routing (unknown paths go to `index.html`), gzip, a one-year cache
+  for `/assets` and `/static`, no cache for `index.html`, www redirect when
+  `www.<domain>` also points to the server
+- dependencies and builds run as the unprivileged `frontdeploy` user. Each
+  build goes to its own folder in `/var/www/<domain>/releases` and goes live
+  with an atomic symlink switch, so a failed build never touches the site.
+  The last 5 releases are kept
+
+```bash
+bash <(curl -Ls https://raw.githubusercontent.com/FarzinNs83/my-scripts/main/front-deploy.sh)
+```
+
+After the install:
+
+```bash
+front-update                    # pull, build, publish (asks which site if there are several)
+front-update --all              # every site
+front-update --force            # rebuild the same commit, e.g. after editing .env
+front-update --clean            # fresh node_modules
+front-update rollback           # back to the previous release
+front-update list               # sites, sources, live releases
+front-update --dist /root/dist.zip   # publish a ready build
+front-update remove             # delete a site
+```
+
+An update is fast when nothing changed: it stops if the commit is already
+live, and skips the dependency install when the lockfile did not change.
+Build-time variables (`VITE_*`, `REACT_APP_*`) go in
+`/var/www/<domain>/shared/.env`; it is copied to `.env.production.local`
+before each build. Re-run `front-deploy.sh` for a deployed domain to change
+its repository, branch or folders.
+
+Show all options:
+
+```bash
+bash <(curl -Ls https://raw.githubusercontent.com/FarzinNs83/my-scripts/main/front-deploy.sh) --help
+```
+
+Ports: TCP 80/443. Next to `dns-setup.sh`, the sites sit behind its relay on
+`127.0.0.1:10444`, the same way as n8n.
+
 ## All three on one VPS
 
 `dns-setup.sh`, `n8n-setup.sh` and `3xui-setup.sh` can run on the same
