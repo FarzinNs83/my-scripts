@@ -202,6 +202,67 @@ bash <(curl -Ls https://raw.githubusercontent.com/FarzinNs83/my-scripts/main/fro
 Ports: TCP 80/443. Next to `dns-setup.sh`, the sites sit behind its relay on
 `127.0.0.1:10444`, the same way as n8n.
 
+## back-deploy.sh / back-update.sh
+
+Deploys a Node.js backend (Express, Nest, Fastify, ...) from its git
+repository behind nginx with a Let's Encrypt certificate, run by systemd, and
+updates it after each push without downtime.
+
+- asks for the domain (e.g. `api.example.com`), the repository (public over
+  HTTPS, private with a read-only deploy key, like `front-deploy.sh`) and the
+  app's `.env` (optional, add it later with `back-update env`)
+- Node.js from `.nvmrc` / `engines`, npm / pnpm / yarn from the lockfile, the
+  `build` script (TypeScript) when there is one. The start command comes from
+  the `start:prod` / `start` script (watch-mode scripts such as nodemon are
+  skipped), else `node <main>`, and is confirmed once
+- **blue/green**: each app has two systemd instances on two local ports. A new
+  release starts on the idle one; nginx switches to it only after it answers
+  HTTP on the health path (any status below 500), then the old one stops after
+  10 seconds. A release that crashes or does not answer never gets traffic
+- `--release-cmd` runs once per new release before the switch, as the app user
+  with its environment (e.g. `npx prisma migrate deploy`)
+- each app runs as its own systemd `DynamicUser` with a read-only filesystem.
+  The `.env` is read by systemd, so the app process cannot read the file (or
+  another app's). Folders the app writes to (`--data-dir uploads`) live in
+  `/var/lib/back-deploy/<app>` and survive releases
+- nginx: websockets, `X-Forwarded-*` headers, 50 MB uploads (`--max-body`)
+
+```bash
+bash <(curl -Ls https://raw.githubusercontent.com/FarzinNs83/my-scripts/main/back-deploy.sh)
+```
+
+The app must listen on `process.env.PORT`; behind nginx, Express needs
+`app.set("trust proxy", 1)` for the real client IP.
+
+After the install:
+
+```bash
+back-update                 # pull, build, switch without downtime (asks which app if there are several)
+back-update --all           # every app (a failed one does not stop the rest)
+back-update env             # edit the .env, then restart without downtime
+back-update restart         # same release on the other instance
+back-update logs -f         # follow the app's log (journald)
+back-update status          # instances, ports, health, certificate
+back-update rollback        # back to the previous release (migrations are not undone)
+back-update list            # all apps
+back-update remove          # delete an app; --purge also deletes its data
+```
+
+Several backends on one server work the same way as the frontends: run
+`back-deploy.sh` once per domain; each gets its own pair of ports (from 3100),
+unit, user and certificate, and only one build runs at a time.
+
+Show all options:
+
+```bash
+bash <(curl -Ls https://raw.githubusercontent.com/FarzinNs83/my-scripts/main/back-deploy.sh) --help
+```
+
+Ports: TCP 80/443, plus two app ports per backend (from 3100). `app.listen(PORT)`
+binds them on all interfaces, so keep them closed in the firewall, or listen on
+`127.0.0.1`. Next to `dns-setup.sh`, the backends sit behind its relay on
+`127.0.0.1:10445`.
+
 ## All three on one VPS
 
 `dns-setup.sh`, `n8n-setup.sh` and `3xui-setup.sh` can run on the same

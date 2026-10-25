@@ -421,6 +421,10 @@ precheck_domain_free() {
     fi
   done
 
+  if [[ -f /etc/back-deploy/apps/${DOMAIN}.conf ]]; then
+    die "${DOMAIN} is a back-deploy.sh backend. Give the site its own domain or subdomain."
+  fi
+
   # other front-deploy sites: example.com (with its www redirect) and
   # www.example.com as a site of its own cannot both exist
   for f in "$SITES_DIR"/*.conf; do

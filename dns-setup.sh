@@ -20,9 +20,10 @@
 #
 #  This file is independent from 3xui-setup.sh: it owns its own paths, ports,
 #  unit, log and state, and it never touches /usr/local/x-ui or its inbounds.
-#  Other sites on :443 through nginx (n8n-setup.sh, front-deploy.sh) move
-#  behind the relay: the SNI map includes /etc/nginx/sni-routes.d/*.map, and
-#  `n8nctl nginx` / `front-update nginx` move them to a loopback port (and
+#  Other sites on :443 through nginx (n8n-setup.sh, front-deploy.sh,
+#  back-deploy.sh) move behind the relay: the SNI map includes
+#  /etc/nginx/sni-routes.d/*.map, and `n8nctl nginx` / `front-update nginx` /
+#  `back-update nginx` move them to a loopback port (and
 #  back to :443 on uninstall).
 #
 #  Usage:
@@ -67,8 +68,12 @@ NGINX_MAIN="${DS_NGINX_MAIN:-/etc/nginx/nginx.conf}"
 SNI_ROUTES_DIR="${DS_SNI_ROUTES_DIR:-/etc/nginx/sni-routes.d}" # other setups' SNI routes
 N8N_NGINX_CONF="${DS_N8N_NGINX_CONF:-/etc/nginx/conf.d/n8n-setup.conf}"
 N8N_CTL="${DS_N8N_CTL:-/usr/local/bin/n8nctl}"
-FRONT_CTL="${DS_FRONT_CTL:-/usr/local/bin/front-update}"  # front-deploy.sh sites
-FRONT_SITES_DIR="${DS_FRONT_SITES_DIR:-/etc/front-deploy/sites}"
+# front-deploy.sh / back-deploy.sh: "name|update tool|site configs"; their
+# nginx files are /etc/nginx/conf.d/<name>-<domain>.conf
+DEPLOY_TOOLS=(
+  "front-deploy|${DS_FRONT_CTL:-/usr/local/bin/front-update}|${DS_FRONT_SITES_DIR:-/etc/front-deploy/sites}"
+  "back-deploy|${DS_BACK_CTL:-/usr/local/bin/back-update}|${DS_BACK_SITES_DIR:-/etc/back-deploy/apps}"
+)
 NGINX_MARK="# dns-setup: stream configs"
 NGINX_MARK_END="# dns-setup: end of stream configs"
 
@@ -174,11 +179,11 @@ How the relay works:
 Ports: 53/udp+tcp (AdGuard), 80/tcp (ACME + redirect), 443/tcp (nginx),
        853/tcp (DoT) and 853/udp (DoQ).
 
-Same server as 3xui-setup.sh / n8n-setup.sh / front-deploy.sh: give each one
-its own subdomain. n8n and the front-deploy sites move behind the relay (their
-domains are routed by SNI to 127.0.0.1:10443 and 127.0.0.1:10444) and back to
-:443 on uninstall; 3x-ui renews its certificate through nginx when
-3xui-setup.sh runs after this script.
+Same server as 3xui-setup.sh / n8n-setup.sh / front-deploy.sh /
+back-deploy.sh: give each one its own subdomain. n8n and the front-deploy /
+back-deploy sites move behind the relay (their domains are routed by SNI to
+127.0.0.1:10443, 10444 and 10445) and back to :443 on uninstall; 3x-ui renews
+its certificate through nginx when 3xui-setup.sh runs after this script.
 EOF
 }
 
@@ -442,22 +447,26 @@ precheck_ports() {
   if [[ -f $N8N_NGINX_CONF ]] && ! grep -qs '^cmd_nginx' "$(readlink -f "$N8N_CTL" 2> /dev/null || printf '%s' "$N8N_CTL")"; then
     die "n8n-setup.sh is installed here, but ${N8N_CTL} is missing or too old to move behind the relay. Re-run the current n8n-setup.sh first, then this script."
   fi
-  if front_sites_present && ! grep -qs '^cmd_nginx' "$(readlink -f "$FRONT_CTL" 2> /dev/null || printf '%s' "$FRONT_CTL")"; then
-    die "front-deploy.sh sites are on this server, but ${FRONT_CTL} is missing or too old to move behind the relay. Re-run the current front-deploy.sh first, then this script."
-  fi
+  local tool name ctl sites
+  for tool in "${DEPLOY_TOOLS[@]}"; do
+    IFS='|' read -r name ctl sites <<< "$tool"
+    if compgen -G "${sites}/*.conf" > /dev/null && ! grep -qs '^cmd_nginx' "$(readlink -f "$ctl" 2> /dev/null || printf '%s' "$ctl")"; then
+      die "${name}.sh sites are on this server, but ${ctl} is missing or too old to move behind the relay. Re-run the current ${name}.sh first, then this script."
+    fi
+  done
 
   if [[ $PANEL_PORT -eq 80 || $LOOPBACK_PORT -eq 80 ]]; then
     die "Port 80 must stay free for ACME; choose another --loopback-port."
   fi
 }
 
-# nginx sites, other than n8n-setup.sh's and front-deploy.sh's, that listen
-# on :443 themselves.
+# nginx sites, other than those of n8n-setup.sh, front-deploy.sh and
+# back-deploy.sh, that listen on :443 themselves.
 foreign_443_sites() {
   local f
   for f in /etc/nginx/conf.d/*.conf /etc/nginx/sites-enabled/*; do
     [[ -f $f && $f != "$N8N_NGINX_CONF" && $f != "$NGINX_HTTP_CONF" ]] || continue
-    [[ ${f##*/} == front-deploy-*.conf ]] && continue
+    [[ ${f##*/} == front-deploy-*.conf || ${f##*/} == back-deploy-*.conf ]] && continue
     if grep -Eq '^[[:space:]]*listen[[:space:]]+([^;[:space:]]*:)?443[[:space:];]' "$f"; then
       printf '%s\n' "$f"
     fi
@@ -477,29 +486,32 @@ precheck_domain_free() {
       die "${DOMAIN} is already used by ${owner}. Give the DNS its own subdomain (e.g. dns.example.com)."
     fi
   done
-  if [[ -f ${FRONT_SITES_DIR}/${DOMAIN}.conf ]]; then
-    die "${DOMAIN} is already used by front-deploy.sh. Give the DNS its own subdomain (e.g. dns.example.com)."
-  fi
+  local tool name ctl sites
+  for tool in "${DEPLOY_TOOLS[@]}"; do
+    IFS='|' read -r name ctl sites <<< "$tool"
+    if [[ -f ${sites}/${DOMAIN}.conf ]]; then
+      die "${DOMAIN} is already used by ${name}.sh. Give the DNS its own subdomain (e.g. dns.example.com)."
+    fi
+  done
 }
 
-front_sites_present() {
-  compgen -G "${FRONT_SITES_DIR}/*.conf" > /dev/null
-}
-
-# n8n-setup.sh and front-deploy.sh follow the relay: on :443 without it, on a
-# loopback port behind it. `n8nctl nginx` / `front-update nginx` re-render
-# their sites for the current layout. The front-deploy sites are rendered
-# first without a reload, so a single restart picks up every change.
+# n8n-setup.sh, front-deploy.sh and back-deploy.sh follow the relay: on :443
+# without it, on a loopback port behind it. `n8nctl nginx`, `front-update
+# nginx` and `back-update nginx` re-render their sites for the current
+# layout. The front / back sites are rendered first without a reload, so a
+# single restart picks up every change.
 refresh_n8n() {
-  local front=0
-  if front_sites_present && [[ -x $FRONT_CTL ]]; then
-    say "Updating the front-deploy sites for the new :443 layout ..."
-    if "$FRONT_CTL" nginx --no-reload; then
+  local front=0 tool name ctl sites
+  for tool in "${DEPLOY_TOOLS[@]}"; do
+    IFS='|' read -r name ctl sites <<< "$tool"
+    compgen -G "${sites}/*.conf" > /dev/null && [[ -x $ctl ]] || continue
+    say "Updating the ${name} sites for the new :443 layout ..."
+    if "$ctl" nginx --no-reload; then
       front=1
     else
-      warn "'front-update nginx' failed; run it by hand and check 'nginx -t'."
+      warn "'${ctl##*/} nginx' failed; run it by hand and check 'nginx -t'."
     fi
-  fi
+  done
   if [[ -f $N8N_NGINX_CONF && -x $N8N_CTL ]]; then
     say "Updating the n8n site for the new :443 layout ..."
     "$N8N_CTL" nginx || warn "'n8nctl nginx' failed; run it by hand and check 'nginx -t'."
