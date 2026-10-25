@@ -186,6 +186,13 @@ Build-time variables (`VITE_*`, `REACT_APP_*`) go in
 before each build. Re-run `front-deploy.sh` for a deployed domain to change
 its repository, branch or folders.
 
+Several sites on one server: run `front-deploy.sh` once per domain. Each site
+has its own config (`/etc/front-deploy/sites/`), nginx file, certificate,
+folder, deploy key and Node.js major. `front-update` asks which one to update,
+`--all` updates them one after the other (a failed build does not stop the
+rest), and only one build runs at a time so a small VPS does not run out of
+memory. `front-update list` shows the disk use of each site.
+
 Show all options:
 
 ```bash

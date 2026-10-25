@@ -231,6 +231,16 @@ lock_site() {
   flock -n 9 || die "Another deploy of ${SITE_DOMAIN} is running."
 }
 
+# One build at a time across all sites: two webpack / Vite builds side by
+# side easily exhaust the RAM of a small VPS. Waits instead of failing.
+lock_builds() {
+  exec 8> "${LOCK_DIR}/front-deploy-build.lock"
+  if ! flock -n 8; then
+    say "Another site is building; waiting for it to finish ..."
+    flock 8
+  fi
+}
+
 # Fills PICKED: --all, --site, the only site, or a menu.
 pick_sites() { # allow_all
   local allow_all=$1 names=() i ans
@@ -892,6 +902,7 @@ update_site() { # domain
   fi
   say "Commit: ${COMMIT} \"${COMMIT_MSG}\""
 
+  lock_builds
   ensure_node "$NODE_MAJOR"
   say "Node.js $("${NODE_DIR}/bin/node" -v), ${PM}"
   pick_registry
@@ -908,11 +919,37 @@ update_site() { # domain
 }
 
 cmd_update() {
-  local d
+  local d self args=() ok=() failed=()
   pick_sites 1
+  if ((${#PICKED[@]} == 1)); then
+    update_site "${PICKED[0]}"
+    return 0
+  fi
+  if [[ -n $NEW_BRANCH || -n $NEW_BUILD_DIR || -n $DIST ]]; then
+    die "--branch, --build-dir and --dist change one site; pick it with --site."
+  fi
+  # each site in its own process, so one failing build does not stop the rest
+  self=$(readlink -f "$0" 2> /dev/null || printf '%s' "$0")
+  if [[ ! -f $self || $self == /proc/* || $self == /dev/* ]]; then
+    for d in "${PICKED[@]}"; do
+      update_site "$d" # piped run: stops at the first failure
+    done
+    return 0
+  fi
+  ((FORCE)) && args+=(--force)
+  ((CLEAN)) && args+=(--clean)
   for d in "${PICKED[@]}"; do
-    update_site "$d"
+    if FD_NO_LOG=1 bash "$self" --site "$d" ${args[@]+"${args[@]}"} < /dev/null; then
+      ok+=("$d")
+    else
+      failed+=("$d")
+    fi
+    printf '\n'
   done
+  say "Done: ${ok[*]:-none}"
+  if ((${#failed[@]} > 0)); then
+    die "Failed: ${failed[*]} (output above; those sites still serve their previous release)."
+  fi
 }
 
 cmd_rollback() {
@@ -964,6 +1001,7 @@ cmd_list() {
       printf '  build   : %s -> %s\n' "${SITE_APP_DIR:-?}" "${SITE_BUILD_DIR:-?}"
     fi
     printf '  env     : %s%s\n' "$ENV_FILE" "$([[ -s $ENV_FILE ]] || printf ' (none)')"
+    printf '  disk    : %s in %s\n' "$(du -sh "$SITE_ROOT" 2> /dev/null | cut -f1)" "$SITE_ROOT"
   done
 }
 

@@ -420,6 +420,22 @@ precheck_domain_free() {
       die "${d} is already used by ${owner}. Give the site its own domain or subdomain."
     fi
   done
+
+  # other front-deploy sites: example.com (with its www redirect) and
+  # www.example.com as a site of its own cannot both exist
+  for f in "$SITES_DIR"/*.conf; do
+    [[ -f $f ]] || continue
+    d=${f##*/}
+    d=${d%.conf}
+    [[ $d != "$DOMAIN" ]] || continue
+    if [[ $DOMAIN == "www.${d}" ]] && grep -qx 'SITE_WWW=1' "$f"; then
+      die "${DOMAIN} is already the www redirect of the site ${d}. Re-run this script for ${d} with --no-www first."
+    fi
+    if [[ $SITE_WWW == 1 && $d == "www.${DOMAIN}" ]]; then
+      warn "www.${DOMAIN} is a site of its own here; ${DOMAIN} is served without the www redirect."
+      SITE_WWW=0
+    fi
+  done
 }
 
 relay_active() {
@@ -859,7 +875,8 @@ print_summary() {
     printf ' Changed .env     : front-update --force\n'
   fi
   printf ' Previous release : front-update rollback\n'
-  printf ' All sites        : front-update list\n'
+  printf ' All sites        : front-update list | front-update --all\n'
+  printf ' Another site     : run this script again with the other domain\n'
   printf '==============================================================\n'
 }
 
