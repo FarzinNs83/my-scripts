@@ -208,9 +208,16 @@ Deploys a Node.js backend (Express, Nest, Fastify, ...) from its git
 repository behind nginx with a Let's Encrypt certificate, run by systemd, and
 updates it after each push without downtime.
 
-- asks for the domain (e.g. `api.example.com`), the repository (public over
-  HTTPS, private with a read-only deploy key, like `front-deploy.sh`) and the
-  app's `.env` (optional, add it later with `back-update env`)
+- asks where to serve it: **on its own subdomain** (`api.example.com`, with
+  its own certificate) or **under a path of a frontend** deployed with
+  `front-deploy.sh` (`example.com/api`, same domain and certificate, so React
+  calls `fetch("/api/...")` without CORS). For a path it lists the frontends on
+  the server and asks whether the app's routes include the path
+  (`app.get("/api/users")`, passed on as is) or not (`app.get("/users")`,
+  nginx strips `/api`)
+- then the repository (public over HTTPS, private with a read-only deploy key,
+  like `front-deploy.sh`) and the app's `.env` (optional, add it later with
+  `back-update env`)
 - Node.js from `.nvmrc` / `engines`, npm / pnpm / yarn from the lockfile, the
   `build` script (TypeScript) when there is one. The start command comes from
   the `start:prod` / `start` script (watch-mode scripts such as nodemon are

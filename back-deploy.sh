@@ -5,8 +5,9 @@
 #                    certificate, run by systemd with zero-downtime updates
 #
 #  What it does
-#    1. asks for the domain (e.g. api.example.com) and checks that it points
-#       here
+#    1. asks where to serve it: on its own subdomain (api.example.com, checks
+#       that it points here) or under a path of a front-deploy.sh site
+#       (example.com/api: the frontend's domain and certificate, no CORS)
 #    2. asks for the git repository. A public one is cloned over HTTPS; for a
 #       private one it creates a read-only deploy key, shows it and waits
 #       until it is added to the repository
@@ -59,14 +60,15 @@ TLS_DIR="${BD_TLS_DIR:-/etc/letsencrypt/live}"
 RENEW_HOOK="${BD_RENEW_HOOK:-/etc/letsencrypt/renewal-hooks/deploy/back-deploy-reload.sh}"
 DS_STREAM_CONF="/etc/nginx/stream.d/dns-setup-relay.conf"
 SNI_ROUTES_DIR="${BD_SNI_ROUTES_DIR:-/etc/nginx/sni-routes.d}"
-FRONT_SITES_DIR="/etc/front-deploy/sites"
+FRONT_SITES_DIR="${BD_FRONT_SITES_DIR:-/etc/front-deploy/sites}"
+FRONT_UPDATE_BIN="${BD_FRONT_UPDATE_BIN:-/usr/local/bin/front-update}"
 UPDATE_BIN="${BD_UPDATE_BIN:-/usr/local/bin/back-update}"
 UPDATE_URL="${BD_UPDATE_URL:-https://raw.githubusercontent.com/FarzinNs83/my-scripts/main/back-update.sh}"
 
 PORT_FIRST=3100 # blue = even port, green = the next one
 PORT_LAST=3998
 
-SITE_VARS=(SITE_DOMAIN SITE_WWW SITE_REPO SITE_BRANCH SITE_KEY SITE_APP_DIR
+SITE_VARS=(SITE_NAME SITE_DOMAIN SITE_PATH SITE_STRIP SITE_WWW SITE_REPO SITE_BRANCH SITE_KEY SITE_APP_DIR
   SITE_INSTALL_CMD SITE_BUILD_CMD SITE_START_CMD SITE_RELEASE_CMD
   SITE_HEALTH_PATH SITE_HEALTH_TIMEOUT SITE_DATA_DIRS SITE_PRUNE SITE_NODE
   SITE_NPM_REGISTRY SITE_PORT SITE_MAX_BODY SITE_EMAIL SITE_STAGING
@@ -80,6 +82,10 @@ unset _v
 # Options
 # ---------------------------------------------------------------------------
 DOMAIN=""
+NAME=""       # the app's key: the domain, or <domain>+<path> under a frontend
+MOUNT_PATH="" # /api when the backend lives under a front-deploy.sh site
+OPT_PATH=""
+OPT_STRIP=""
 OPT_REPO=""
 OPT_BRANCH=""
 OPT_APP_DIR=""
@@ -124,8 +130,19 @@ systemd, updated without downtime.
 Usage:
   sudo bash back-deploy.sh [options]      (asks for the domain and the repository)
 
+Where it is served (asked when there are front-deploy.sh sites here):
+  on its own subdomain (api.example.com, its own certificate), or under a path
+  of a front-deploy.sh site (example.com/api: same domain and certificate as
+  the frontend, no CORS):
+      --path <path>         under a path of the frontend, e.g. /api (with
+                            several frontends also pass the domain with -d)
+      --strip-path          the app's routes start at / (app.get("/users")):
+                            nginx turns /api/users into /users
+      --no-strip-path       the app's routes include the path
+                            (app.get("/api/users")); the default
+
 Repository and build:
-      --repo <url>          git repository (https://github.com/me/api or
+      --repo <url>         git repository (https://github.com/me/api or
                             git@github.com:me/api.git)
       --branch <name>       branch to deploy (default: the repository's default)
       --app-dir <dir>       folder of the app inside the repository
@@ -344,7 +361,7 @@ save_site() {
 }
 
 load_existing() {
-  local f="${SITES_DIR}/${DOMAIN}.conf"
+  local f="${SITES_DIR}/${NAME}.conf"
   [[ -r $f ]] || return 0
   # shellcheck disable=SC1090
   . "$f"
@@ -370,7 +387,9 @@ apply_options() {
   [[ -n $OPT_EMAIL ]] && SITE_EMAIL=$OPT_EMAIL
   [[ -n $OPT_TLS_PORT ]] && SITE_TLS_PORT=$OPT_TLS_PORT
   [[ -n $OPT_KEEP ]] && SITE_KEEP=$OPT_KEEP
+  SITE_NAME=$NAME
   SITE_DOMAIN=$DOMAIN
+  SITE_PATH=$MOUNT_PATH
   SITE_STAGING=$STAGING
   : "${SITE_TLS_PORT:=10445}" "${SITE_KEEP:=5}" "${SITE_WWW:=0}" "${SITE_HEALTH_PATH:=/}" \
     "${SITE_HEALTH_TIMEOUT:=60}" "${SITE_MAX_BODY:=50}" "${SITE_PRUNE:=0}"
@@ -399,7 +418,7 @@ apply_options() {
 allocate_port() {
   local used=() f p
   for f in "$SITES_DIR"/*.conf; do
-    [[ -f $f && $f != "${SITES_DIR}/${DOMAIN}.conf" ]] || continue
+    [[ -f $f && $f != "${SITES_DIR}/${NAME}.conf" ]] || continue
     p=$(sed -n 's/^SITE_PORT=//p' "$f" | head -n 1)
     [[ $p =~ ^[0-9]+$ ]] && used+=("$p" "$((p + 1))")
   done
@@ -454,16 +473,133 @@ as_builder() { # key-or-empty command...
 # ---------------------------------------------------------------------------
 # Domain and pre-checks
 # ---------------------------------------------------------------------------
-resolve_domain() {
-  if [[ -z $DOMAIN ]]; then
-    [[ -t 0 ]] || die "No domain given and no terminal to ask for one."
-    ask "Domain for the backend (e.g. api.example.com)"
-    DOMAIN=$REPLY_VALUE
+app_name() { # domain [path] -- same as back-update.sh
+  local p=${2-}
+  p=${p#/}
+  p=${p%/}
+  if [[ -n $p ]]; then
+    printf '%s+%s\n' "$1" "${p//\//-}"
+  else
+    printf '%s\n' "$1"
   fi
+}
+
+front_sites() {
+  local f
+  for f in "$FRONT_SITES_DIR"/*.conf; do
+    [[ -f $f ]] || continue
+    f=${f##*/}
+    printf '%s\n' "${f%.conf}"
+  done
+}
+
+# Where the backend is served: its own (sub)domain, or a path of a
+# front-deploy.sh site (same domain and certificate, no CORS). Asked unless
+# --domain / --path decide it.
+resolve_target() {
+  local mode="" fronts=() i ans
+  mapfile -t fronts < <(front_sites)
   DOMAIN=$(normalize_domain "$DOMAIN")
-  if [[ -z $DOMAIN ]] || ! is_domain "$DOMAIN"; then
-    die "Invalid domain '${DOMAIN}'. Use something like api.example.com."
+  if [[ -n $OPT_PATH ]]; then
+    mode=path
+  elif [[ -n $DOMAIN ]]; then
+    mode=own
+    [[ -f ${FRONT_SITES_DIR}/${DOMAIN}.conf ]] && mode=path
+  elif ((${#fronts[@]} == 0)); then
+    mode=own
+  else
+    [[ -t 0 ]] || die "No domain given and no terminal to ask for one."
+    printf 'Where should the backend be served?\n'
+    printf '  1) on its own subdomain, e.g. api.example.com\n'
+    printf '  2) under a path of a frontend on this server, e.g. %s/api\n' "${fronts[0]}"
+    ask "Choice" "1"
+    case $REPLY_VALUE in
+      1) mode=own ;;
+      2) mode=path ;;
+      *) die "Invalid choice '${REPLY_VALUE}'." ;;
+    esac
   fi
+
+  if [[ $mode == own ]]; then
+    if [[ -z $DOMAIN ]]; then
+      [[ -t 0 ]] || die "No domain given and no terminal to ask for one."
+      ask "Domain for the backend (e.g. api.example.com)"
+      DOMAIN=$(normalize_domain "$REPLY_VALUE")
+    fi
+    if [[ -z $DOMAIN ]] || ! is_domain "$DOMAIN"; then
+      die "Invalid domain '${DOMAIN}'. Use something like api.example.com."
+    fi
+    if [[ -f ${FRONT_SITES_DIR}/${DOMAIN}.conf ]]; then
+      die "${DOMAIN} is a frontend (front-deploy.sh). Serve the backend under a path of it (--path /api), or give it its own subdomain."
+    fi
+    NAME=$DOMAIN
+    return 0
+  fi
+
+  # --- under a path of a frontend ---
+  ((${#fronts[@]} > 0)) || die "There is no front-deploy.sh site on this server to put the backend under; set the frontend up first."
+  if [[ -z $DOMAIN ]]; then
+    if ((${#fronts[@]} == 1)); then
+      DOMAIN=${fronts[0]}
+      say "Frontend: ${DOMAIN}"
+    else
+      [[ -t 0 ]] || die "There are several frontends (${fronts[*]}); pass --domain <one of them> with --path."
+      printf 'Frontend sites:\n'
+      for i in "${!fronts[@]}"; do
+        printf '  %d) %s\n' "$((i + 1))" "${fronts[i]}"
+      done
+      ask "Which one" "1"
+      ans=$REPLY_VALUE
+      if [[ $ans =~ ^[0-9]+$ ]] && ((ans >= 1 && ans <= ${#fronts[@]})); then
+        DOMAIN=${fronts[ans - 1]}
+      else
+        DOMAIN=$(normalize_domain "$ans")
+      fi
+    fi
+  fi
+  [[ -f ${FRONT_SITES_DIR}/${DOMAIN}.conf ]] \
+    || die "${DOMAIN} is not a front-deploy.sh site (sites: ${fronts[*]})."
+
+  local p=$OPT_PATH
+  if [[ -z $p ]]; then
+    [[ -t 0 ]] || die "Pass --path (e.g. /api)."
+    ask "Path for the backend on ${DOMAIN}" "/api"
+    p=$REPLY_VALUE
+  fi
+  p="/${p#/}"
+  p=${p%/}
+  [[ $p =~ ^(/[A-Za-z0-9._-]+)+$ && $p != *..* ]] || die "Invalid path '${p}' (something like /api)."
+  case $p in
+    /assets | /assets/* | /static | /static/* | /.well-known* | /index.html)
+      die "${p} is used by the frontend itself; pick another path (e.g. /api)."
+      ;;
+  esac
+  if [[ ! -x $FRONT_UPDATE_BIN ]] || ! grep -q 'front-deploy.d' "$FRONT_UPDATE_BIN"; then
+    die "${FRONT_UPDATE_BIN} is missing or too old for backends under a path. Re-run the current front-deploy.sh for ${DOMAIN} first."
+  fi
+  MOUNT_PATH=$p
+  NAME=$(app_name "$DOMAIN" "$p")
+}
+
+# Does the app expect /api/users or /users? Asked once, then kept.
+resolve_strip() {
+  local ans
+  [[ -n $MOUNT_PATH ]] || return 0
+  if [[ -n $OPT_STRIP ]]; then
+    SITE_STRIP=$OPT_STRIP
+  elif [[ -z $SITE_STRIP && -t 0 ]]; then
+    printf 'How are the routes written in the app?\n'
+    printf '  1) with the path:    app.get("%s/users")  -> requests are passed on as they are\n' "$MOUNT_PATH"
+    printf '  2) without the path: app.get("/users")      -> nginx strips %s\n' "$MOUNT_PATH"
+    ask "Choice" "1"
+    ans=$REPLY_VALUE
+    case $ans in
+      1) SITE_STRIP=0 ;;
+      2) SITE_STRIP=1 ;;
+      *) die "Invalid choice '${ans}'." ;;
+    esac
+  fi
+  : "${SITE_STRIP:=0}"
 }
 
 precheck_disk() {
@@ -644,7 +780,7 @@ resolve_repo() {
   parse_repo_url "$src" || die "'$(mask_url "$src")' is not a git repository URL."
   if [[ -n $SITE_REPO && $SITE_REPO != "$src" ]] && ! same_repo "$SITE_REPO" "$src"; then
     say "The repository changed; the next build starts from a fresh clone."
-    rm -rf "${APPS_ROOT}/${DOMAIN}/repo" "${APPS_ROOT}/${DOMAIN}/staging" "${APPS_ROOT}/${DOMAIN}/meta/deps.hash"
+    rm -rf "${APPS_ROOT}/${NAME}/repo" "${APPS_ROOT}/${NAME}/staging" "${APPS_ROOT}/${NAME}/meta/deps.hash"
     [[ -n $OPT_APP_DIR ]] || SITE_APP_DIR=""
     [[ -n $OPT_START_CMD ]] || SITE_START_CMD=""
     SITE_BRANCH=""
@@ -685,7 +821,7 @@ print_deploy_key() { # key
 # Public repositories are read over HTTPS. Anything else gets its own
 # ed25519 deploy key (GitHub accepts a key on one repository only).
 ensure_repo_access() {
-  local key="${BD_HOME}/keys/${DOMAIN}" candidates=() c ans shown=0
+  local key="${BD_HOME}/keys/${NAME}" candidates=() c ans shown=0
   if [[ $SITE_REPO == http://* || $SITE_REPO == https://* ]]; then
     say "Checking $(mask_url "$SITE_REPO") ..."
     if ls_remote "$SITE_REPO" ""; then
@@ -751,7 +887,7 @@ resolve_branch() {
 # ---------------------------------------------------------------------------
 # The .env is read by systemd (root), never by the app user.
 prepare_app_dirs() {
-  local root="${APPS_ROOT}/${DOMAIN}" env_src=$OPT_ENV_FILE
+  local root="${APPS_ROOT}/${NAME}" env_src=$OPT_ENV_FILE
   install -d -m 755 "$APPS_ROOT" "$root" "${root}/releases" "${root}/meta" "${root}/slots"
   install -d -m 700 "${root}/shared"
   if [[ -z $env_src && ! -s ${root}/shared/.env && -t 0 ]]; then
@@ -792,7 +928,7 @@ install_update_tool() {
 }
 
 first_deploy() {
-  BD_NO_LOG=1 "$UPDATE_BIN" --site "$DOMAIN" --force \
+  BD_NO_LOG=1 "$UPDATE_BIN" --site "$NAME" --force \
     || die "The first deploy failed (output above). Fix it, then run: back-update"
 }
 
@@ -800,7 +936,7 @@ first_deploy() {
 # nginx and certificate
 # ---------------------------------------------------------------------------
 render_nginx() {
-  BD_NO_LOG=1 "$UPDATE_BIN" nginx --site "$DOMAIN" || die "Could not set up nginx for ${DOMAIN}."
+  BD_NO_LOG=1 "$UPDATE_BIN" nginx --site "$NAME" || die "Could not set up nginx for ${NAME}."
 }
 
 cert_valid() {
@@ -889,23 +1025,34 @@ verify_https() {
   local args=(-sS -o /dev/null -w '%{http_code}' --max-time 15 --resolve "${DOMAIN}:443:127.0.0.1")
   [[ $STAGING -eq 1 ]] && args+=(-k)
   local code
-  code=$(curl "${args[@]}" "https://${DOMAIN}${SITE_HEALTH_PATH}" 2> /dev/null) || code=000
+  VERIFY_URL="https://${DOMAIN}${SITE_HEALTH_PATH}"
+  [[ -z $MOUNT_PATH ]] || VERIFY_URL="https://${DOMAIN}${MOUNT_PATH}/"
+  code=$(curl "${args[@]}" "$VERIFY_URL" 2> /dev/null) || code=000
   HTTPS_CODE=$code
   [[ $code =~ ^[1-4][0-9][0-9]$ ]]
 }
 
 print_summary() {
-  local root="${APPS_ROOT}/${DOMAIN}" expires live
+  local root="${APPS_ROOT}/${NAME}" expires live
   # back-update saved what it detected (app folder, start command, instance)
   # shellcheck disable=SC1090
-  . "${SITES_DIR}/${DOMAIN}.conf"
+  . "${SITES_DIR}/${NAME}.conf"
   expires=$(openssl x509 -in "${TLS_DIR}/${DOMAIN}/fullchain.pem" -noout -enddate 2> /dev/null | sed -n 's/^notAfter=//p') || expires=""
   live=$(readlink "${root}/current" 2> /dev/null) || live=""
   printf '\n'
   printf '==============================================================\n'
-  printf ' %s is live\n' "$DOMAIN"
+  printf ' %s%s is live\n' "$DOMAIN" "$MOUNT_PATH"
   printf '==============================================================\n'
-  printf ' URL         : https://%s/\n' "$DOMAIN"
+  printf ' URL         : https://%s%s/\n' "$DOMAIN" "$MOUNT_PATH"
+  if [[ -n $MOUNT_PATH ]]; then
+    printf ' Mounted     : under the front-deploy site %s; ' "$DOMAIN"
+    if [[ $SITE_STRIP == 1 ]]; then
+      printf '%s/users reaches the app as /users\n' "$MOUNT_PATH"
+    else
+      printf 'the app sees the full path (%s/users)\n' "$MOUNT_PATH"
+    fi
+    printf ' In React    : fetch("%s/users") -- same origin, no CORS needed\n' "$MOUNT_PATH"
+  fi
   if [[ $SITE_WWW == 1 ]]; then
     printf ' www         : https://www.%s/ redirects to it\n' "$DOMAIN"
   fi
@@ -924,7 +1071,7 @@ print_summary() {
     printf ' Data        : /var/lib/back-deploy/... (%s), kept across releases\n' "$SITE_DATA_DIRS"
   fi
   printf ' Certificate : expires %s, renews automatically\n' "${expires:-unknown}"
-  if relay_active; then
+  if [[ -z $MOUNT_PATH ]] && relay_active; then
     printf ' HTTPS       : 127.0.0.1:%s, reached through the dns-setup.sh relay on :443\n' "$SITE_TLS_PORT"
   fi
   printf '%s\n' '--------------------------------------------------------------'
@@ -955,6 +1102,19 @@ parse_args() {
         (($# >= 2)) || die "Option $1 needs a value."
         OPT_REPO="$2"
         shift 2
+        ;;
+      --path)
+        (($# >= 2)) || die "Option $1 needs a value."
+        OPT_PATH="$2"
+        shift 2
+        ;;
+      --strip-path)
+        OPT_STRIP=1
+        shift
+        ;;
+      --no-strip-path)
+        OPT_STRIP=0
+        shift
         ;;
       --branch)
         (($# >= 2)) || die "Option $1 needs a value."
@@ -1092,21 +1252,25 @@ parse_args() {
 
 install_all() {
   parse_args "$@"
-  resolve_domain
+  resolve_target
   setup_logging
   trap '_on_err $LINENO' ERR
 
   say "=== back-deploy ${SCRIPT_VERSION}: Node.js backend + systemd + nginx + Let's Encrypt ==="
-  say "domain : ${DOMAIN}"
-
   load_os
   ensure_packages
+  say "app    : https://${DOMAIN}${MOUNT_PATH}/"
   load_existing
+  resolve_strip
   apply_options
   precheck_disk
-  precheck_dns
-  precheck_domain_free
-  precheck_ports
+  if [[ -z $MOUNT_PATH ]]; then
+    precheck_dns
+    precheck_domain_free
+    precheck_ports
+  else
+    SITE_WWW=0 # the front-deploy site owns the domain, www and certificate
+  fi
   allocate_port
   ensure_nginx
   [[ $OPEN_FIREWALL -eq 1 ]] && open_firewall_rules
@@ -1125,19 +1289,26 @@ install_all() {
   # --- 2. first deploy: build, start, wait until it answers ---------------
   first_deploy
 
-  # --- 3. nginx: port 80 first, needed for the ACME challenge -------------
-  render_nginx
+  if [[ -n $MOUNT_PATH ]]; then
+    # --- 3. locations inside the frontend's server blocks -----------------
+    render_nginx
+    FD_NO_LOG=1 "$FRONT_UPDATE_BIN" nginx --site "$DOMAIN" \
+      || die "Could not update the nginx site of ${DOMAIN} (front-update nginx)."
+  else
+    # --- 3. nginx: port 80 first, needed for the ACME challenge -----------
+    render_nginx
 
-  # --- 4. certificate -----------------------------------------------------
-  obtain_certificate || die "Could not obtain a certificate for ${DOMAIN}. The app is served over http:// until you re-run this script."
-  install_renew_hook
-  render_nginx
+    # --- 4. certificate ---------------------------------------------------
+    obtain_certificate || die "Could not obtain a certificate for ${DOMAIN}. The app is served over http:// until you re-run this script."
+    install_renew_hook
+    render_nginx
+  fi
 
   # --- 5. check -----------------------------------------------------------
   if verify_https; then
-    say "HTTPS check OK: https://${DOMAIN}${SITE_HEALTH_PATH} (HTTP ${HTTPS_CODE})"
+    say "HTTPS check OK: ${VERIFY_URL} (HTTP ${HTTPS_CODE})"
   else
-    warn "https://${DOMAIN}${SITE_HEALTH_PATH} answered HTTP ${HTTPS_CODE} through nginx; check: back-update status"
+    warn "${VERIFY_URL} answered HTTP ${HTTPS_CODE} through nginx; check: back-update status"
   fi
   print_summary
 }

@@ -48,6 +48,7 @@ ACME_ROOT="${FD_ACME_ROOT:-/var/www/front-deploy-acme}"
 TLS_DIR="${FD_TLS_DIR:-/etc/letsencrypt/live}"
 DS_STREAM_CONF="/etc/nginx/stream.d/dns-setup-relay.conf"     # dns-setup.sh owns :443
 SNI_ROUTES_DIR="${FD_SNI_ROUTES_DIR:-/etc/nginx/sni-routes.d}" # included by its SNI map
+FRONT_MOUNT_DIR="${FD_MOUNT_DIR:-/etc/nginx/front-deploy.d}"   # back-deploy.sh paths (/api)
 LOCK_DIR="${FD_LOCK_DIR:-/run/lock}"
 
 DEFAULT_NODE=24
@@ -206,6 +207,7 @@ load_site() {
   ENV_FILE="${SITE_ROOT}/shared/.env"
   NGINX_CONF="${NGINX_DIR}/front-deploy-${SITE_DOMAIN}.conf"
   SNI_MAP="${SNI_ROUTES_DIR}/front-deploy-${SITE_DOMAIN}.map"
+  MOUNT_DIR="${FRONT_MOUNT_DIR}/${SITE_DOMAIN}"
   CERT_FULLCHAIN="${TLS_DIR}/${SITE_DOMAIN}/fullchain.pem"
   CERT_PRIVKEY="${TLS_DIR}/${SITE_DOMAIN}/privkey.pem"
 }
@@ -1002,7 +1004,16 @@ cmd_list() {
     fi
     printf '  env     : %s%s\n' "$ENV_FILE" "$([[ -s $ENV_FILE ]] || printf ' (none)')"
     printf '  disk    : %s in %s\n' "$(du -sh "$SITE_ROOT" 2> /dev/null | cut -f1)" "$SITE_ROOT"
+    if compgen -G "${MOUNT_DIR}/*.conf" > /dev/null; then
+      printf '  backend : %s (back-deploy.sh)\n' "$(mounted_paths)"
+    fi
   done
+}
+
+# "/api -> example.com+api, ..." from the back-deploy mounts of this site
+mounted_paths() {
+  sed -n 's|^# Managed by back-deploy -- [^/]*\(/[^ ]*\) -> \(.*\)$|\1 -> \2|p' "$MOUNT_DIR"/*.conf 2> /dev/null \
+    | paste -sd ',' - | sed 's/,/, /g'
 }
 
 # ---------------------------------------------------------------------------
@@ -1107,6 +1118,9 @@ site_body() {
         expires -1;
     }
 
+    # backends of back-deploy.sh under a path of this site (e.g. /api)
+    include ${MOUNT_DIR}/*.conf;
+
     location / {
         try_files \$uri \$uri/ /index.html;
     }
@@ -1141,7 +1155,7 @@ render_site_nginx() {
   else
     H2_LISTEN=' http2'
   fi
-  install -d -m 755 "$NGINX_DIR" "${ACME_ROOT}/.well-known/acme-challenge"
+  install -d -m 755 "$NGINX_DIR" "${ACME_ROOT}/.well-known/acme-challenge" "$MOUNT_DIR"
   {
     printf '# Managed by front-deploy -- run "front-update nginx" instead of editing by hand\n'
     printf 'server {\n'
@@ -1233,6 +1247,9 @@ cmd_remove() {
   pick_sites 0
   load_site "${PICKED[0]}"
   lock_site
+  if compgen -G "${MOUNT_DIR}/*.conf" > /dev/null; then
+    die "Backends of back-deploy.sh run under ${SITE_DOMAIN} ($(mounted_paths)); remove them first with: back-update remove"
+  fi
   if [[ $YES -eq 0 ]]; then
     [[ -t 0 ]] || die "Pass --yes to remove ${SITE_DOMAIN} without a prompt."
     printf 'This deletes %s: nginx config, %s, its certificate and deploy key. Type "yes": ' "$SITE_DOMAIN" "$SITE_ROOT"
@@ -1253,6 +1270,7 @@ cmd_remove() {
   fi
   rm -rf "${WWW_ROOT:?}/${SITE_DOMAIN:?}"
   rm -f "${SITES_DIR}/${SITE_DOMAIN}.conf" "${LOCK_DIR}/front-deploy-${SITE_DOMAIN}.lock"
+  rmdir "$MOUNT_DIR" 2> /dev/null || true
   say "${SITE_DOMAIN} removed. nginx, certbot and Node.js stay installed."
 }
 

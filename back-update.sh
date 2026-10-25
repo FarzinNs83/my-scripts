@@ -55,6 +55,9 @@ ACME_ROOT="${BD_ACME_ROOT:-/var/www/back-deploy-acme}"
 TLS_DIR="${BD_TLS_DIR:-/etc/letsencrypt/live}"
 DS_STREAM_CONF="/etc/nginx/stream.d/dns-setup-relay.conf"     # dns-setup.sh owns :443
 SNI_ROUTES_DIR="${BD_SNI_ROUTES_DIR:-/etc/nginx/sni-routes.d}" # included by its SNI map
+# a backend under a path of a front-deploy.sh site drops its locations here;
+# the site's server blocks include <dir>/<domain>/*.conf
+FRONT_MOUNT_DIR="${BD_FRONT_MOUNT_DIR:-/etc/nginx/front-deploy.d}"
 LOCK_DIR="${BD_LOCK_DIR:-/run/lock}"
 
 DEFAULT_NODE=24
@@ -63,7 +66,7 @@ NODE_MIRRORS=(https://nodejs.org/dist https://npmmirror.com/mirrors/node)
 NPM_REGISTRY_FALLBACK="https://registry.npmmirror.com"
 
 # Everything back-deploy.sh stores per app in ${SITES_DIR}/<domain>.conf
-SITE_VARS=(SITE_DOMAIN SITE_WWW SITE_REPO SITE_BRANCH SITE_KEY SITE_APP_DIR
+SITE_VARS=(SITE_NAME SITE_DOMAIN SITE_PATH SITE_STRIP SITE_WWW SITE_REPO SITE_BRANCH SITE_KEY SITE_APP_DIR
   SITE_INSTALL_CMD SITE_BUILD_CMD SITE_START_CMD SITE_RELEASE_CMD
   SITE_HEALTH_PATH SITE_HEALTH_TIMEOUT SITE_DATA_DIRS SITE_PRUNE SITE_NODE
   SITE_NPM_REGISTRY SITE_PORT SITE_MAX_BODY SITE_EMAIL SITE_STAGING
@@ -187,9 +190,35 @@ port_holder() {
   ss -ltnp 2> /dev/null | awk -v p=":${1}$" '$4 ~ p && !found {print; found=1}'
 }
 
+# An app on its own domain is named after it; one under a path of a frontend
+# site is <domain>+<path>, e.g. example.com+api for example.com/api.
+app_name() { # domain [path]
+  local p=${2-}
+  p=${p#/}
+  p=${p%/}
+  if [[ -n $p ]]; then
+    printf '%s+%s\n' "$1" "${p//\//-}"
+  else
+    printf '%s\n' "$1"
+  fi
+}
+
+# --site accepts the app name, the domain or domain/path
+site_arg_name() {
+  local a=${1,,}
+  a=${a#*://}
+  a=${a%/}
+  if [[ $a == */* ]]; then
+    app_name "$(normalize_domain "${a%%/*}")" "/${a#*/}"
+  else
+    printf '%s\n' "$a" | tr -d '[:space:]'
+  fi
+}
+
 # Short name for systemd units, the app user and nginx variables.
-site_id() { # domain
+site_id() { # app name
   local id=${1//./-}
+  id=${id//+/-}
   if ((${#id} > 26)); then
     id="${id:0:19}-$(printf '%s' "$1" | sha256sum | cut -c1-6)"
   fi
@@ -216,16 +245,17 @@ load_site() {
   done
   # shellcheck disable=SC1090
   . "$f"
-  [[ $SITE_DOMAIN == "$d" ]] || die "${f} is damaged (SITE_DOMAIN='${SITE_DOMAIN}')."
+  : "${SITE_NAME:=$SITE_DOMAIN}"
+  [[ $SITE_NAME == "$d" && -n $SITE_DOMAIN ]] || die "${f} is damaged (SITE_NAME='${SITE_NAME}')."
   [[ $SITE_PORT =~ ^[0-9]+$ ]] || die "${f} has no valid SITE_PORT; re-run back-deploy.sh."
   : "${SITE_WWW:=0}" "${SITE_STAGING:=0}" "${SITE_TLS_PORT:=10445}" "${SITE_KEEP:=5}" \
     "${SITE_HEALTH_PATH:=/}" "${SITE_HEALTH_TIMEOUT:=60}" "${SITE_MAX_BODY:=50}" \
-    "${SITE_PRUNE:=0}" "${SITE_UPSTREAM_HOST:=127.0.0.1}"
-  SITE_ID=$(site_id "$SITE_DOMAIN")
+    "${SITE_PRUNE:=0}" "${SITE_UPSTREAM_HOST:=127.0.0.1}" "${SITE_STRIP:=0}"
+  SITE_ID=$(site_id "$SITE_NAME")
   UNIT="bd-${SITE_ID}"
   APP_USER="bd-${SITE_ID}"
   UNIT_FILE="${UNIT_DIR}/${UNIT}@.service"
-  SITE_ROOT="${APPS_ROOT}/${SITE_DOMAIN}"
+  SITE_ROOT="${APPS_ROOT}/${SITE_NAME}"
   REPO_DIR="${SITE_ROOT}/repo"
   STAGE_DIR="${SITE_ROOT}/staging"
   RELEASES_DIR="${SITE_ROOT}/releases"
@@ -234,14 +264,16 @@ load_site() {
   ENV_FILE="${SITE_ROOT}/shared/.env"
   ENV_SYSTEMD="${SITE_ROOT}/shared/env.systemd"
   STATE_DIR="${STATE_ROOT}/${SITE_ID}"
-  NGINX_CONF="${NGINX_DIR}/back-deploy-${SITE_DOMAIN}.conf"
-  SNI_MAP="${SNI_ROUTES_DIR}/back-deploy-${SITE_DOMAIN}.map"
+  NGINX_CONF="${NGINX_DIR}/back-deploy-${SITE_NAME}.conf"
+  SNI_MAP="${SNI_ROUTES_DIR}/back-deploy-${SITE_NAME}.map"
   CERT_FULLCHAIN="${TLS_DIR}/${SITE_DOMAIN}/fullchain.pem"
   CERT_PRIVKEY="${TLS_DIR}/${SITE_DOMAIN}/privkey.pem"
+  MOUNT_CONF="${FRONT_MOUNT_DIR}/${SITE_DOMAIN}/back-deploy-${SITE_NAME}.conf"
+  SITE_URL="https://${SITE_DOMAIN}${SITE_PATH}/"
 }
 
 save_site() {
-  local f="${SITES_DIR}/${SITE_DOMAIN}.conf" tmp v
+  local f="${SITES_DIR}/${SITE_NAME}.conf" tmp v
   install -d -m 700 "$BD_ETC" "$SITES_DIR"
   tmp=$(mktemp)
   {
@@ -257,8 +289,8 @@ save_site() {
 # one deploy per app at a time (fd 9 stays open until the next app / exit)
 lock_site() {
   install -d -m 755 "$LOCK_DIR"
-  exec 9> "${LOCK_DIR}/back-deploy-${SITE_DOMAIN}.lock"
-  flock -n 9 || die "Another deploy of ${SITE_DOMAIN} is running."
+  exec 9> "${LOCK_DIR}/back-deploy-${SITE_NAME}.lock"
+  flock -n 9 || die "Another deploy of ${SITE_NAME} is running."
 }
 
 # One build at a time across all apps, so a small VPS does not run out of
@@ -283,7 +315,7 @@ pick_sites() { # allow_all
     return 0
   fi
   if [[ -n $SITE_ARG ]]; then
-    SITE_ARG=$(normalize_domain "$SITE_ARG")
+    SITE_ARG=$(site_arg_name "$SITE_ARG")
     [[ -f ${SITES_DIR}/${SITE_ARG}.conf ]] || die "No app '${SITE_ARG}'. Apps: ${names[*]}"
     PICKED=("$SITE_ARG")
     return 0
@@ -863,7 +895,7 @@ render_unit() {
   cat > "$tmp" << EOF
 # Managed by back-deploy -- re-run back-deploy.sh instead of editing by hand
 [Unit]
-Description=${SITE_DOMAIN} (%i), deployed by back-deploy
+Description=${SITE_URL} (%i), deployed by back-deploy
 After=network-online.target
 Wants=network-online.target
 StartLimitIntervalSec=0
@@ -1094,7 +1126,7 @@ update_site() { # domain
   started=$(date +%s)
   load_site "$1"
   lock_site
-  say "=== ${SITE_DOMAIN} ==="
+  say "=== ${SITE_URL} ==="
   if [[ -n $NEW_BRANCH ]]; then
     SITE_BRANCH=$NEW_BRANCH
     save_site
@@ -1126,7 +1158,7 @@ update_site() { # domain
     if [[ $FORCE -eq 0 ]] && kept=$(release_with_sig "$sig"); then
       say "Commit ${COMMIT} was built before (release ${kept}); starting it again."
       go_live "$kept" 0
-      say "Live: https://${SITE_DOMAIN}/ -> ${COMMIT} \"${COMMIT_MSG}\" ($(($(date +%s) - started))s)"
+      say "Live: ${SITE_URL} -> ${COMMIT} \"${COMMIT_MSG}\" ($(($(date +%s) - started))s)"
       return 0
     fi
   fi
@@ -1148,7 +1180,7 @@ update_site() { # domain
   make_release "$sig"
   exec 8>&- # the build lock: starting the app needs no build slot
   go_live "$RELEASE" 1
-  say "Live: https://${SITE_DOMAIN}/ -> ${COMMIT} \"${COMMIT_MSG}\" in $(($(date +%s) - started))s (release ${RELEASE})"
+  say "Live: ${SITE_URL} -> ${COMMIT} \"${COMMIT_MSG}\" in $(($(date +%s) - started))s (release ${RELEASE})"
 }
 
 cmd_update() {
@@ -1265,14 +1297,20 @@ health_of() { # port
 }
 
 cmd_status() {
-  local d c inst state expires https
+  local d c inst state expires https url
   pick_sites 0
   for d in "${PICKED[@]}"; do
     load_site "$d"
     expires=$(openssl x509 -in "$CERT_FULLCHAIN" -noout -enddate 2> /dev/null | sed -n 's/^notAfter=//p') || expires=""
+    url="https://${SITE_DOMAIN}${SITE_HEALTH_PATH}"
+    [[ -z $SITE_PATH ]] || url=$SITE_URL
     https=$(curl -s -o /dev/null -w '%{http_code}' --max-time 10 --resolve "${SITE_DOMAIN}:443:127.0.0.1" \
-      "https://${SITE_DOMAIN}${SITE_HEALTH_PATH}" 2> /dev/null) || https=000
-    printf 'App         : https://%s/\n' "$SITE_DOMAIN"
+      "$url" 2> /dev/null) || https=000
+    printf 'App         : %s\n' "$SITE_URL"
+    if [[ -n $SITE_PATH ]]; then
+      printf 'Mounted     : under the front-deploy site %s (%s)\n' "$SITE_DOMAIN" \
+        "$([[ $SITE_STRIP == 1 ]] && printf 'path stripped: %s/x -> /x' "$SITE_PATH" || printf 'full path passed on')"
+    fi
     printf 'Release     : %s (%s)\n' "$(current_release || printf none)" "$(meta_get "$(current_release || true)" message)"
     for c in blue green; do
       inst="${UNIT}@${c}"
@@ -1285,7 +1323,7 @@ cmd_status() {
     printf 'Certificate : %s\n' "${expires:-missing}"
     printf 'Data        : %s\n' "$STATE_DIR"
     printf 'Env         : %s\n' "$ENV_FILE"
-    printf 'Logs        : back-update logs --site %s\n' "$SITE_DOMAIN"
+    printf 'Logs        : back-update logs --site %s\n' "$SITE_NAME"
   done
 }
 
@@ -1310,7 +1348,7 @@ cmd_list() {
     load_site "$d"
     cur=$(current_release || printf 'none')
     n=$(release_list | wc -l)
-    printf '%s\n' "https://${SITE_DOMAIN}/"
+    printf '%s\n' "${SITE_URL}  (${SITE_NAME})"
     printf '  source  : %s (%s)\n' "$(mask_url "$SITE_REPO")" "$SITE_BRANCH"
     printf '  live    : %s on %s, port %s (%s releases kept)\n' "$cur" "${SITE_ACTIVE:-none}" \
       "$(color_port "${SITE_ACTIVE:-blue}")" "$n"
@@ -1376,28 +1414,35 @@ tls_server_head() { # server_name
 
 # Proxy to the live instance: websockets, real client IP headers (use
 # app.set("trust proxy", 1) in Express), long timeouts, upload limit.
-proxy_body() {
-  local up=$1 var=$2
+proxy_location() { # location-spec proxy_pass-target
+  local up="bd_${SITE_ID//-/_}"
   cat << EOF
-
-    client_max_body_size ${SITE_MAX_BODY}m;
-
-    location / {
-        proxy_pass http://${up};
+    location ${1} {
+        proxy_pass ${2};
         proxy_http_version 1.1;
         proxy_set_header Upgrade \$http_upgrade;
-        proxy_set_header Connection \$${var};
+        proxy_set_header Connection \$${up}_connection;
         proxy_set_header Host \$host;
         proxy_set_header X-Real-IP \$remote_addr;
         proxy_set_header X-Forwarded-For \$proxy_add_x_forwarded_for;
         proxy_set_header X-Forwarded-Proto \$scheme;
         proxy_set_header X-Forwarded-Host \$host;
+EOF
+  if [[ -n $SITE_PATH && $SITE_STRIP == 1 ]]; then
+    printf '        proxy_set_header X-Forwarded-Prefix %s;\n' "$SITE_PATH"
+  fi
+  cat << EOF
+        client_max_body_size ${SITE_MAX_BODY}m;
         proxy_connect_timeout 10s;
         proxy_read_timeout 300s;
         proxy_send_timeout 300s;
-        proxy_next_upstream error timeout;
     }
 EOF
+}
+
+proxy_body() {
+  printf '\n'
+  proxy_location / "http://bd_${SITE_ID//-/_}"
 }
 
 sync_sni_route() { # http | https
@@ -1415,15 +1460,54 @@ sync_sni_route() { # http | https
   fi
 }
 
+# upstream (the live instance) and the websocket map: http context
+render_upstream() {
+  local up="bd_${SITE_ID//-/_}" port
+  port=$(color_port "${SITE_ACTIVE:-blue}")
+  printf '# Managed by back-deploy -- run "back-update nginx" instead of editing by hand\n'
+  printf '# live instance: %s\n' "${SITE_ACTIVE:-none yet}"
+  printf 'upstream %s {\n' "$up"
+  if [[ $SITE_UPSTREAM_HOST == '[::1]' ]]; then
+    printf '    server [::1]:%s;\n' "$port"
+  else
+    printf '    server 127.0.0.1:%s;\n' "$port"
+  fi
+  printf '    keepalive 16;\n'
+  printf '}\n\n'
+  printf 'map $http_upgrade $%s_connection {\n' "$up"
+  printf '    default upgrade;\n'
+  printf "    ''      \"\";\n"
+  printf '}\n'
+}
+
+# Under a path of a front-deploy.sh site: only locations, included by that
+# site's server blocks (its certificate, its :443 / relay layout). Without
+# --strip-path the app sees the full path (/api/users), with it the rest
+# (/users).
+render_mount() {
+  local up="bd_${SITE_ID//-/_}" target
+  target="http://${up}"
+  [[ $SITE_STRIP == 1 ]] && target+="/"
+  install -d -m 755 "$(dirname "$MOUNT_CONF")"
+  {
+    printf '# Managed by back-deploy -- %s%s/ -> %s\n' "$SITE_DOMAIN" "$SITE_PATH" "$SITE_NAME"
+    proxy_location "^~ ${SITE_PATH}/" "$target"
+    proxy_location "= ${SITE_PATH}" "$target"
+  } > "$MOUNT_CONF"
+}
+
 # Without a certificate yet, port 80 proxies to the app (and answers the
 # ACME challenge); with one, port 80 only redirects.
 render_site_nginx() {
-  local mode=http names=$SITE_DOMAIN up var port
+  local mode=http names=$SITE_DOMAIN
+  install -d -m 755 "$NGINX_DIR" "${ACME_ROOT}/.well-known/acme-challenge"
+  if [[ -n $SITE_PATH ]]; then
+    render_upstream > "$NGINX_CONF"
+    render_mount
+    return 0
+  fi
   cert_valid && mode=https
   [[ $SITE_WWW == 1 ]] && names+=" www.${SITE_DOMAIN}"
-  up="bd_${SITE_ID//-/_}"
-  var="${up}_connection"
-  port=$(color_port "${SITE_ACTIVE:-blue}")
   H2_LISTEN=""
   H2_LINE=""
   if nginx_version_ge 1.25.1; then
@@ -1431,23 +1515,9 @@ render_site_nginx() {
   else
     H2_LISTEN=' http2'
   fi
-  install -d -m 755 "$NGINX_DIR" "${ACME_ROOT}/.well-known/acme-challenge"
   {
-    printf '# Managed by back-deploy -- run "back-update nginx" instead of editing by hand\n'
-    printf '# live instance: %s\n' "${SITE_ACTIVE:-none yet}"
-    printf 'upstream %s {\n' "$up"
-    if [[ $SITE_UPSTREAM_HOST == '[::1]' ]]; then
-      printf '    server [::1]:%s;\n' "$port"
-    else
-      printf '    server 127.0.0.1:%s;\n' "$port"
-    fi
-    printf '    keepalive 16;\n'
-    printf '}\n\n'
-    printf 'map $http_upgrade $%s {\n' "$var"
-    printf '    default upgrade;\n'
-    printf "    ''      \"\";\n"
-    printf '}\n\n'
-    printf 'server {\n'
+    render_upstream
+    printf '\nserver {\n'
     printf '    listen 80;\n'
     if ipv6_enabled; then
       printf '    listen [::]:80;\n'
@@ -1462,7 +1532,7 @@ render_site_nginx() {
       printf '        return 301 https://%s$request_uri;\n' "$SITE_DOMAIN"
       printf '    }\n'
     else
-      proxy_body "$up" "$var"
+      proxy_body
     fi
     printf '}\n'
     if [[ $mode == https ]]; then
@@ -1474,7 +1544,7 @@ render_site_nginx() {
       fi
       printf '\nserver {\n'
       tls_server_head "$SITE_DOMAIN"
-      proxy_body "$up" "$var"
+      proxy_body
       printf '}\n'
     fi
   } > "$NGINX_CONF"
@@ -1519,6 +1589,10 @@ cmd_nginx() {
     if [[ $before != none && $after != none && $before != "$after" ]]; then
       restart=1
     fi
+    if [[ -n $SITE_PATH ]]; then
+      say "${d}: ${SITE_URL} (inside the front-deploy site ${SITE_DOMAIN})"
+      continue
+    fi
     case $after in
       public) say "${d}: HTTPS on :443" ;;
       loopback) say "${d}: HTTPS on 127.0.0.1:${SITE_TLS_PORT} behind the dns-setup.sh relay" ;;
@@ -1536,12 +1610,12 @@ cmd_remove() {
   load_site "${PICKED[0]}"
   lock_site
   if [[ $YES -eq 0 ]]; then
-    [[ -t 0 ]] || die "Pass --yes to remove ${SITE_DOMAIN} without a prompt."
+    [[ -t 0 ]] || die "Pass --yes to remove ${SITE_NAME} without a prompt."
     if [[ $PURGE -eq 1 ]]; then
-      printf 'This deletes %s with its releases, .env, certificate AND its data in %s. Type "yes": ' "$SITE_DOMAIN" "$STATE_DIR"
+      printf 'This deletes %s with its releases, .env AND its data in %s. Type "yes": ' "$SITE_URL" "$STATE_DIR"
     else
-      printf 'This deletes %s: instances, nginx config, %s, certificate, deploy key (data in %s stays). Type "yes": ' \
-        "$SITE_DOMAIN" "$SITE_ROOT" "$STATE_DIR"
+      printf 'This deletes %s: instances, nginx config, %s, deploy key (data in %s stays). Type "yes": ' \
+        "$SITE_URL" "$SITE_ROOT" "$STATE_DIR"
     fi
     read -r ans || true
     [[ $ans == yes ]] || die "Aborted."
@@ -1551,11 +1625,13 @@ cmd_remove() {
   done
   rm -f "$UNIT_FILE"
   systemctl daemon-reload || true
-  rm -f "$NGINX_CONF" "$SNI_MAP"
+  # the mount refers to the upstream in NGINX_CONF: both go together
+  rm -f "$NGINX_CONF" "$SNI_MAP" "$MOUNT_CONF"
   if command -v nginx > /dev/null 2>&1 && nginx -t > /dev/null 2>&1 && svc_active nginx; then
     systemctl reload nginx || true
   fi
-  if command -v certbot > /dev/null 2>&1 && [[ -e /etc/letsencrypt/renewal/${SITE_DOMAIN}.conf ]]; then
+  # under a path, the certificate belongs to the front-deploy site
+  if [[ -z $SITE_PATH ]] && command -v certbot > /dev/null 2>&1 && [[ -e /etc/letsencrypt/renewal/${SITE_DOMAIN}.conf ]]; then
     certbot delete --non-interactive --cert-name "$SITE_DOMAIN" > /dev/null 2>&1 \
       || warn "certbot could not delete the certificate; run: certbot delete --cert-name ${SITE_DOMAIN}"
   fi
@@ -1563,14 +1639,14 @@ cmd_remove() {
     rm -f "$SITE_KEY" "${SITE_KEY}.pub"
     say "Also delete the deploy key from the repository settings."
   fi
-  rm -rf "${APPS_ROOT:?}/${SITE_DOMAIN:?}"
-  rm -f "${SITES_DIR}/${SITE_DOMAIN}.conf" "${LOCK_DIR}/back-deploy-${SITE_DOMAIN}.lock"
+  rm -rf "${APPS_ROOT:?}/${SITE_NAME:?}"
+  rm -f "${SITES_DIR}/${SITE_NAME}.conf" "${LOCK_DIR}/back-deploy-${SITE_NAME}.lock"
   if [[ $PURGE -eq 1 ]]; then
     # with DynamicUser the data lives in /var/lib/private
     rm -rf "${STATE_ROOT:?}/${SITE_ID:?}" "/var/lib/private/back-deploy/${SITE_ID:?}"
-    say "${SITE_DOMAIN} and its data removed."
+    say "${SITE_URL} and its data removed."
   else
-    say "${SITE_DOMAIN} removed; its data stays in ${STATE_DIR} (--purge deletes it)."
+    say "${SITE_URL} removed; its data stays in ${STATE_DIR} (--purge deletes it)."
   fi
 }
 
