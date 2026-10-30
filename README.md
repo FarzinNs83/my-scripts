@@ -204,7 +204,7 @@ Ports: TCP 80/443. Next to `dns-setup.sh`, the sites sit behind its relay on
 
 ## back-deploy.sh / back-update.sh
 
-Deploys a Node.js backend (Express, Nest, Fastify, ...) from its git
+Deploys a Node.js (Express, Nest, Fastify, ...) or Django backend from its git
 repository behind nginx with a Let's Encrypt certificate, run by systemd, and
 updates it after each push without downtime.
 
@@ -216,8 +216,14 @@ updates it after each push without downtime.
   (`app.get("/api/users")`, passed on as is) or not (`app.get("/users")`,
   nginx strips `/api`)
 - then the repository (public over HTTPS, private with a read-only deploy key,
-  like `front-deploy.sh`) and the app's `.env` (optional, add it later with
-  `back-update env`)
+  like `front-deploy.sh`)
+- the app's `.env` from the repository's `.env.example` (or `.env.sample`,
+  `.env.template`, ...): it asks for each variable, showing the comment above
+  it; Enter keeps the example value, `-` leaves it empty, and secrets
+  (`JWT_SECRET`, `SESSION_SECRET`, ...) get a random value on Enter. `PORT` is
+  not asked. Or copy a `.env` already on the server (`--env-file`), or skip and
+  add it later with `back-update env`. Re-running the script asks only for
+  variables added to `.env.example` since
 - Node.js from `.nvmrc` / `engines`, npm / pnpm / yarn from the lockfile, the
   `build` script (TypeScript) when there is one. The start command comes from
   the `start:prod` / `start` script (watch-mode scripts such as nodemon are
@@ -240,6 +246,41 @@ bash <(curl -Ls https://raw.githubusercontent.com/FarzinNs83/my-scripts/main/bac
 
 The app must listen on `process.env.PORT`; behind nginx, Express needs
 `app.set("trust proxy", 1)` for the real client IP.
+
+### Django
+
+A repository with `manage.py` (at the root, or the only folder with one) is
+deployed as Django, with the same questions and the same `back-update`:
+
+- a virtualenv with system Python 3 and `requirements.txt`, plus gunicorn when
+  it is not listed; the start command is
+  `python -m gunicorn <project>.wsgi:application --bind 127.0.0.1:$PORT`
+  (confirmed once). pypi.org blocked: a mirror is used (`--pip-index`)
+- every release runs `migrate` and `collectstatic` before it gets traffic
+- **PostgreSQL** (requirements with `psycopg`): installed locally, with a
+  database and user for the app and a random password. **Redis** (requirements
+  with `celery`, `redis` or `django-redis`): installed on `127.0.0.1:6379`.
+  While filling the `.env`, `DB_NAME` / `DB_USER` / `DB_PASSWORD` /
+  `DB_HOST` / `DB_PORT` (or `POSTGRES_*`, `DATABASE_URL`), `REDIS_HOST` /
+  `REDIS_PORT` / `REDIS_URL` / `CELERY_BROKER_URL`, `ALLOWED_HOSTS` and
+  `DEBUG` come pre-filled; Enter takes them
+- **Celery** (celery in the requirements and a `celery.py` next to the
+  settings): `celery worker` as a service, and `celery beat` when the code has
+  a beat schedule. Both restart after every deploy, `back-update env`,
+  restart and rollback, and show up in `back-update logs` / `status`
+- the server's paths stay out of the repository: Django runs with
+  `DJANGO_SETTINGS_MODULE=_back_deploy_settings`, a file back-deploy adds to each
+  release that imports the project's settings and sets `STATIC_ROOT`,
+  `MEDIA_ROOT` (in `/var/lib/back-deploy/<app>`, kept across releases),
+  `STATIC_URL=/static/`, `MEDIA_URL=/media/` and the `X-Forwarded-Proto` https
+  header. nginx serves `/static/` and `/media/` itself (uploads sandboxed)
+- the app runs as its own system user `bd-<app>` (not a DynamicUser, so nginx
+  can read the static and media files); the `.env` is still read by systemd
+  only
+
+The project's settings read everything else from the environment
+(`os.getenv`). Behind nginx there is exactly one proxy: if the project counts
+proxies for the client IP (DRF `NUM_PROXIES`), set it to 1.
 
 After the install:
 

@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # =============================================================================
-#  back-update.sh -- rebuild and restart a Node.js (Express) backend set up by
-#                    back-deploy.sh, without downtime
+#  back-update.sh -- rebuild and restart a Node.js (Express) or Django backend
+#                    set up by back-deploy.sh, without downtime
 #
 #  What it does (for each app)
 #    1. pulls the latest commit of the app's branch (shallow, as the
@@ -11,7 +11,10 @@
 #    3. installs the Node.js major the project asks for (.nvmrc,
 #       .node-version, engines.node; default 24) under /opt/back-deploy/node,
 #       the dependencies with npm / pnpm / yarn (skipped when the lockfile did
-#       not change), and runs the "build" script when there is one (TypeScript)
+#       not change), and runs the "build" script when there is one (TypeScript).
+#       Django: a virtualenv with requirements.txt and gunicorn; migrate and
+#       collectstatic run once per release; Celery worker / beat restart after
+#       every switch
 #    4. copies the result into /srv/back-deploy/<domain>/releases
 #       (unchanged files are hard links to the previous release)
 #    5. blue/green: every app has two systemd instances on two ports. The new
@@ -64,13 +67,15 @@ DEFAULT_NODE=24
 DRAIN_SECONDS=10 # the old instance finishes its requests before it stops
 NODE_MIRRORS=(https://nodejs.org/dist https://npmmirror.com/mirrors/node)
 NPM_REGISTRY_FALLBACK="https://registry.npmmirror.com"
+PIP_INDEX_FALLBACK="https://mirrors.aliyun.com/pypi/simple/"
 
 # Everything back-deploy.sh stores per app in ${SITES_DIR}/<domain>.conf
 SITE_VARS=(SITE_NAME SITE_DOMAIN SITE_PATH SITE_STRIP SITE_WWW SITE_REPO SITE_BRANCH SITE_KEY SITE_APP_DIR
   SITE_INSTALL_CMD SITE_BUILD_CMD SITE_START_CMD SITE_RELEASE_CMD
   SITE_HEALTH_PATH SITE_HEALTH_TIMEOUT SITE_DATA_DIRS SITE_PRUNE SITE_NODE
   SITE_NPM_REGISTRY SITE_PORT SITE_MAX_BODY SITE_EMAIL SITE_STAGING
-  SITE_TLS_PORT SITE_KEEP SITE_ACTIVE SITE_UPSTREAM_HOST SITE_CREATED)
+  SITE_TLS_PORT SITE_KEEP SITE_ACTIVE SITE_UPSTREAM_HOST SITE_CREATED
+  SITE_KIND SITE_PIP_INDEX SITE_DJANGO_SETTINGS SITE_CELERY SITE_BEAT SITE_DB SITE_DB_PASSWORD)
 
 # ---------------------------------------------------------------------------
 # Options
@@ -87,6 +92,8 @@ PURGE=0
 FOLLOW=0
 
 REGISTRY=""
+PIP_INDEX=""
+PY_VER=""
 NODE_DIR=""
 NODE_MAJOR=""
 COMMIT=""
@@ -100,7 +107,7 @@ die() { printf '[x] %s\n' "$*" >&2; exit 1; }
 
 usage() {
   cat << 'EOF'
-back-update.sh -- rebuild and restart a Node.js backend set up by
+back-update.sh -- rebuild and restart a Node.js or Django backend set up by
 back-deploy.sh, without downtime (blue/green behind nginx).
 
 Usage:
@@ -122,11 +129,12 @@ Options:
       --site <name>       the app to work on instead of being asked
       --all               every app, one after the other
       --force             rebuild even when the commit did not change
-      --clean             delete node_modules first (fresh dependency install)
+      --clean             delete node_modules / .venv first (fresh install)
       --branch <name>     switch the app to another branch (saved)
   -h, --help              show this help
 
-The app must listen on process.env.PORT. Runtime variables go in
+The app must listen on process.env.PORT (Django: gunicorn gets --bind
+127.0.0.1:$PORT). Runtime variables go in
 /srv/back-deploy/<app>/shared/.env (read by systemd, not by the app user);
 after editing it run back-update restart, or use back-update env.
 EOF
@@ -255,6 +263,7 @@ load_site() {
   UNIT="bd-${SITE_ID}"
   APP_USER="bd-${SITE_ID}"
   UNIT_FILE="${UNIT_DIR}/${UNIT}@.service"
+  DJANGO_ENV="${APPS_ROOT}/${SITE_NAME}/slots/django.env"
   SITE_ROOT="${APPS_ROOT}/${SITE_NAME}"
   REPO_DIR="${SITE_ROOT}/repo"
   STAGE_DIR="${SITE_ROOT}/staging"
@@ -373,6 +382,8 @@ builder_env() {
     npm_config_fund=false
     npm_config_audit=false
   )
+  BENV+=(PIP_DISABLE_PIP_VERSION_CHECK=1 PIP_NO_INPUT=1 PIP_PROGRESS_BAR=off)
+  [[ -z $PIP_INDEX ]] || BENV+=(PIP_INDEX_URL="$PIP_INDEX")
   if [[ -n $REGISTRY ]]; then
     BENV+=(npm_config_registry="$REGISTRY" COREPACK_NPM_REGISTRY="$REGISTRY"
       YARN_REGISTRY="$REGISTRY" YARN_NPM_REGISTRY_SERVER="$REGISTRY")
@@ -481,6 +492,18 @@ pick_registry() {
   warn "registry.npmjs.org is unreachable; using ${REGISTRY} (pin one with back-deploy.sh --npm-registry)."
 }
 
+pick_pip_index() {
+  PIP_INDEX=$SITE_PIP_INDEX
+  if [[ -n $PIP_INDEX ]]; then
+    return 0
+  fi
+  if curl -fsS -o /dev/null --max-time 10 https://pypi.org/simple/pip/ 2> /dev/null; then
+    return 0
+  fi
+  PIP_INDEX=$PIP_INDEX_FALLBACK
+  warn "pypi.org is unreachable; using ${PIP_INDEX} (pin one with back-deploy.sh --pip-index)."
+}
+
 # ---------------------------------------------------------------------------
 # Repository and build
 # ---------------------------------------------------------------------------
@@ -495,7 +518,7 @@ git_sync() {
     as_builder timeout 600 git -C "$REPO_DIR" fetch -q --depth 1 origin "$br" \
       || die "git fetch failed (deploy key removed? branch '${br}' deleted? network?)."
     as_builder git -C "$REPO_DIR" checkout -q -f -B "$br" FETCH_HEAD
-    as_builder git -C "$REPO_DIR" clean -fdq
+    as_builder git -C "$REPO_DIR" clean -fdq -e .venv
   else
     rm -rf "$REPO_DIR"
     install -d -m 750 -o "$BUILD_USER" -g "$BUILD_USER" "$REPO_DIR"
@@ -511,28 +534,29 @@ git_sync() {
   COMMIT_MSG=$(as_builder git -C "$REPO_DIR" log -1 --format=%s | cut -c1-70)
 }
 
-# The folder with the backend's package.json: the repository root, or the
-# one sub-folder that has one (monorepo); asked once and saved.
+# The folder with the backend's package.json (Django: manage.py): the
+# repository root, or the one sub-folder that has one (monorepo); asked once
+# and saved.
 choose_app_dir() {
   local c=() f i ans
   if [[ -n $SITE_APP_DIR ]]; then
     return 0
   fi
-  if [[ -f ${REPO_DIR}/package.json ]]; then
+  if [[ -f ${REPO_DIR}/package.json || -f ${REPO_DIR}/manage.py ]]; then
     SITE_APP_DIR=.
     save_site
     return 0
   fi
   while IFS= read -r f; do
     c+=("$f")
-  done < <(cd "$REPO_DIR" && find . -mindepth 2 -maxdepth 3 -name package.json \
-    -not -path '*/node_modules/*' -not -path './.git/*' -printf '%h\n' | sed 's|^\./||' | sort)
-  ((${#c[@]} > 0)) || die "The repository has no package.json; is this a Node.js app?"
+  done < <(cd "$REPO_DIR" && find . -mindepth 2 -maxdepth 3 \( -name package.json -o -name manage.py \) \
+    -not -path '*/node_modules/*' -not -path '*/.venv/*' -not -path './.git/*' -printf '%h\n' | sed 's|^\./||' | sort -u)
+  ((${#c[@]} > 0)) || die "The repository has no package.json or manage.py; is this a Node.js or Django app?"
   if ((${#c[@]} == 1)); then
     SITE_APP_DIR=${c[0]}
     say "App found in ${SITE_APP_DIR}/"
   else
-    [[ -t 0 ]] || die "Several package.json files (${c[*]}); set the folder with back-deploy.sh --app-dir."
+    [[ -t 0 ]] || die "Several app folders (${c[*]}); set the folder with back-deploy.sh --app-dir."
     printf 'Which folder is the backend?\n'
     for i in "${!c[@]}"; do
       printf '  %d) %s\n' "$((i + 1))" "${c[i]}"
@@ -701,7 +725,91 @@ detect_pm() {
   APP_REL=${APP_REL#/}
 }
 
+# Django: the settings module from manage.py, the WSGI module next to it, and
+# Celery when the requirements list it and that package has a celery.py.
+read_django() {
+  local f m pkg
+  command -v python3 > /dev/null 2>&1 || die "python3 is missing; re-run back-deploy.sh."
+  PY_VER=$(python3 -c 'import sys; print("%d.%d" % sys.version_info[:2])')
+  REQ_FILE=""
+  for f in requirements.txt requirements/production.txt requirements/prod.txt requirements/base.txt; do
+    if [[ -f ${APP}/${f} ]]; then
+      REQ_FILE=$f
+      break
+    fi
+  done
+  m=$(sed -n -E "s/.*DJANGO_SETTINGS_MODULE['\"][[:space:]]*,[[:space:]]*['\"]([A-Za-z0-9_.]+)['\"].*/\1/p" "${APP}/manage.py" | head -n 1)
+  [[ -n $m ]] || die "manage.py does not set DJANGO_SETTINGS_MODULE."
+  SITE_DJANGO_SETTINGS=$m
+  pkg=${m%%.*}
+  WSGI_MODULE=""
+  if [[ -f ${APP}/${pkg}/wsgi.py ]]; then
+    WSGI_MODULE="${pkg}.wsgi"
+  else
+    f=$(cd "$APP" && find . -mindepth 2 -maxdepth 3 -name wsgi.py -not -path './.venv/*' | sort | head -n 1)
+    f=${f#./}
+    f=${f%.py}
+    WSGI_MODULE=${f//\//.}
+  fi
+  SITE_CELERY=""
+  SITE_BEAT=0
+  if [[ -n $REQ_FILE && -f ${APP}/${pkg}/celery.py ]] && grep -qiE '^[[:space:]]*celery\b' "${APP}/${REQ_FILE}"; then
+    SITE_CELERY=$pkg
+    if grep -rqsE --include='*.py' --exclude-dir=.venv 'CELERY_BEAT_SCHEDULE|beat_schedule|django_celery_beat' "$APP"; then
+      SITE_BEAT=1
+    fi
+  fi
+  INSTALL_DIR=$APP
+  APP_REL=""
+  if [[ -n $SITE_INSTALL_CMD ]]; then
+    INSTALL_CMD=$SITE_INSTALL_CMD
+  else
+    [[ -n $REQ_FILE ]] || die "No requirements.txt in ${SITE_APP_DIR}/; set the install command with back-deploy.sh --install-cmd."
+    INSTALL_CMD="python -m pip install -r ${REQ_FILE}"
+  fi
+  case $SITE_BUILD_CMD in
+    "" | none) BUILD_CMD="" ;;
+    *) BUILD_CMD=$SITE_BUILD_CMD ;;
+  esac
+  NODE_MAJOR=""
+  PM=pip
+  PRUNE_CMD=""
+}
+
+# The virtualenv lives in the app folder and is copied into every release;
+# everything runs through .venv/bin/python, which works from any folder.
+install_python_deps() {
+  local h stamp="${META_DIR}/deps.hash"
+  h=$(deps_hash)
+  if [[ $CLEAN -eq 1 ]] || ! run_in "$INSTALL_DIR" '.venv/bin/python -c ""' 2> /dev/null; then
+    rm -rf "${INSTALL_DIR}/.venv" "$stamp"
+    say "Creating the virtualenv (Python ${PY_VER}) ..."
+    run_in "$INSTALL_DIR" 'python3 -m venv .venv' \
+      || die "Could not create the virtualenv (python3-venv missing? re-run back-deploy.sh)."
+  fi
+  if [[ -f $stamp && $(cat "$stamp") == "$h" ]]; then
+    say "Dependencies did not change; skipping the install."
+    return 0
+  fi
+  rm -f "$stamp"
+  say "Installing dependencies: ${INSTALL_CMD}"
+  run_in "$INSTALL_DIR" "PATH=\"\$PWD/.venv/bin:\$PATH\"; ${INSTALL_CMD}" \
+    || die "Installing the dependencies failed (output above). This server has Python ${PY_VER}; \"Requires-Python\" / \"No matching distribution\" means a package wants a newer one (Ubuntu 24.04 has 3.12)."
+  if ! run_in "$INSTALL_DIR" '.venv/bin/python -c "import gunicorn"' 2> /dev/null; then
+    say "Installing gunicorn (not in the requirements) ..."
+    run_in "$INSTALL_DIR" '.venv/bin/python -m pip install gunicorn' || die "Installing gunicorn failed."
+  fi
+  printf '%s\n' "$h" > "$stamp"
+}
+
 deps_hash() {
+  if [[ $SITE_KIND == django ]]; then
+    {
+      printf '%s|%s\n' "$PY_VER" "$INSTALL_CMD"
+      cat "${INSTALL_DIR}"/requirements*.txt "${INSTALL_DIR}"/requirements/*.txt 2> /dev/null || true
+    } | sha256sum | cut -c1-32
+    return 0
+  fi
   {
     printf '%s|%s\n' "$NODE_MAJOR" "$INSTALL_CMD"
     cat "${INSTALL_DIR}"/{pnpm-lock.yaml,yarn.lock,package-lock.json,npm-shrinkwrap.json} 2> /dev/null || true
@@ -743,7 +851,11 @@ choose_start_cmd() {
   if [[ -n $SITE_START_CMD ]]; then
     return 0
   fi
-  if [[ -n $PKG_START ]]; then
+  if [[ $SITE_KIND == django ]]; then
+    if [[ -n $WSGI_MODULE ]]; then
+      guess="python -m gunicorn ${WSGI_MODULE}:application --bind 127.0.0.1:\$PORT --workers 3 --timeout 120"
+    fi
+  elif [[ -n $PKG_START ]]; then
     guess=$PKG_START
   elif [[ -n $PKG_MAIN && -f ${APP}/${PKG_MAIN} ]]; then
     guess="node ${PKG_MAIN}"
@@ -769,7 +881,7 @@ choose_start_cmd() {
 
 build_signature() {
   printf '%s|%s|%s|%s|%s|%s|%s|%s|%s\n' "$COMMIT" "$NODE_MAJOR" "$INSTALL_CMD" "$BUILD_CMD" \
-    "$SITE_START_CMD" "$SITE_RELEASE_CMD" "$SITE_APP_DIR" "$SITE_PRUNE" "$SITE_DATA_DIRS"
+    "$SITE_START_CMD" "$SITE_RELEASE_CMD" "$SITE_APP_DIR" "$SITE_PRUNE" "$SITE_DATA_DIRS${PY_VER:+|python ${PY_VER}}"
 }
 
 # ---------------------------------------------------------------------------
@@ -851,15 +963,43 @@ make_release() { # signature
     install -d -m 755 "$(dirname "${rel}.tmp/${APP_REL:+${APP_REL}/}${d}")"
     ln -s "${STATE_DIR}/${d}" "${rel}.tmp/${APP_REL:+${APP_REL}/}${d}"
   done
+  if [[ $SITE_KIND == django ]]; then
+    write_django_settings > "${rel}.tmp/_back_deploy_settings.py"
+    chmod 644 "${rel}.tmp/_back_deploy_settings.py"
+  fi
   mv "${rel}.tmp" "$rel"
   printf '%s\n' "$sig" > "${META_DIR}/${name}.sig"
   {
     printf 'node=%s\n' "$NODE_MAJOR"
+    [[ -z $PY_VER ]] || printf 'python=%s\n' "$PY_VER"
     printf 'app=%s\n' "$APP_REL"
     printf 'commit=%s\n' "$COMMIT"
     printf 'message=%s\n' "$COMMIT_MSG"
   } > "${META_DIR}/${name}.info"
   RELEASE=$name
+}
+
+# DJANGO_SETTINGS_MODULE of every Django process: the project's own settings
+# (BD_DJANGO_SETTINGS) with the paths of this server, so nothing in the
+# repository has to know where it is deployed.
+write_django_settings() {
+  cat << 'PY'
+# Generated by back-deploy: the project's settings plus this server's paths.
+import os
+from importlib import import_module
+
+_base = import_module(os.environ["BD_DJANGO_SETTINGS"])
+globals().update((k, getattr(_base, k)) for k in dir(_base) if k.isupper())
+
+# the release is read-only: collectstatic and uploads go to the app's state
+# folder, served by nginx
+STATIC_URL = os.environ.get("BD_URL_PREFIX", "") + "/static/"
+STATIC_ROOT = os.environ["BD_STATIC_ROOT"]
+MEDIA_URL = os.environ.get("BD_URL_PREFIX", "") + "/media/"
+MEDIA_ROOT = os.environ["BD_MEDIA_ROOT"]
+# nginx terminates TLS and always sets X-Forwarded-Proto
+SECURE_PROXY_SSL_HEADER = ("HTTP_X_FORWARDED_PROTO", "https")
+PY
 }
 
 # ---------------------------------------------------------------------------
@@ -889,8 +1029,134 @@ state_dirs() {
   printf '%s\n' "$out"
 }
 
+# Django runs as a real system user instead of a DynamicUser: nginx serves its
+# static and media files from the state folder, and /var/lib/private (where
+# DynamicUser keeps it) is closed to nginx.
+ensure_app_user() {
+  if id -u "$APP_USER" > /dev/null 2>&1; then
+    return 0
+  fi
+  useradd --system --user-group --no-create-home --home-dir "$STATE_DIR" --shell /usr/sbin/nologin "$APP_USER" \
+    || die "Could not create the ${APP_USER} user."
+}
+
+# Read after the app's .env (a later EnvironmentFile wins), so the settings
+# wrapper is always used; a DJANGO_SETTINGS_MODULE in .env becomes its base.
+render_django_env() {
+  local base=$SITE_DJANGO_SETTINGS v tmp
+  v=$(sed -n 's/^DJANGO_SETTINGS_MODULE="\(.*\)"$/\1/p' "$ENV_SYSTEMD" 2> /dev/null | tail -n 1)
+  [[ -z $v || $v == _back_deploy_settings ]] || base=$v
+  install -d -m 755 "$SLOTS_DIR"
+  tmp=$(mktemp)
+  {
+    printf 'DJANGO_SETTINGS_MODULE=_back_deploy_settings\n'
+    printf 'BD_DJANGO_SETTINGS=%s\n' "$base"
+    printf 'BD_STATIC_ROOT=%s/static\n' "$STATE_DIR"
+    printf 'BD_MEDIA_ROOT=%s/media\n' "$STATE_DIR"
+    printf 'BD_URL_PREFIX=%s\n' "$SITE_PATH"
+    printf 'PYTHONUNBUFFERED=1\n'
+  } > "$tmp"
+  install -m 644 "$tmp" "$DJANGO_ENV"
+  rm -f "$tmp"
+}
+
+# who the app runs as and its environment, the same in every unit
+unit_common() {
+  if [[ $SITE_KIND == django ]]; then
+    printf 'User=%s\nGroup=%s\n' "$APP_USER" "$APP_USER"
+    printf 'StateDirectory=%s\nStateDirectoryMode=0755\n' "$(state_dirs)"
+    printf 'Environment=HOME=%s\n' "$STATE_DIR"
+    printf 'EnvironmentFile=-%s\nEnvironmentFile=%s\n' "$ENV_SYSTEMD" "$DJANGO_ENV"
+  else
+    printf 'DynamicUser=yes\nUser=%s\n' "$APP_USER"
+    printf 'StateDirectory=%s\n' "$(state_dirs)"
+    printf 'Environment=NODE_ENV=production\nEnvironment=HOME=%s\n' "$STATE_DIR"
+    printf 'Environment=npm_config_update_notifier=false\n'
+    printf 'EnvironmentFile=-%s\n' "$ENV_SYSTEMD"
+  fi
+}
+
+unit_hardening() {
+  cat << 'EOF'
+NoNewPrivileges=yes
+ProtectSystem=strict
+ProtectHome=yes
+PrivateTmp=yes
+PrivateDevices=yes
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectControlGroups=yes
+RestrictSUIDSGID=yes
+LockPersonality=yes
+EOF
+}
+
+install_unit() { # tmp dest
+  if ! cmp -s "$1" "$2"; then
+    install -m 644 "$1" "$2"
+    UNITS_CHANGED=1
+  fi
+  rm -f "$1"
+}
+
+# Celery worker / beat: one instance each, run from the live release
+# (<app>/current), restarted by go_live after every switch.
+render_celery_unit() { # worker | beat
+  local role=$1 f="${UNIT_DIR}/${UNIT}-$1.service" args tmp
+  if [[ -z $SITE_CELERY || ($role == beat && $SITE_BEAT != 1) ]]; then
+    if [[ -f $f ]]; then
+      systemctl disable --now "${UNIT}-${role}" > /dev/null 2>&1 || true
+      rm -f "$f"
+      UNITS_CHANGED=1
+    fi
+    return 0
+  fi
+  args="worker -l info"
+  # the release is read-only: beat keeps its schedule in the state folder
+  [[ $role == beat ]] && args="beat -l info --schedule ${STATE_DIR}/celerybeat-schedule"
+  tmp=$(mktemp)
+  cat > "$tmp" << EOF
+# Managed by back-deploy -- re-run back-deploy.sh instead of editing by hand
+[Unit]
+Description=${SITE_URL} celery ${role}, deployed by back-deploy
+After=network-online.target redis-server.service postgresql.service
+Wants=network-online.target
+StartLimitIntervalSec=0
+
+[Service]
+Type=simple
+$(unit_common)
+WorkingDirectory=${SITE_ROOT}/current
+ExecStart=${SITE_ROOT}/current/.venv/bin/python -m celery -A ${SITE_CELERY} ${args}
+Restart=always
+RestartSec=5
+KillMode=mixed
+TimeoutStopSec=60
+SyslogIdentifier=${UNIT}-${role}
+$(unit_hardening)
+
+[Install]
+WantedBy=multi-user.target
+EOF
+  install_unit "$tmp" "$f"
+}
+
+restart_celery() {
+  local role
+  for role in worker beat; do
+    [[ -f ${UNIT_DIR}/${UNIT}-${role}.service ]] || continue
+    systemctl enable "${UNIT}-${role}" > /dev/null 2>&1 || true
+    systemctl restart "${UNIT}-${role}" || warn "Could not start celery ${role}; see: back-update logs"
+  done
+}
+
 render_unit() {
   local tmp
+  UNITS_CHANGED=0
+  if [[ $SITE_KIND == django ]]; then
+    ensure_app_user
+    render_django_env
+  fi
   tmp=$(mktemp)
   cat > "$tmp" << EOF
 # Managed by back-deploy -- re-run back-deploy.sh instead of editing by hand
@@ -902,13 +1168,7 @@ StartLimitIntervalSec=0
 
 [Service]
 Type=simple
-DynamicUser=yes
-User=${APP_USER}
-StateDirectory=$(state_dirs)
-Environment=NODE_ENV=production
-Environment=HOME=${STATE_DIR}
-Environment=npm_config_update_notifier=false
-EnvironmentFile=-${ENV_SYSTEMD}
+$(unit_common)
 EnvironmentFile=${SLOTS_DIR}/%i.env
 ExecStart=${SLOTS_DIR}/%i.sh
 Restart=always
@@ -916,25 +1176,19 @@ RestartSec=2
 TimeoutStopSec=30
 LimitNOFILE=65536
 SyslogIdentifier=${UNIT}-%i
-NoNewPrivileges=yes
-ProtectSystem=strict
-ProtectHome=yes
-PrivateTmp=yes
-PrivateDevices=yes
-ProtectKernelTunables=yes
-ProtectKernelModules=yes
-ProtectControlGroups=yes
-RestrictSUIDSGID=yes
-LockPersonality=yes
+$(unit_hardening)
 
 [Install]
 WantedBy=multi-user.target
 EOF
-  if ! cmp -s "$tmp" "$UNIT_FILE"; then
-    install -m 644 "$tmp" "$UNIT_FILE"
+  install_unit "$tmp" "$UNIT_FILE"
+  if [[ $SITE_KIND == django ]]; then
+    render_celery_unit worker
+    render_celery_unit beat
+  fi
+  if ((UNITS_CHANGED)); then
     systemctl daemon-reload
   fi
-  rm -f "$tmp"
 }
 
 # dotenv syntax -> systemd EnvironmentFile (quotes, "export", inline comments)
@@ -994,17 +1248,24 @@ write_slot() { # color release
   node=$(meta_get "$rel" node)
   app=$(meta_get "$rel" app)
   node=${node:-$DEFAULT_NODE}
-  [[ -x ${NODE_ROOT}/${node}/bin/node ]] || ensure_node "$node"
   dir="${RELEASES_DIR}/${rel}${app:+/${app}}"
+  if [[ $SITE_KIND != django && ! -x ${NODE_ROOT}/${node}/bin/node ]]; then
+    ensure_node "$node"
+  fi
   install -d -m 755 "$SLOTS_DIR"
   tmp=$(mktemp)
   {
     printf '#!/bin/sh\n'
     printf '# Managed by back-deploy: %s instance -> release %s\n' "$color" "$rel"
-    printf "PATH='%s/node_modules/.bin:%s/%s/bin:/usr/local/bin:/usr/bin:/bin'\n" "$dir" "$NODE_ROOT" "$node"
+    if [[ $SITE_KIND == django ]]; then
+      printf "PATH='%s/.venv/bin:/usr/local/bin:/usr/bin:/bin'\n" "$dir"
+    else
+      printf "PATH='%s/node_modules/.bin:%s/%s/bin:/usr/local/bin:/usr/bin:/bin'\n" "$dir" "$NODE_ROOT" "$node"
+    fi
     printf 'export PATH\n'
     printf "cd '%s' || exit 1\n" "$dir"
-    if [[ $SITE_START_CMD == *[\;\&\|\<\>\`\$\(\)]* ]]; then
+    # $PORT expands fine after exec; only real shell syntax needs a shell
+    if [[ $SITE_START_CMD == *[\;\&\|\<\>\`\(\)]* ]]; then
       printf '%s\n' "$SITE_START_CMD"
     else
       printf 'exec %s\n' "$SITE_START_CMD"
@@ -1018,20 +1279,30 @@ write_slot() { # color release
 
 # Runs once per new release, before it gets traffic (e.g. database
 # migrations), as the app user with the app's environment.
+# Django always migrates and collects the static files here.
 run_release_cmd() { # release
-  local rel=$1 node app dir
-  [[ -n $SITE_RELEASE_CMD ]] || return 0
+  local rel=$1 node app dir cmd=$SITE_RELEASE_CMD path props=()
   node=$(meta_get "$rel" node)
   app=$(meta_get "$rel" app)
   dir="${RELEASES_DIR}/${rel}${app:+/${app}}"
-  say "Release command: ${SITE_RELEASE_CMD}"
+  if [[ $SITE_KIND == django ]]; then
+    cmd="python manage.py migrate --noinput && python manage.py collectstatic --noinput${cmd:+ && ${cmd}}"
+    path="${dir}/.venv/bin:/usr/local/bin:/usr/bin:/bin"
+    props=(-p User="$APP_USER" -p Group="$APP_USER" -p StateDirectoryMode=0755
+      -p "EnvironmentFile=-${ENV_SYSTEMD}" -p "EnvironmentFile=${DJANGO_ENV}")
+  else
+    [[ -n $cmd ]] || return 0
+    path="${dir}/node_modules/.bin:${NODE_ROOT}/${node:-$DEFAULT_NODE}/bin:/usr/local/bin:/usr/bin:/bin"
+    props=(-p DynamicUser=yes -p User="$APP_USER" -p Environment=NODE_ENV=production
+      -p "EnvironmentFile=-${ENV_SYSTEMD}")
+  fi
+  say "Release command: ${cmd}"
   systemd-run --quiet --wait --pipe --collect \
     --unit="${UNIT}-release-$(date +%s)" \
-    -p DynamicUser=yes -p User="$APP_USER" -p "StateDirectory=$(state_dirs)" \
-    -p Environment=NODE_ENV=production -p "Environment=HOME=${STATE_DIR}" \
-    -p "EnvironmentFile=-${ENV_SYSTEMD}" -p "WorkingDirectory=${dir}" \
-    /bin/sh -c "PATH='${dir}/node_modules/.bin:${NODE_ROOT}/${node:-$DEFAULT_NODE}/bin:/usr/local/bin:/usr/bin:/bin'; export PATH; ${SITE_RELEASE_CMD}" < /dev/null \
-    || die "The release command failed (output above); the live release keeps running."
+    "${props[@]}" -p "StateDirectory=$(state_dirs)" -p "Environment=HOME=${STATE_DIR}" \
+    -p "WorkingDirectory=${dir}" \
+    /bin/sh -c "PATH='${path}'; export PATH; ${cmd}" < /dev/null \
+    || die "The release command failed (output above; missing .env values? fix them with back-update env); the live release keeps running."
 }
 
 restarts_of() {
@@ -1041,10 +1312,12 @@ restarts_of() {
 # Healthy = any HTTP answer below 500 on the health path. Also learns whether
 # the app listens on 127.0.0.1 or only on ::1 (listen("localhost") on Node 17+).
 wait_healthy() { # instance port
-  local inst=$1 port=$2 i code host n
+  local inst=$1 port=$2 i code host n hdr=()
+  # as nginx sends it: Django answers ALLOWED_HOSTS and SSL redirects right
+  [[ $SITE_KIND == django ]] && hdr=(-H "Host: ${SITE_DOMAIN}" -H "X-Forwarded-Proto: https")
   for ((i = 0; i < SITE_HEALTH_TIMEOUT; i++)); do
     for host in 127.0.0.1 '[::1]'; do
-      code=$(curl -s -o /dev/null -w '%{http_code}' --max-time 3 "http://${host}:${port}${SITE_HEALTH_PATH}" 2> /dev/null) || code=000
+      code=$(curl -s -o /dev/null -w '%{http_code}' --max-time 3 ${hdr[@]+"${hdr[@]}"} "http://${host}:${port}${SITE_HEALTH_PATH}" 2> /dev/null) || code=000
       if [[ $code =~ ^[1-4][0-9][0-9]$ ]]; then
         UP_HOST=$host
         return 0
@@ -1070,8 +1343,8 @@ go_live() { # release run-release-cmd
   port=$(color_port "$idle")
   inst="${UNIT}@${idle}"
 
-  render_unit
   render_env
+  render_unit
   write_slot "$idle" "$rel"
   systemctl stop "$inst" > /dev/null 2>&1 || true
   systemctl reset-failed "$inst" > /dev/null 2>&1 || true
@@ -1105,6 +1378,7 @@ go_live() { # release run-release-cmd
     apply_nginx 0
   fi
   systemctl enable "$inst" > /dev/null 2>&1 || true
+  restart_celery
 
   if [[ -n $old ]]; then
     old_inst="${UNIT}@${old}"
@@ -1141,10 +1415,22 @@ update_site() { # domain
   choose_app_dir
   APP="${REPO_DIR}/${SITE_APP_DIR}"
   APP=${APP%/.}
-  [[ -f ${APP}/package.json ]] || die "${SITE_APP_DIR}/package.json is missing in the repository."
-  read_package_json "$APP"
-  pick_node_major
-  detect_pm
+  if [[ -z $SITE_KIND ]]; then # apps set up before Django support
+    SITE_KIND=node
+    [[ -f ${APP}/manage.py ]] && SITE_KIND=django
+    save_site
+  fi
+  if [[ $SITE_KIND == django ]]; then
+    [[ -f ${APP}/manage.py ]] || die "${SITE_APP_DIR}/manage.py is missing in the repository."
+    read_django
+    save_site
+  else
+    [[ -f ${APP}/package.json ]] || die "${SITE_APP_DIR}/package.json is missing in the repository."
+    PY_VER=""
+    read_package_json "$APP"
+    pick_node_major
+    detect_pm
+  fi
 
   if [[ -n $SITE_START_CMD ]]; then
     sig=$(build_signature)
@@ -1165,15 +1451,20 @@ update_site() { # domain
   say "Commit: ${COMMIT} \"${COMMIT_MSG}\""
 
   lock_builds
-  ensure_node "$NODE_MAJOR"
-  say "Node.js $("${NODE_DIR}/bin/node" -v), ${PM}"
-  pick_registry
-  if [[ $CLEAN -eq 1 ]]; then
-    say "Deleting node_modules (--clean) ..."
-    rm -rf "${INSTALL_DIR}/node_modules" "${APP}/node_modules"
+  if [[ $SITE_KIND == django ]]; then
+    pick_pip_index
+    install_python_deps
+  else
+    ensure_node "$NODE_MAJOR"
+    say "Node.js $("${NODE_DIR}/bin/node" -v), ${PM}"
+    pick_registry
+    if [[ $CLEAN -eq 1 ]]; then
+      say "Deleting node_modules (--clean) ..."
+      rm -rf "${INSTALL_DIR}/node_modules" "${APP}/node_modules"
+    fi
+    [[ $PM == npm ]] || ensure_corepack
+    install_deps
   fi
-  [[ $PM == npm ]] || ensure_corepack
-  install_deps
   build_app
   choose_start_cmd
   sig=$(build_signature)
@@ -1319,6 +1610,10 @@ cmd_status() {
         "$([[ $c == "$SITE_ACTIVE" ]] && printf ', live')" \
         "$([[ $state == active ]] && printf ', %s' "$(health_of "$(color_port "$c")")")"
     done
+    if [[ -n $SITE_CELERY ]]; then
+      printf 'Celery      : worker %s%s\n' "$(systemctl is-active "${UNIT}-worker" 2> /dev/null || true)" \
+        "$([[ $SITE_BEAT == 1 ]] && printf ', beat %s' "$(systemctl is-active "${UNIT}-beat" 2> /dev/null || true)")"
+    fi
     printf 'HTTPS       : HTTP %s via nginx\n' "$https"
     printf 'Certificate : %s\n' "${expires:-missing}"
     printf 'Data        : %s\n' "$STATE_DIR"
@@ -1331,9 +1626,9 @@ cmd_logs() {
   pick_sites 0
   load_site "${PICKED[0]}"
   if [[ $FOLLOW -eq 1 ]]; then
-    journalctl -u "${UNIT}@*" -n 200 -f --no-pager -o short-iso
+    journalctl -u "${UNIT}@*" -u "${UNIT}-worker" -u "${UNIT}-beat" -n 200 -f --no-pager -o short-iso
   else
-    journalctl -u "${UNIT}@*" -n 200 --no-pager -o short-iso
+    journalctl -u "${UNIT}@*" -u "${UNIT}-worker" -u "${UNIT}-beat" -n 200 --no-pager -o short-iso
   fi
 }
 
@@ -1440,8 +1735,27 @@ EOF
 EOF
 }
 
+# Django: collectstatic output and uploads straight from the state folder.
+# Uploads are sandboxed so an uploaded .html / .svg cannot run scripts here.
+static_locations() { # url prefix
+  [[ $SITE_KIND == django ]] || return 0
+  cat << EOF
+    location ^~ ${1}/static/ {
+        alias ${STATE_DIR}/static/;
+        expires 30d;
+        access_log off;
+    }
+    location ^~ ${1}/media/ {
+        alias ${STATE_DIR}/media/;
+        add_header X-Content-Type-Options nosniff always;
+        add_header Content-Security-Policy "sandbox; default-src 'none'; img-src 'self'; media-src 'self'; style-src 'unsafe-inline'" always;
+    }
+EOF
+}
+
 proxy_body() {
   printf '\n'
+  static_locations ""
   proxy_location / "http://bd_${SITE_ID//-/_}"
 }
 
@@ -1491,6 +1805,7 @@ render_mount() {
   install -d -m 755 "$(dirname "$MOUNT_CONF")"
   {
     printf '# Managed by back-deploy -- %s%s/ -> %s\n' "$SITE_DOMAIN" "$SITE_PATH" "$SITE_NAME"
+    static_locations "$SITE_PATH"
     proxy_location "^~ ${SITE_PATH}/" "$target"
     proxy_location "= ${SITE_PATH}" "$target"
   } > "$MOUNT_CONF"
@@ -1612,7 +1927,8 @@ cmd_remove() {
   if [[ $YES -eq 0 ]]; then
     [[ -t 0 ]] || die "Pass --yes to remove ${SITE_NAME} without a prompt."
     if [[ $PURGE -eq 1 ]]; then
-      printf 'This deletes %s with its releases, .env AND its data in %s. Type "yes": ' "$SITE_URL" "$STATE_DIR"
+      printf 'This deletes %s with its releases, .env AND its data in %s%s. Type "yes": ' "$SITE_URL" "$STATE_DIR" \
+        "${SITE_DB:+ and the PostgreSQL database ${SITE_DB}}"
     else
       printf 'This deletes %s: instances, nginx config, %s, deploy key (data in %s stays). Type "yes": ' \
         "$SITE_URL" "$SITE_ROOT" "$STATE_DIR"
@@ -1620,10 +1936,10 @@ cmd_remove() {
     read -r ans || true
     [[ $ans == yes ]] || die "Aborted."
   fi
-  for c in blue green; do
-    systemctl disable --now "${UNIT}@${c}" > /dev/null 2>&1 || true
+  for c in @blue @green -worker -beat; do
+    systemctl disable --now "${UNIT}${c}" > /dev/null 2>&1 || true
   done
-  rm -f "$UNIT_FILE"
+  rm -f "$UNIT_FILE" "${UNIT_DIR}/${UNIT}-worker.service" "${UNIT_DIR}/${UNIT}-beat.service"
   systemctl daemon-reload || true
   # the mount refers to the upstream in NGINX_CONF: both go together
   rm -f "$NGINX_CONF" "$SNI_MAP" "$MOUNT_CONF"
@@ -1644,6 +1960,13 @@ cmd_remove() {
   if [[ $PURGE -eq 1 ]]; then
     # with DynamicUser the data lives in /var/lib/private
     rm -rf "${STATE_ROOT:?}/${SITE_ID:?}" "/var/lib/private/back-deploy/${SITE_ID:?}"
+    if [[ -n $SITE_DB ]] && command -v psql > /dev/null 2>&1; then
+      (cd / && runuser -u postgres -- psql -X -q -c "DROP DATABASE IF EXISTS ${SITE_DB}" -c "DROP ROLE IF EXISTS ${SITE_DB}") \
+        || warn "Could not drop the database ${SITE_DB}."
+    fi
+    if [[ $SITE_KIND == django ]]; then
+      userdel "$APP_USER" > /dev/null 2>&1 || true
+    fi
     say "${SITE_URL} and its data removed."
   else
     say "${SITE_URL} removed; its data stays in ${STATE_DIR} (--purge deletes it)."

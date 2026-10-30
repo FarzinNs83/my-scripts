@@ -1,8 +1,9 @@
 #!/usr/bin/env bash
 # =============================================================================
-#  back-deploy.sh -- a Node.js (Express, Nest, Fastify, ...) backend from its
-#                    git repository, behind nginx with a Let's Encrypt
-#                    certificate, run by systemd with zero-downtime updates
+#  back-deploy.sh -- a Node.js (Express, Nest, Fastify, ...) or Django backend
+#                    from its git repository, behind nginx with a Let's
+#                    Encrypt certificate, run by systemd with zero-downtime
+#                    updates
 #
 #  What it does
 #    1. asks where to serve it: on its own subdomain (api.example.com, checks
@@ -11,7 +12,9 @@
 #    2. asks for the git repository. A public one is cloned over HTTPS; for a
 #       private one it creates a read-only deploy key, shows it and waits
 #       until it is added to the repository
-#    3. asks for the app's .env (optional; edit it later with back-update env)
+#    3. builds the app's .env from the repository's .env.example: asks for
+#       each variable (Enter keeps the example value, secrets get a random
+#       one), or copies a .env file, or skips (back-update env later)
 #    4. installs `back-update` and runs the first deploy with it: Node.js from
 #       .nvmrc / engines, npm / pnpm / yarn from the lockfile, the "build"
 #       script (TypeScript) when there is one, the start command from
@@ -19,6 +22,13 @@
 #       it answers HTTP
 #    5. nginx in front (websockets, real client IP headers, upload limit) and
 #       a Let's Encrypt certificate (HTTP-01, webroot) with auto-renewal
+#
+#  Django (a manage.py in the repository) is detected: a virtualenv with
+#  requirements.txt, gunicorn on the app's port, migrate + collectstatic per
+#  release, static and media files served by nginx, Celery worker / beat as
+#  services when the requirements have celery, and a local Redis and
+#  PostgreSQL (database and user created, .env values filled in) when the
+#  requirements ask for them.
 #
 #  The app runs as its own systemd DynamicUser on a local port (PORT in its
 #  environment); two instances per app (blue/green) make updates and
@@ -68,11 +78,15 @@ UPDATE_URL="${BD_UPDATE_URL:-https://raw.githubusercontent.com/FarzinNs83/my-scr
 PORT_FIRST=3100 # blue = even port, green = the next one
 PORT_LAST=3998
 
+# templates of the app's .env in the repository, the first one found wins
+ENV_TEMPLATE_NAMES=(.env.example .env.sample .env.template .env.dist example.env env.example)
+
 SITE_VARS=(SITE_NAME SITE_DOMAIN SITE_PATH SITE_STRIP SITE_WWW SITE_REPO SITE_BRANCH SITE_KEY SITE_APP_DIR
   SITE_INSTALL_CMD SITE_BUILD_CMD SITE_START_CMD SITE_RELEASE_CMD
   SITE_HEALTH_PATH SITE_HEALTH_TIMEOUT SITE_DATA_DIRS SITE_PRUNE SITE_NODE
   SITE_NPM_REGISTRY SITE_PORT SITE_MAX_BODY SITE_EMAIL SITE_STAGING
-  SITE_TLS_PORT SITE_KEEP SITE_ACTIVE SITE_UPSTREAM_HOST SITE_CREATED)
+  SITE_TLS_PORT SITE_KEEP SITE_ACTIVE SITE_UPSTREAM_HOST SITE_CREATED
+  SITE_KIND SITE_PIP_INDEX SITE_DJANGO_SETTINGS SITE_CELERY SITE_BEAT SITE_DB SITE_DB_PASSWORD)
 for _v in "${SITE_VARS[@]}"; do
   printf -v "$_v" '%s' ''
 done
@@ -100,6 +114,7 @@ OPT_PRUNE=""
 OPT_NODE=""
 OPT_ENV_FILE=""
 OPT_REGISTRY=""
+OPT_PIP_INDEX=""
 OPT_PORT=""
 OPT_MAX_BODY=""
 OPT_EMAIL=""
@@ -116,6 +131,12 @@ REMOTE_HEAD=""
 REPO_HOST=""
 REPO_PATH=""
 PUBLIC_IPV4=""
+ENV_FILE=""
+ENV_TEMPLATE=""      # local copy of the repository's .env.example
+ENV_TEMPLATE_NAME="" # its path in the repository
+PEEK=""              # blobless clone of the branch, to look at its files
+NEED_PG=0
+NEED_REDIS=0
 
 say() { printf '[+] %s\n' "$*"; }
 warn() { printf '[!] %s\n' "$*" >&2; }
@@ -123,9 +144,9 @@ die() { printf '[x] %s\n' "$*" >&2; exit 1; }
 
 usage() {
   cat << 'EOF'
-back-deploy.sh -- deploy a Node.js backend (Express, Nest, Fastify, ...) from
-its git repository behind nginx with a Let's Encrypt certificate, run by
-systemd, updated without downtime.
+back-deploy.sh -- deploy a Node.js (Express, Nest, Fastify, ...) or Django
+backend from its git repository behind nginx with a Let's Encrypt
+certificate, run by systemd, updated without downtime.
 
 Usage:
   sudo bash back-deploy.sh [options]      (asks for the domain and the repository)
@@ -147,20 +168,26 @@ Repository and build:
       --branch <name>       branch to deploy (default: the repository's default)
       --app-dir <dir>       folder of the app inside the repository
                             (default: the root, or the only one with package.json)
-      --install-cmd <cmd>   dependency install (default: from the lockfile)
+      --install-cmd <cmd>   dependency install (default: from the lockfile;
+                            Django: pip install -r requirements.txt)
       --build-cmd <cmd>     build command (default: the "build" script if there
                             is one; "none" skips it)
       --node <major>        Node.js major, e.g. 22 (default: .nvmrc, engines, 24)
       --npm-registry <url>  npm registry, e.g. https://registry.npmmirror.com
                             (default: registry.npmjs.org, a mirror when blocked)
       --prune-dev           remove devDependencies from the releases (npm, pnpm)
+      --pip-index <url>     Django: pip index (default: pypi.org, a mirror
+                            when blocked)
 
 Running:
       --start-cmd <cmd>     start command, run in the app folder (default: the
-                            "start:prod" / "start" script, else node <main>)
+                            "start:prod" / "start" script, else node <main>;
+                            Django: gunicorn on 127.0.0.1:$PORT)
       --release-cmd <cmd>   runs once per new release before it gets traffic,
-                            e.g. "npx prisma migrate deploy"
-      --env-file <path>     the app's .env (DATABASE_URL, secrets, ...)
+                            e.g. "npx prisma migrate deploy" (Django: migrate
+                            and collectstatic always run, this comes after)
+      --env-file <path>     the app's .env (DATABASE_URL, secrets, ...); without
+                            it, asks for each variable of .env.example
       --data-dir <dir>      folder the app writes to, e.g. uploads (repeatable);
                             kept across releases in /var/lib/back-deploy/<app>
       --health-path <path>  URL the deploy waits for, any answer below 500
@@ -182,8 +209,12 @@ Web:
       --staging             Let's Encrypt staging CA (testing only)
   -h, --help                show this help
 
-The app must listen on process.env.PORT. Re-running the script for a deployed
-domain changes its settings and keeps the rest.
+The app must listen on process.env.PORT. A Django app (manage.py) gets
+gunicorn, migrate + collectstatic, nginx for /static/ and /media/, Celery
+worker / beat when it uses celery, and a local Redis / PostgreSQL (database
+and user created, .env filled in) when its requirements need them.
+Re-running the script for a deployed domain changes its settings and keeps
+the rest.
 
 After the install:
   back-update               pull, build and switch to the latest commit
@@ -382,6 +413,7 @@ apply_options() {
   [[ -n $OPT_PRUNE ]] && SITE_PRUNE=$OPT_PRUNE
   [[ -n $OPT_NODE ]] && SITE_NODE=$OPT_NODE
   [[ -n $OPT_REGISTRY ]] && SITE_NPM_REGISTRY=$OPT_REGISTRY
+  [[ -n $OPT_PIP_INDEX ]] && SITE_PIP_INDEX=$OPT_PIP_INDEX
   [[ -n $OPT_PORT ]] && SITE_PORT=$OPT_PORT
   [[ -n $OPT_MAX_BODY ]] && SITE_MAX_BODY=$OPT_MAX_BODY
   [[ -n $OPT_EMAIL ]] && SITE_EMAIL=$OPT_EMAIL
@@ -404,6 +436,9 @@ apply_options() {
   [[ $SITE_MAX_BODY =~ ^[0-9]+$ ]] && ((SITE_MAX_BODY > 0)) || die "Invalid --max-body '${SITE_MAX_BODY}'."
   if [[ -n $SITE_NPM_REGISTRY && ! $SITE_NPM_REGISTRY =~ ^https?://[^[:space:]]+$ ]]; then
     die "Invalid --npm-registry '${SITE_NPM_REGISTRY}'."
+  fi
+  if [[ -n $SITE_PIP_INDEX && ! $SITE_PIP_INDEX =~ ^https?://[^[:space:]]+$ ]]; then
+    die "Invalid --pip-index '${SITE_PIP_INDEX}'."
   fi
   [[ -z $SITE_APP_DIR || ($SITE_APP_DIR != /* && $SITE_APP_DIR != *..*) ]] \
     || die "The app folder must be inside the repository: '${SITE_APP_DIR}'."
@@ -784,6 +819,7 @@ resolve_repo() {
     [[ -n $OPT_APP_DIR ]] || SITE_APP_DIR=""
     [[ -n $OPT_START_CMD ]] || SITE_START_CMD=""
     SITE_BRANCH=""
+    SITE_KIND=""
   fi
   parse_repo_url "$src"
   SITE_REPO=$src
@@ -887,20 +923,481 @@ resolve_branch() {
 # ---------------------------------------------------------------------------
 # The .env is read by systemd (root), never by the app user.
 prepare_app_dirs() {
-  local root="${APPS_ROOT}/${NAME}" env_src=$OPT_ENV_FILE
+  local root="${APPS_ROOT}/${NAME}"
   install -d -m 755 "$APPS_ROOT" "$root" "${root}/releases" "${root}/meta" "${root}/slots"
   install -d -m 700 "${root}/shared"
-  if [[ -z $env_src && ! -s ${root}/shared/.env && -t 0 ]]; then
-    printf 'The app'"'"'s .env (DATABASE_URL, secrets, ...): path to a file on this server,\n'
-    printf 'or Enter to skip and add it later with: back-update env\n'
-    ask ".env file" ""
-    env_src=${REPLY_VALUE/#\~/$HOME}
+  ENV_FILE="${root}/shared/.env"
+  if [[ -n $OPT_ENV_FILE ]]; then
+    copy_env_file "$OPT_ENV_FILE"
+  elif [[ -t 0 ]]; then
+    if [[ -s $ENV_FILE ]]; then
+      # re-run: only the variables added to .env.example since
+      fetch_env_template && complete_env
+    else
+      setup_env
+    fi
   fi
-  if [[ -n $env_src ]]; then
-    [[ -r $env_src ]] || die "Cannot read the .env file ${env_src}."
-    install -m 600 "$env_src" "${root}/shared/.env"
-    say "App env copied to ${root}/shared/.env"
+  rm -f "${ENV_TEMPLATE:-/nonexistent}"
+}
+
+copy_env_file() { # path
+  [[ -r $1 ]] || die "Cannot read the .env file ${1}."
+  install -m 600 "$1" "$ENV_FILE"
+  say "App env copied to ${ENV_FILE}"
+}
+
+ask_env_path() {
+  printf 'The app'"'"'s .env (DATABASE_URL, secrets, ...): path to a file on this server,\n'
+  printf 'or Enter to skip and add it later with: back-update env\n'
+  ask ".env file" ""
+  if [[ -n $REPLY_VALUE ]]; then
+    copy_env_file "${REPLY_VALUE/#\~/$HOME}"
   fi
+}
+
+# No .env yet: build it from the repository's .env.example, one question per
+# variable, or copy a file, or skip.
+setup_env() {
+  local n
+  if ! fetch_env_template; then
+    ask_env_path
+    return 0
+  fi
+  n=$(env_tool keys "$ENV_TEMPLATE" /dev/null | tr -cd '\0' | wc -c)
+  n=$((n / 3))
+  if ((n == 0)); then
+    say "${ENV_TEMPLATE_NAME} has no variables."
+    ask_env_path
+    return 0
+  fi
+  printf '\n%s lists %d variables for the app'"'"'s .env:\n' "$ENV_TEMPLATE_NAME" "$n"
+  printf '  1) fill them in now, one by one\n'
+  printf '  2) use a .env file already on this server\n'
+  printf '  3) skip; add it later with: back-update env\n'
+  ask "Choice" "1"
+  case $REPLY_VALUE in
+    1) fill_env 0 ;;
+    2)
+      ask ".env file" ""
+      [[ -n $REPLY_VALUE ]] || die "No file given."
+      copy_env_file "${REPLY_VALUE/#\~/$HOME}"
+      ;;
+    3) say "No .env for now; add it later with: back-update env" ;;
+    *) die "Invalid choice '${REPLY_VALUE}'." ;;
+  esac
+}
+
+# .env exists: offer the variables of the template it does not have yet.
+complete_env() {
+  local missing=() k
+  while IFS= read -r -d '' k && IFS= read -r -d '' _ && IFS= read -r -d '' _; do
+    missing+=("$k")
+  done < <(env_tool keys "$ENV_TEMPLATE" "$ENV_FILE")
+  ((${#missing[@]} > 0)) || return 0
+  printf '\n%s has variables the .env does not have yet:\n  %s\n' "$ENV_TEMPLATE_NAME" "${missing[*]}"
+  ask "Add them now? [Y/n]" ""
+  case ${REPLY_VALUE,,} in
+    "" | y | yes) fill_env 1 ;;
+    *) say "Kept the .env as it is (edit it with: back-update env)." ;;
+  esac
+}
+
+# A blobless shallow clone of the deployed branch -> PEEK, made once per run:
+# only the tree and the files read with peek_show are downloaded.
+peek_repo() {
+  local tmp
+  [[ -z $PEEK ]] || return 0
+  tmp=$(mktemp -d -p "$BD_HOME" peek.XXXXXX)
+  chown "${BUILD_USER}:${BUILD_USER}" "$tmp"
+  if ! as_builder "$SITE_KEY" timeout 300 git clone -q --depth 1 --filter=blob:none --no-checkout \
+    --single-branch --branch "$SITE_BRANCH" -- "$SITE_REPO" "${tmp}/repo" 2> /dev/null; then
+    # git older than 2.19, or a server without partial clone
+    rm -rf "${tmp}/repo"
+    if ! as_builder "$SITE_KEY" timeout 600 git clone -q --depth 1 --no-checkout \
+      --single-branch --branch "$SITE_BRANCH" -- "$SITE_REPO" "${tmp}/repo" 2> /dev/null; then
+      rm -rf "$tmp"
+      return 1
+    fi
+  fi
+  PEEK="${tmp}/repo"
+}
+
+peek_files() { # paths up to 4 levels deep, without node_modules / .venv
+  as_builder "" git -C "$PEEK" ls-tree -r --name-only HEAD 2> /dev/null \
+    | awk -F/ 'NF <= 4 && !/(^|\/)(node_modules|\.venv)\//'
+}
+
+peek_show() { # path
+  as_builder "$SITE_KEY" timeout 120 git -C "$PEEK" show "HEAD:${1}" 2> /dev/null
+}
+
+drop_peek() {
+  [[ -z $PEEK ]] || rm -rf "${PEEK%/repo}"
+  PEEK=""
+}
+
+# Django when the app folder (or the only folder with one) has manage.py;
+# PostgreSQL / Redis when its requirements need them.
+detect_stack() {
+  local dirs=() f d req="" i
+  NEED_PG=0
+  NEED_REDIS=0
+  if ! peek_repo; then
+    warn "Could not read the repository to detect the framework; back-update detects it on the first build."
+    return 0
+  fi
+  while IFS= read -r f; do
+    [[ ${f##*/} == manage.py ]] || continue
+    d=.
+    [[ $f == */* ]] && d=${f%/*}
+    dirs+=("$d")
+  done < <(peek_files)
+  if [[ -n $SITE_APP_DIR ]]; then
+    d=$SITE_APP_DIR
+    [[ " ${dirs[*]} " == *" ${d} "* ]] || dirs=()
+  elif ((${#dirs[@]} == 1)); then
+    d=${dirs[0]}
+  elif ((${#dirs[@]} > 1)); then
+    [[ -t 0 ]] || die "Several manage.py files (${dirs[*]}); pick the folder with --app-dir."
+    printf 'Which folder is the backend?\n'
+    for i in "${!dirs[@]}"; do
+      printf '  %d) %s\n' "$((i + 1))" "${dirs[i]}"
+    done
+    ask "Choice" "1"
+    i=$REPLY_VALUE
+    [[ $i =~ ^[0-9]+$ ]] && ((i >= 1 && i <= ${#dirs[@]})) || die "Invalid choice '${i}'."
+    d=${dirs[i - 1]}
+  fi
+  if ((${#dirs[@]} == 0)); then
+    SITE_KIND=node
+    return 0
+  fi
+  SITE_KIND=django
+  SITE_APP_DIR=$d
+  say "Django app in ${d}/"
+  [[ $d == . ]] && d="" || d+=/
+  for f in requirements.txt requirements/production.txt requirements/prod.txt requirements/base.txt; do
+    req=$(peek_show "${d}${f}" | tr '[:upper:]' '[:lower:]') && [[ -n $req ]] && break
+  done
+  [[ -n $req ]] || return 0
+  grep -qE '^[[:space:]]*psycopg' <<< "$req" && NEED_PG=1
+  grep -qE '^[[:space:]]*(celery|redis|django-redis)\b' <<< "$req" && NEED_REDIS=1
+  return 0
+}
+
+# Python with venv and headers (packages without wheels build here),
+# Redis and PostgreSQL on localhost when the app needs them.
+ensure_django_stack() {
+  local missing=() inc tmp
+  # Debian/Ubuntu split venv + pip into python3-venv; only a real try tells
+  tmp=$(mktemp -d)
+  python3 -m venv "${tmp}/v" > /dev/null 2>&1 || missing+=(python3-venv)
+  rm -rf "$tmp"
+  inc=$(python3 -c 'import sysconfig; print(sysconfig.get_paths()["include"])' 2> /dev/null) || inc=""
+  [[ -f ${inc}/Python.h ]] || missing+=(python3-dev)
+  command -v gcc > /dev/null 2>&1 || missing+=(build-essential)
+  if [[ $NEED_PG -eq 1 ]]; then
+    command -v pg_config > /dev/null 2>&1 || missing+=(libpq-dev)
+    command -v psql > /dev/null 2>&1 || missing+=(postgresql)
+  fi
+  if [[ $NEED_REDIS -eq 1 ]]; then
+    command -v redis-server > /dev/null 2>&1 || missing+=(redis-server)
+  fi
+  if ((${#missing[@]} > 0)); then
+    say "Installing for Django: ${missing[*]}"
+    apt_update || die "apt-get update failed."
+    apt_install "${missing[@]}" || die "Could not install: ${missing[*]}"
+  fi
+  if [[ $NEED_PG -eq 1 ]]; then
+    systemctl enable --now postgresql > /dev/null 2>&1 || die "Could not start PostgreSQL."
+    say "PostgreSQL: running on 127.0.0.1:5432"
+  fi
+  if [[ $NEED_REDIS -eq 1 ]]; then
+    systemctl enable --now redis-server > /dev/null 2>&1 || die "Could not start Redis."
+    say "Redis: running on 127.0.0.1:6379"
+  fi
+}
+
+# The app's own database and role (same name, random password kept in the
+# app's settings); re-runs keep both and re-apply the password.
+ensure_database() {
+  local exists
+  [[ -n $SITE_DB ]] || SITE_DB=$(printf '%s' "$NAME" | tr -c 'a-z0-9' '_' | cut -c1-48)
+  [[ $SITE_DB =~ ^[a-z_] ]] || SITE_DB="db_${SITE_DB}"
+  [[ -n $SITE_DB_PASSWORD ]] || SITE_DB_PASSWORD=$(openssl rand -hex 24)
+  exists=$( (cd / && runuser -u postgres -- psql -X -tAc "SELECT 1 FROM pg_roles WHERE rolname = '${SITE_DB}'")) \
+    || die "Could not reach PostgreSQL."
+  # the password goes in on stdin, not on a command line other users can see
+  if [[ $exists == 1 ]]; then
+    printf "ALTER ROLE %s WITH LOGIN PASSWORD '%s';\n" "$SITE_DB" "$SITE_DB_PASSWORD"
+  else
+    printf "CREATE ROLE %s WITH LOGIN PASSWORD '%s';\n" "$SITE_DB" "$SITE_DB_PASSWORD"
+  fi | (cd / && runuser -u postgres -- psql -X -q -v ON_ERROR_STOP=1) || die "Could not create the database user ${SITE_DB}."
+  exists=$( (cd / && runuser -u postgres -- psql -X -tAc "SELECT 1 FROM pg_database WHERE datname = '${SITE_DB}'"))
+  if [[ $exists != 1 ]]; then
+    (cd / && runuser -u postgres -- psql -X -q -v ON_ERROR_STOP=1 -c "CREATE DATABASE ${SITE_DB} OWNER ${SITE_DB}") \
+      || die "Could not create the database ${SITE_DB}."
+  fi
+  say "Database: ${SITE_DB} (user ${SITE_DB}) on 127.0.0.1:5432"
+}
+
+# Values back-deploy knows for the usual Django keys, offered instead of the
+# example value: its own database, its own Redis, the domain.
+env_suggest() { # key
+  [[ $SITE_KIND == django ]] || return 0
+  local db=$SITE_DB redis=$NEED_REDIS
+  case ${1^^} in
+    ALLOWED_HOSTS | DJANGO_ALLOWED_HOSTS) printf '%s' "$DOMAIN" ;;
+    DEBUG | DJANGO_DEBUG) printf 'False' ;;
+    DB_NAME | DATABASE_NAME | POSTGRES_DB | DB_USER | DATABASE_USER | POSTGRES_USER) [[ -z $db ]] || printf '%s' "$db" ;;
+    DB_PASSWORD | DATABASE_PASSWORD | POSTGRES_PASSWORD) [[ -z $db ]] || printf '%s' "$SITE_DB_PASSWORD" ;;
+    DB_HOST | DATABASE_HOST | POSTGRES_HOST) [[ -z $db ]] || printf '127.0.0.1' ;;
+    DB_PORT | DATABASE_PORT | POSTGRES_PORT) [[ -z $db ]] || printf '5432' ;;
+    DB_ENGINE) [[ -z $db ]] || printf 'django.db.backends.postgresql' ;;
+    DATABASE_URL) [[ -z $db ]] || printf 'postgres://%s:%s@127.0.0.1:5432/%s' "$db" "$SITE_DB_PASSWORD" "$db" ;;
+    REDIS_HOST) [[ $redis == 0 ]] || printf '127.0.0.1' ;;
+    REDIS_PORT) [[ $redis == 0 ]] || printf '6379' ;;
+    REDIS_URL | CELERY_BROKER_URL | CELERY_RESULT_BACKEND | BROKER_URL) [[ $redis == 0 ]] || printf 'redis://127.0.0.1:6379/0' ;;
+  esac
+  return 0
+}
+
+# The template from the deployed branch -> ENV_TEMPLATE (a local copy) and
+# ENV_TEMPLATE_NAME (its path in the repository).
+fetch_env_template() {
+  local f base dir i r app=${SITE_APP_DIR%/} dirs=()
+  local -A best=() rank=()
+  ENV_TEMPLATE=""
+  ENV_TEMPLATE_NAME=""
+  say "Looking for a .env.example in the repository ..."
+  if ! peek_repo; then
+    warn "Could not read the repository to look for a .env.example."
+    return 1
+  fi
+
+  # per folder, the first name of ENV_TEMPLATE_NAMES that it has
+  while IFS= read -r f; do
+    base=${f##*/}
+    dir=.
+    if [[ $f == */* ]]; then
+      dir=${f%/*}
+    fi
+    for i in "${!ENV_TEMPLATE_NAMES[@]}"; do
+      [[ $base == "${ENV_TEMPLATE_NAMES[i]}" ]] || continue
+      r=${rank[$dir]-99}
+      if ((i < r)); then
+        best[$dir]=$f
+        rank[$dir]=$i
+      fi
+    done
+  done < <(peek_files)
+  if ((${#best[@]} == 0)); then
+    say "No .env.example in the repository."
+    return 1
+  fi
+
+  mapfile -t dirs < <(printf '%s\n' "${!best[@]}" | sort)
+  if [[ -n $app && -n ${best[$app]-} ]]; then
+    f=${best[$app]}
+  elif ((${#dirs[@]} == 1)); then
+    f=${best[${dirs[0]}]}
+  else
+    printf 'Several .env templates in the repository; which one is the backend'"'"'s?\n'
+    for i in "${!dirs[@]}"; do
+      printf '  %d) %s\n' "$((i + 1))" "${best[${dirs[i]}]}"
+    done
+    ask "Choice" "1"
+    i=$REPLY_VALUE
+    [[ $i =~ ^[0-9]+$ ]] && ((i >= 1 && i <= ${#dirs[@]})) || die "Invalid choice '${i}'."
+    f=${best[${dirs[i - 1]}]}
+  fi
+
+  ENV_TEMPLATE=$(mktemp)
+  if ! peek_show "$f" > "$ENV_TEMPLATE"; then
+    rm -f "$ENV_TEMPLATE"
+    ENV_TEMPLATE=""
+    warn "Could not read ${f} from the repository."
+    return 1
+  fi
+  ENV_TEMPLATE_NAME=$f
+  say "Found ${f}"
+}
+
+# Keys that the app signs or encrypts with: Enter generates a random value
+# (an example value is never a production secret).
+is_secret_key() {
+  local re='(SECRET|SALT|ENCRYPTION_KEY|SIGNING_KEY|APP_KEY|^KEY$)'
+  [[ ${1^^} =~ $re ]]
+}
+
+# One question per variable of the template the .env does not have yet;
+# 0 = write a new .env laid out like the template, 1 = append to the .env.
+fill_env() { # append
+  local append=$1 keys=() defs=() helps=() k d h i n val shown gen answers
+  while IFS= read -r -d '' k && IFS= read -r -d '' d && IFS= read -r -d '' h; do
+    keys+=("$k")
+    defs+=("$d")
+    helps+=("$h")
+  done < <(env_tool keys "$ENV_TEMPLATE" "$([[ $append == 1 ]] && printf '%s' "$ENV_FILE" || printf /dev/null)")
+  n=${#keys[@]}
+  ((n > 0)) || return 0
+  printf '\nEnter keeps the value in [brackets], "-" leaves it empty.\n'
+  printf 'PORT is not asked: back-deploy sets it for each instance.\n'
+  answers=$(mktemp)
+  for i in "${!keys[@]}"; do
+    k=${keys[i]} d=${defs[i]} h=${helps[i]}
+    gen=0
+    val=$(env_suggest "$k")
+    [[ -z $val ]] || d=$val
+    shown=$d
+    if [[ -z $val ]] && is_secret_key "$k"; then
+      gen=1
+      shown="Enter = random"
+    fi
+    printf '\n'
+    if [[ -n $h ]]; then
+      printf '  # %s\n' "$h"
+    fi
+    while :; do
+      if [[ -n $shown ]]; then
+        printf '(%d/%d) %s [%s]: ' "$((i + 1))" "$n" "$k" "$shown"
+      else
+        printf '(%d/%d) %s: ' "$((i + 1))" "$n" "$k"
+      fi
+      read -r val || {
+        rm -f "$answers"
+        die "No input."
+      }
+      val=${val#"${val%%[![:space:]]*}"}
+      val=${val%"${val##*[![:space:]]}"}
+      if [[ -z $val ]]; then
+        if ((gen == 1)); then
+          val=$(openssl rand -hex 32)
+        else
+          val=$d
+        fi
+      elif [[ $val == - ]]; then
+        val=""
+      fi
+      # the .env quoting has no escapes: '...' or "..." around the value
+      if [[ $val == *"'"* && ($val == *'"'* || $val == *'\n'*) ]]; then
+        warn "A value with both ' and \" (or ' and \\n) cannot be stored in the .env; try again."
+        continue
+      fi
+      break
+    done
+    printf '%s\0%s\0' "$k" "$val" >> "$answers"
+  done
+  if ! env_tool write "$ENV_TEMPLATE" "$answers" "$ENV_FILE" "$append" "$ENV_TEMPLATE_NAME"; then
+    rm -f "$answers"
+    die "Could not write ${ENV_FILE}."
+  fi
+  rm -f "$answers"
+  if [[ $append == 1 ]]; then
+    say "Added ${n} variables to ${ENV_FILE} (edit it later with: back-update env)"
+  else
+    say "Wrote ${ENV_FILE} with ${n} variables (edit it later with: back-update env)"
+  fi
+}
+
+# dotenv files, same syntax as back-update's render_env:
+#   keys <template> <env>   -> key \0 example value \0 help \0 per variable of
+#                              the template that <env> lacks (PORT excluded)
+#   write <template> <answers> <env> <append> <name>
+#                           -> the .env with the answers (key \0 value \0 ...):
+#                              a new one laid out like the template, or the
+#                              answers appended to the existing one
+env_tool() {
+  python3 - "$@" << 'PY'
+import os, re, sys
+key_re = re.compile(r"^(?:export\s+)?([A-Za-z_][A-Za-z0-9_]*)\s*=\s*(.*)$", re.S)
+var_re = re.compile(r"^(?:export\s+)?[A-Za-z_][A-Za-z0-9_]*\s*=")
+
+def parse(path):
+    """[(key, example value, help, first line, line after)], lines"""
+    try:
+        text = open(path, encoding="utf-8", errors="replace").read()
+    except OSError:
+        return [], []
+    lines = text.replace("\r\n", "\n").split("\n")
+    out, help, i = [], [], 0
+    while i < len(lines):
+        start = i
+        s = lines[i].strip()
+        i += 1
+        if not s:
+            help = []
+            continue
+        if s.startswith("#"):
+            c = s.strip("#=-*_ \t")  # "# ===== Server =====" -> Server
+            # a commented-out variable is not a description
+            if re.search(r"[A-Za-z0-9]", c) and not var_re.match(c):
+                help.append(c)
+            continue
+        m = key_re.match(s)
+        if not m:
+            help = []
+            continue
+        key, val = m.group(1), m.group(2)
+        if val[:1] in ("'", '"'):
+            q = val[0]
+            body = val[1:]
+            while q not in body and i < len(lines):  # multi-line quoted value
+                body += "\n" + lines[i]
+                i += 1
+            val, _, note = body.partition(q)
+        else:  # KEY=value # inline comment
+            c = re.search(r"\s+#", val)
+            note = val[c.end():] if c else ""
+            val = (val[:c.start()] if c else val).strip()
+        note = note.strip().lstrip("#").strip()
+        out.append((key, val, " ".join(help + ([note] if note else [])), start, i))
+        help = []
+    return out, lines
+
+def quote(v):
+    if re.fullmatch(r"[A-Za-z0-9_./:@%+,=~^-]*", v):
+        return v
+    if "'" not in v:
+        return "'%s'" % v
+    return '"%s"' % v  # back-deploy.sh made sure there is no " or \n in it
+
+mode = sys.argv[1]
+if mode == "keys":
+    tpl, env = sys.argv[2], sys.argv[3]
+    have = {e[0] for e in parse(env)[0]}
+    seen = set()
+    for key, val, help, _, _ in parse(tpl)[0]:
+        if key in have or key in seen or key == "PORT":
+            continue
+        seen.add(key)
+        sys.stdout.write("%s\0%s\0%s\0" % (key, val, help))
+elif mode == "write":
+    tpl, answers, env, append, name = sys.argv[2:7]
+    raw = open(answers, encoding="utf-8").read().split("\0")
+    ans = dict(zip(raw[0::2], raw[1::2]))
+    if append == "1":
+        old = open(env, encoding="utf-8", errors="replace").read().rstrip("\n")
+        text = old + "\n\n# added by back-deploy from %s\n" % name
+        text += "".join("%s=%s\n" % (k, quote(v)) for k, v in ans.items())
+    else:
+        entries, lines = parse(tpl)
+        res = ["# written by back-deploy from %s -- edit with: back-update env" % name, ""]
+        i = 0
+        for key, _, _, start, end in entries:
+            res.extend(lines[i:start])
+            if key == "PORT":
+                res.append("# PORT is set by back-deploy for each instance")
+            elif key in ans:
+                res.append("%s=%s" % (key, quote(ans.pop(key))))
+            i = end  # a repeated key keeps its first answer only
+        res.extend(lines[i:])
+        text = "\n".join(res).rstrip("\n") + "\n"
+    fd = os.open(env + ".tmp", os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+    with os.fdopen(fd, "w", encoding="utf-8") as fh:
+        fh.write(text)
+    os.replace(env + ".tmp", env)
+PY
 }
 
 # back-update.sh next to this script, else from the repository of these scripts
@@ -1074,9 +1571,29 @@ print_summary() {
   if [[ -z $MOUNT_PATH ]] && relay_active; then
     printf ' HTTPS       : 127.0.0.1:%s, reached through the dns-setup.sh relay on :443\n' "$SITE_TLS_PORT"
   fi
-  printf '%s\n' '--------------------------------------------------------------'
-  printf ' The app gets PORT from systemd; behind nginx, Express needs\n'
-  printf ' app.set("trust proxy", 1) for the real client IP.\n'
+  if [[ $SITE_KIND == django ]]; then
+    printf ' Static/media: %s/static/ and %s/media/, served by nginx from the\n' "$MOUNT_PATH" "$MOUNT_PATH"
+    printf '               data folder (Data in: back-update status)\n'
+    if [[ -n $SITE_CELERY ]]; then
+      printf ' Celery      : worker%s (-A %s), restarted after every deploy\n' \
+        "$([[ $SITE_BEAT == 1 ]] && printf ' + beat')" "$SITE_CELERY"
+    fi
+    if [[ -n $SITE_DB ]]; then
+      printf ' Database    : PostgreSQL %s (user %s) on 127.0.0.1:5432; password:\n' "$SITE_DB" "$SITE_DB"
+      printf '               SITE_DB_PASSWORD in %s/%s.conf\n' "$SITES_DIR" "$NAME"
+    fi
+    if systemctl is-active --quiet redis-server 2> /dev/null; then
+      printf ' Redis       : 127.0.0.1:6379\n'
+    fi
+    printf '%s\n' '--------------------------------------------------------------'
+    printf ' Django runs with DJANGO_SETTINGS_MODULE=_back_deploy_settings: your\n'
+    printf ' %s plus this server'"'"'s STATIC/MEDIA paths and the\n' "${SITE_DJANGO_SETTINGS:-settings}"
+    printf ' https header of nginx. migrate + collectstatic run on every release.\n'
+  else
+    printf '%s\n' '--------------------------------------------------------------'
+    printf ' The app gets PORT from systemd; behind nginx, Express needs\n'
+    printf ' app.set("trust proxy", 1) for the real client IP.\n'
+  fi
   printf '%s\n' '--------------------------------------------------------------'
   printf ' After a push     : back-update\n'
   printf ' Edit the .env    : back-update env\n'
@@ -1186,6 +1703,11 @@ parse_args() {
         OPT_REGISTRY="${2%/}"
         shift 2
         ;;
+      --pip-index)
+        (($# >= 2)) || die "Option $1 needs a value."
+        OPT_PIP_INDEX="$2"
+        shift 2
+        ;;
       --port)
         (($# >= 2)) || die "Option $1 needs a value."
         OPT_PORT="$2"
@@ -1256,7 +1778,7 @@ install_all() {
   setup_logging
   trap '_on_err $LINENO' ERR
 
-  say "=== back-deploy ${SCRIPT_VERSION}: Node.js backend + systemd + nginx + Let's Encrypt ==="
+  say "=== back-deploy ${SCRIPT_VERSION}: Node.js / Django backend + systemd + nginx + Let's Encrypt ==="
   load_os
   ensure_packages
   say "app    : https://${DOMAIN}${MOUNT_PATH}/"
@@ -1281,8 +1803,14 @@ install_all() {
   resolve_repo
   ensure_repo_access
   resolve_branch
+  detect_stack
+  if [[ $SITE_KIND == django ]]; then
+    ensure_django_stack
+    [[ $NEED_PG -eq 0 ]] || ensure_database
+  fi
   ensure_swap
   prepare_app_dirs
+  drop_peek
   save_site
   install_update_tool
 
