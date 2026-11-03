@@ -65,9 +65,11 @@ LOCK_DIR="${BD_LOCK_DIR:-/run/lock}"
 
 DEFAULT_NODE=24
 DRAIN_SECONDS=10 # the old instance finishes its requests before it stops
-NODE_MIRRORS=(https://nodejs.org/dist https://npmmirror.com/mirrors/node)
-NPM_REGISTRY_FALLBACK="https://registry.npmmirror.com"
-PIP_INDEX_FALLBACK="https://mirrors.aliyun.com/pypi/simple/"
+# tried in order; the Iranian mirrors (runflare) last, they still work when
+# international traffic is cut
+NODE_MIRRORS=(https://nodejs.org/dist https://npmmirror.com/mirrors/node https://mirror-nodejs.runflare.com/dist)
+NPM_REGISTRY_FALLBACKS=(https://registry.npmmirror.com https://mirror-npm.runflare.com)
+PIP_INDEX_FALLBACKS=(https://mirrors.aliyun.com/pypi/simple/ https://mirror-pypi.runflare.com/simple/)
 
 # Everything back-deploy.sh stores per app in ${SITES_DIR}/<domain>.conf
 SITE_VARS=(SITE_NAME SITE_DOMAIN SITE_PATH SITE_STRIP SITE_WWW SITE_REPO SITE_BRANCH SITE_KEY SITE_APP_DIR
@@ -488,8 +490,15 @@ pick_registry() {
   if curl -fsS -o /dev/null --max-time 10 https://registry.npmjs.org/-/ping 2> /dev/null; then
     return 0
   fi
-  REGISTRY=$NPM_REGISTRY_FALLBACK
-  warn "registry.npmjs.org is unreachable; using ${REGISTRY} (pin one with back-deploy.sh --npm-registry)."
+  local r
+  for r in "${NPM_REGISTRY_FALLBACKS[@]}"; do
+    if curl -fsS -o /dev/null --max-time 10 "${r}/is-number" 2> /dev/null; then
+      REGISTRY=$r
+      warn "registry.npmjs.org is unreachable; using ${REGISTRY} (pin one with back-deploy.sh --npm-registry)."
+      return 0
+    fi
+  done
+  warn "registry.npmjs.org and its mirrors are unreachable; trying npmjs anyway."
 }
 
 pick_pip_index() {
@@ -500,8 +509,15 @@ pick_pip_index() {
   if curl -fsS -o /dev/null --max-time 10 https://pypi.org/simple/pip/ 2> /dev/null; then
     return 0
   fi
-  PIP_INDEX=$PIP_INDEX_FALLBACK
-  warn "pypi.org is unreachable; using ${PIP_INDEX} (pin one with back-deploy.sh --pip-index)."
+  local i
+  for i in "${PIP_INDEX_FALLBACKS[@]}"; do
+    if curl -fsS -o /dev/null --max-time 10 "${i}pip/" 2> /dev/null; then
+      PIP_INDEX=$i
+      warn "pypi.org is unreachable; using ${PIP_INDEX} (pin one with back-deploy.sh --pip-index)."
+      return 0
+    fi
+  done
+  warn "pypi.org and its mirrors are unreachable; trying pypi.org anyway."
 }
 
 # ---------------------------------------------------------------------------

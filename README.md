@@ -150,7 +150,9 @@ push.
   (folder, `.zip` or `.tar.gz`), for servers too small to build on
 - picks the Node.js major from `.nvmrc` / `.node-version` / `engines.node`
   (default 24) and installs it from the official tarballs, with
-  npmmirror as a fallback. npm, pnpm or yarn is chosen from the lockfile; a
+  npmmirror and then the Iranian Runflare mirror as fallbacks (the same goes
+  for the npm registry, and apt falls back to Runflare's Ubuntu/Debian mirror
+  for that run). npm, pnpm or yarn is chosen from the lockfile; a
   frontend in a sub-folder (monorepo) is found automatically
 - finds the build folder (`dist` for Vite, `build` for Create React App, or
   wherever the build wrote `index.html`) and asks you to confirm it once
@@ -255,7 +257,8 @@ deployed as Django, with the same questions and the same `back-update`:
 - a virtualenv with system Python 3 and `requirements.txt`, plus gunicorn when
   it is not listed; the start command is
   `python -m gunicorn <project>.wsgi:application --bind 127.0.0.1:$PORT`
-  (confirmed once). pypi.org blocked: a mirror is used (`--pip-index`)
+  (confirmed once). pypi.org blocked: a mirror is used (aliyun, then the
+  Iranian Runflare mirror; pin one with `--pip-index`)
 - every release runs `migrate` and `collectstatic` before it gets traffic
 - **PostgreSQL** (requirements with `psycopg`): installed locally, with a
   database and user for the app and a random password. **Redis** (requirements

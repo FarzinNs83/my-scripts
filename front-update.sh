@@ -52,8 +52,10 @@ FRONT_MOUNT_DIR="${FD_MOUNT_DIR:-/etc/nginx/front-deploy.d}"   # back-deploy.sh 
 LOCK_DIR="${FD_LOCK_DIR:-/run/lock}"
 
 DEFAULT_NODE=24
-NODE_MIRRORS=(https://nodejs.org/dist https://npmmirror.com/mirrors/node)
-NPM_REGISTRY_FALLBACK="https://registry.npmmirror.com"
+# tried in order; the Iranian mirrors (runflare) last, they still work when
+# international traffic is cut
+NODE_MIRRORS=(https://nodejs.org/dist https://npmmirror.com/mirrors/node https://mirror-nodejs.runflare.com/dist)
+NPM_REGISTRY_FALLBACKS=(https://registry.npmmirror.com https://mirror-npm.runflare.com)
 
 # Everything front-deploy.sh stores per site in ${SITES_DIR}/<domain>.conf
 SITE_VARS=(SITE_DOMAIN SITE_WWW SITE_SOURCE SITE_REPO SITE_BRANCH SITE_KEY
@@ -172,10 +174,62 @@ ipv6_enabled() {
   [[ -f /proc/net/if_inet6 ]]
 }
 
+APT_OPTS=(-o DPkg::Lock::Timeout=180)
+APT_MIRROR="http://mirror-linux.runflare.com" # Iranian; apt checks signatures, so http is fine
+
+# When the configured apt sources are unreachable (international traffic
+# cut), point the rest of this run at an Iranian mirror. Sources and lists
+# live in a temp dir, so /etc/apt and /var/lib/apt/lists stay untouched.
+apt_use_mirror() {
+  local id="" code="" dir kr opt="" s
+  [[ ${APT_OPTS[*]} != *SourceList* ]] || return 1
+  if [[ -r /etc/os-release ]]; then
+    id=$(. /etc/os-release && printf '%s' "${ID:-}") || id=""
+    code=$(. /etc/os-release && printf '%s' "${VERSION_CODENAME:-}") || code=""
+  fi
+  [[ -n $code ]] || return 1
+  kr="/usr/share/keyrings/${id}-archive-keyring.gpg"
+  if [[ -f $kr ]]; then
+    opt="[signed-by=${kr}] "
+  fi
+  dir=$(mktemp -d)
+  chmod 755 "$dir"
+  mkdir -p "${dir}/parts" "${dir}/lists/partial"
+  chown _apt "${dir}/lists/partial" 2> /dev/null || true
+  case $id in
+    ubuntu)
+      # shortcut: amd64 only (other arches live in ubuntu-ports); add ports if arm VPSes need it
+      if [[ $(dpkg --print-architecture) != amd64 ]]; then
+        rm -rf "$dir"
+        return 1
+      fi
+      for s in "$code" "${code}-updates" "${code}-security"; do
+        printf 'deb %s%s/ubuntu %s main restricted universe multiverse\n' "$opt" "$APT_MIRROR" "$s"
+      done > "${dir}/sources.list"
+      ;;
+    debian)
+      {
+        printf 'deb %s%s/debian %s main\n' "$opt" "$APT_MIRROR" "$code" "$opt" "$APT_MIRROR" "${code}-updates"
+        printf 'deb %s%s/debian-security %s-security main\n' "$opt" "$APT_MIRROR" "$code"
+      } > "${dir}/sources.list"
+      ;;
+    *)
+      rm -rf "$dir"
+      return 1
+      ;;
+  esac
+  APT_OPTS+=(-o "Dir::Etc::SourceList=${dir}/sources.list" -o "Dir::Etc::SourceParts=${dir}/parts"
+    -o "Dir::State::Lists=${dir}/lists")
+  warn "apt sources are unreachable; using ${APT_MIRROR} for this run."
+}
+
+# apt update only warns on network errors, so a failed install is what
+# switches to the mirror
 apt_install() {
   command -v apt-get > /dev/null 2>&1 || die "apt-get is required to install: $*"
-  apt-get -o DPkg::Lock::Timeout=180 update -qq || true
-  DEBIAN_FRONTEND=noninteractive apt-get -o DPkg::Lock::Timeout=180 install -y -qq "$@"
+  apt-get "${APT_OPTS[@]}" update -qq || true
+  DEBIAN_FRONTEND=noninteractive apt-get "${APT_OPTS[@]}" install -y -qq "$@" && return 0
+  apt_use_mirror && apt-get "${APT_OPTS[@]}" update -qq     && DEBIAN_FRONTEND=noninteractive apt-get "${APT_OPTS[@]}" install -y -qq "$@"
 }
 
 # ---------------------------------------------------------------------------
@@ -419,8 +473,15 @@ pick_registry() {
   if curl -fsS -o /dev/null --max-time 10 https://registry.npmjs.org/-/ping 2> /dev/null; then
     return 0
   fi
-  REGISTRY=$NPM_REGISTRY_FALLBACK
-  warn "registry.npmjs.org is unreachable; using ${REGISTRY} (pin one with front-deploy.sh --npm-registry)."
+  local r
+  for r in "${NPM_REGISTRY_FALLBACKS[@]}"; do
+    if curl -fsS -o /dev/null --max-time 10 "${r}/is-number" 2> /dev/null; then
+      REGISTRY=$r
+      warn "registry.npmjs.org is unreachable; using ${REGISTRY} (pin one with front-deploy.sh --npm-registry)."
+      return 0
+    fi
+  done
+  warn "registry.npmjs.org and its mirrors are unreachable; trying npmjs anyway."
 }
 
 # ---------------------------------------------------------------------------
