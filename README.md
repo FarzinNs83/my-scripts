@@ -314,6 +314,33 @@ binds them on all interfaces, so keep them closed in the firewall, or listen on
 `127.0.0.1`. Next to `dns-setup.sh`, the backends sit behind its relay on
 `127.0.0.1:10445`.
 
+## nfsu2-setup.sh
+
+Installs [nfsu2-web](https://github.com/th0mk/nfsu2-web) (Need for Speed:
+Underground 2 in the browser) on its own VPS. It asks only for the domain:
+
+- installs the packages, wasi-sdk 34, Python (the lifter), Node.js 24 and
+  Rust. Each comes from its own site, or from a mirror when that site is
+  blocked (runflare apt/npm/pypi, npmmirror, rsproxy.cn, GitHub proxies)
+- finds your game folder on the server (`SPEED2.EXE` v1.2 NA, checked by its
+  SHA-256). If the folder isn't there, it shows how to upload it to
+  `/srv/nfsu2/game` and waits. The game is never downloaded: bring your own copy
+- clones the project to `/opt/nfsu2-web` and builds it with its own scripts
+  (`web/gen.sh`, `web/build.sh`, the page and the Rust server). The first
+  build can take an hour, and small VPSes get a 4 GB swap file for it
+- runs the server with the project's systemd unit (`nfsu2-web`) behind nginx,
+  with websockets and a Let's Encrypt certificate that renews automatically
+
+```bash
+bash <(curl -Ls https://raw.githubusercontent.com/FarzinNs83/my-scripts/main/nfsu2-setup.sh)
+```
+
+Run it again to update: it pulls the project, rebuilds what changed and
+restarts the server. Log: `journalctl -u nfsu2-web -f`.
+
+Needs 15 GB of free disk. Ports: TCP 80/443. Anyone who can open the site
+can play and download the game files from it.
+
 ## All three on one VPS
 
 `dns-setup.sh`, `n8n-setup.sh` and `3xui-setup.sh` can run on the same
