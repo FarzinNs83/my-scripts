@@ -168,11 +168,20 @@ public_ipv4() {
 
 check_dns() {
   local mine resolved
-  mine=$(public_ipv4) || { warn "Could not detect this server's public IPv4; skipping the DNS check."; return 0; }
   resolved=$(getent ahostsv4 "$DOMAIN" 2> /dev/null | awk 'NR == 1 {print $1}') || true
-  [[ -n $resolved ]] || die "No A record for ${DOMAIN}. Create '${DOMAIN} A ${mine}' (Cloudflare: grey cloud) and re-run."
-  [[ $resolved == "$mine" ]] || die "${DOMAIN} points to ${resolved}, this server is ${mine}. Fix the A record (Cloudflare: grey cloud) and re-run."
-  say "DNS OK: ${DOMAIN} -> ${mine}"
+  [[ -n $resolved ]] || die "No A record for ${DOMAIN}. Point it to this server (Cloudflare: grey cloud) and re-run."
+  # an address of this server's own interfaces: the outgoing IP can differ (provider NAT, a proxy)
+  if ip -4 -o addr show | awk '{split($4, a, "/"); print a[1]}' | grep -qxF "$resolved"; then
+    say "DNS OK: ${DOMAIN} -> ${resolved}"
+    return 0
+  fi
+  mine=$(public_ipv4) || mine=""
+  if [[ $resolved == "$mine" ]]; then
+    say "DNS OK: ${DOMAIN} -> ${resolved}"
+    return 0
+  fi
+  # behind 1:1 NAT neither matches; the certificate (next step) is the real check
+  warn "${DOMAIN} points to ${resolved}, not an address of this server (outgoing IP: ${mine:-unknown}). Continuing; the certificate step fails if it is wrong."
 }
 
 check_system() {
@@ -217,18 +226,17 @@ find_exe() {
 }
 
 ensure_game() {
-  local exe src ip
+  local exe src
   while :; do
     exe=$(find_exe || true) # head closing early makes find exit with SIGPIPE
     [[ -n $exe ]] && break
-    ip=$(public_ipv4 || printf '<server-ip>')
     cat << EOF
 
 [!] The game is not on this server yet. Upload your own NFS Underground 2
     folder (the one with SPEED2.EXE, patched to v1.2 NA) to ${GAME_DIR}
     From Windows (PowerShell), inside the game folder:
-      ssh root@${ip} mkdir -p ${GAME_DIR}
-      scp -r * root@${ip}:${GAME_DIR}/
+      ssh root@${DOMAIN} mkdir -p ${GAME_DIR}
+      scp -r * root@${DOMAIN}:${GAME_DIR}/
     or with WinSCP / FileZilla (SFTP) into ${GAME_DIR}
 
 EOF
@@ -533,6 +541,8 @@ main() {
   check_system
   ensure_packages
   check_dns
+  # the certificate before the long build: a wrong A record fails in a minute, not after an hour
+  setup_https
   ensure_swap
   ensure_game
   ensure_project
@@ -542,7 +552,6 @@ main() {
   ensure_rust
   build_all
   install_service
-  setup_https
   curl -fsS -o /dev/null --max-time 15 --resolve "${DOMAIN}:443:127.0.0.1" "https://${DOMAIN}/game.json" \
     || warn "https://${DOMAIN}/ did not answer from this server; check nginx (journalctl -u nginx)."
   cat << EOF
