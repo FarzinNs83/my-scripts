@@ -9,8 +9,8 @@
 #       steamcmd caches the login, the script never sees the password
 #    3. Synergy (app 17520, free) and Half-Life 2 (app 220, includes
 #       Episode One and Two) -- the account must own Half-Life 2
-#    4. server.cfg, a systemd unit (synergy), the game port in the firewall,
-#       and synergyctl: synergyctl start | stop | restart | status | log
+#    4. server.cfg, a systemd unit (synergy), the game port (UDP) in the firewall,
+#       and synergyctl: synergyctl start/stop/save/load/export/import/...
 #
 #  Other game servers on the same VPS: the port must be free (the first free
 #  one from 27015 is offered), SourceTV is off, and apt does not restart
@@ -71,7 +71,7 @@ MAPS=(
   "ep2_outland_12a|Episode Two - T-Minus One"
 )
 
-SV_NAME="" SV_PASS="" SV_MAX="" SV_MAP="" PORT="" STEAM_LOGIN=""
+SV_NAME="" SV_PASS="" SV_MAX="" SV_MAP="" PORT="" STEAM_LOGIN="" RCON_PASS=""
 
 say() { printf '[+] %s\n' "$*"; }
 warn() { printf '[!] %s\n' "$*" >&2; }
@@ -161,7 +161,7 @@ ask_all() {
     while [[ -n $(port_users "$PORT") ]]; do PORT=$((PORT + 1)); done
   fi
   while :; do
-    v=$(ask "Game port (UDP+TCP; each game server on this VPS needs its own)" "$PORT")
+    v=$(ask "Game port (each game server on this VPS needs its own)" "$PORT")
     if ! [[ $v =~ ^[0-9]+$ ]] || ((v < 1024 || v > 65535)); then
       warn "Enter a port from 1024 to 65535."
     elif [[ -n $(port_users "$v") ]]; then
@@ -187,15 +187,19 @@ ask_all() {
     printf 'SV_MAP=%q\n' "$SV_MAP"
     printf 'PORT=%q\n' "$PORT"
     printf 'STEAM_LOGIN=%q\n' "$STEAM_LOGIN"
+    # for synergyctl only: rcon is reached from this server, its TCP port is not opened
+    printf 'RCON_PASS=%q\n' "${RCON_PASS:-$(head -c 24 /dev/urandom | base64 | tr -dc 'A-Za-z0-9')}"
   } > "$CONF_FILE"
   chmod 600 "$CONF_FILE"
+  # shellcheck disable=SC1090
+  . "$CONF_FILE"
 }
 
 # ---------------------------------------------------------------------------
 # Packages and the steam user
 # ---------------------------------------------------------------------------
 ensure_packages() {
-  local pkgs=(steamcmd:i386 lib32gcc-s1 lib32stdc++6 libc6-i386 libtinfo6:i386 libncurses6:i386 libatomic1:i386)
+  local pkgs=(steamcmd:i386 lib32gcc-s1 lib32stdc++6 libc6-i386 libtinfo6:i386 libncurses6:i386 libatomic1:i386 python3)
   local missing=() p
   for p in "${pkgs[@]}"; do
     dpkg -s "$p" > /dev/null 2>&1 || missing+=("$p")
@@ -272,10 +276,12 @@ write_config() {
 // Written by synergy-setup.sh; run it again to change these
 hostname "${SV_NAME}"
 sv_password "${SV_PASS}"
+rcon_password "${RCON_PASS}"
 sv_lan 0
 sv_region 255
 EOF
   chown "$STEAM_USER:$STEAM_USER" "${SYN_DIR}/synergy/cfg/server.cfg"
+  chmod 600 "${SYN_DIR}/synergy/cfg/server.cfg"
 
   cat > "$SERVICE" << EOF
 [Unit]
@@ -298,27 +304,127 @@ EOF
   systemctl enable -q synergy
 
   cat > "$CTL" << 'EOF'
-#!/bin/sh
+#!/usr/bin/env bash
 # Written by synergy-setup.sh
-case "$1" in
+set -euo pipefail
+SAVE_DIR=/home/steam/synergy/synergy/save
+
+die() { printf '%s\n' "$*" >&2; exit 1; }
+[[ ${EUID} -eq 0 ]] || die "Run as root."
+# shellcheck disable=SC1091
+. /etc/synergy-setup.conf
+
+# rcon <command>: runs a server console command and prints the answer
+rcon() {
+  local host
+  # srcds binds rcon (TCP) to the address the hostname resolves to, often 127.0.1.1
+  host=$(ss -Hltn "sport = :${PORT}" | awk 'NR == 1 {sub(/:[0-9]+$/, "", $4); print $4}')
+  [[ -n $host ]] || die "The server is not running (synergyctl start)."
+  [[ $host == 0.0.0.0 || $host == '*' ]] && host=127.0.0.1
+  python3 -I - "$host" "$PORT" "$RCON_PASS" "$*" << 'PY'
+import socket, struct, sys
+host, port, pw, cmd = sys.argv[1], int(sys.argv[2]), sys.argv[3], sys.argv[4]
+s = socket.create_connection((host, port), 10)
+def send(i, t, body):
+    b = body.encode() + b"\0\0"
+    s.sendall(struct.pack("<iii", len(b) + 8, i, t) + b)
+def read(n):
+    buf = b""
+    while len(buf) < n:
+        c = s.recv(n - len(buf))
+        if not c:
+            sys.exit("rcon: the server closed the connection")
+        buf += c
+    return buf
+def recv():
+    d = read(struct.unpack("<i", read(4))[0])
+    i, t = struct.unpack("<ii", d[:8])
+    return i, t, d[8:-2].decode(errors="replace")
+send(1, 3, pw)
+while True:
+    i, t, _ = recv()
+    if t == 2:
+        break
+if i == -1:
+    sys.exit("rcon: wrong password")
+send(2, 2, cmd)
+send(3, 0, "")  # an empty packet comes back after the whole answer
+while True:
+    i, t, body = recv()
+    if i == 3:
+        break
+    print(body, end="")
+PY
+}
+
+save_name() {
+  [[ ${1:-} =~ ^[A-Za-z0-9_-]+$ ]] || die "A save name has only letters, digits, _ and -."
+}
+
+case "${1:-}" in
   start) systemctl enable -q --now synergy && echo "Synergy started (also starts at boot)." ;;
   stop) systemctl disable -q --now synergy && echo "Synergy stopped (stays off after a reboot)." ;;
   restart) systemctl restart synergy && echo "Synergy restarted." ;;
   status) systemctl status synergy --no-pager -n 0 ;;
   log) journalctl -u synergy -f ;;
-  *) echo "Usage: synergyctl start | stop | restart | status | log"; exit 1 ;;
+  cmd)
+    shift
+    (($#)) || die "Usage: synergyctl cmd <console command>"
+    rcon "$*"
+    ;;
+  save)
+    save_name "${2:-coop}"
+    rcon "save ${2:-coop}"
+    ;;
+  load)
+    save_name "${2:-coop}"
+    rcon "load ${2:-coop}"
+    ;;
+  saves) ls -lt "$SAVE_DIR" 2> /dev/null || echo "No saves yet." ;;
+  export)
+    out=${2:-/root/synergy-saves-$(date +%Y%m%d-%H%M).tar.gz}
+    if systemctl is-active -q synergy; then
+      rcon "save export" || echo "Could not save the running game; exporting the saves on disk."
+      sleep 3
+    fi
+    [[ -d $SAVE_DIR ]] || die "No saves yet."
+    tar -czf "$out" -C "$(dirname "$SAVE_DIR")" save
+    echo "Exported to ${out}"
+    echo "On the new server: synergyctl import <file>, then synergyctl load export"
+    ;;
+  import)
+    [[ -f ${2:-} ]] || die "Usage: synergyctl import <file from synergyctl export>"
+    # only a save/ folder is taken from the archive
+    if tar -tzf "$2" | grep -qv '^save/'; then die "${2} is not a synergyctl export."; fi
+    tar -xzf "$2" -C "$(dirname "$SAVE_DIR")" --no-same-owner save
+    chown -R steam:steam "$SAVE_DIR"
+    ls -lt "$SAVE_DIR"
+    echo "Imported. Load one with: synergyctl load <name>  (export = the last export)"
+    ;;
+  *)
+    cat >&2 << 'USAGE'
+Usage: synergyctl <command>
+  start | stop | restart | status | log
+  save [name]       save the running game (default name: coop)
+  load [name]       load a save; players who were in it get their state back
+  saves             list the saves
+  export [file]     save the game and pack all saves into a .tar.gz
+  import <file>     unpack an export (from this or another server)
+  cmd <command>     any server console command (changelevel d1_canals_01, status, ...)
+USAGE
+    exit 1
+    ;;
 esac
 EOF
   chmod 755 "$CTL"
 }
 
 open_ports() {
-  local p
   if command -v ufw > /dev/null && ufw status 2> /dev/null | grep -q 'Status: active'; then
-    for p in "${PORT}/tcp" "${PORT}/udp"; do ufw allow "$p" > /dev/null; done
+    ufw allow "${PORT}/udp" > /dev/null
   fi
   if command -v firewall-cmd > /dev/null && [[ $(firewall-cmd --state 2> /dev/null) == running ]]; then
-    for p in "${PORT}/tcp" "${PORT}/udp"; do firewall-cmd -q --permanent --add-port="$p" || true; done
+    firewall-cmd -q --permanent --add-port="${PORT}/udp" || true
     firewall-cmd -q --reload || true
   fi
 }
@@ -375,11 +481,11 @@ main() {
     Name       : ${SV_NAME}
     Players    : ${SV_MAX}
     Start map  : ${SV_MAP}
-    Port       : ${PORT} (UDP+TCP)
+    Port       : ${PORT} (UDP; players need only this)
     Start/stop : synergyctl start | stop | restart | status | log
     Change map : run this script again; the game also moves on by itself
     Update     : run this script again
-    Open UDP/TCP ${PORT} in your provider's firewall too, if it has one.
+    Open UDP ${PORT} in your provider's firewall too, if it has one.
 EOF
 }
 

@@ -370,13 +370,24 @@ synergyctl stop      # stop, and stay off after a reboot
 synergyctl restart
 synergyctl status
 synergyctl log       # follow the server log
+synergyctl save [name]      # save the running game (default name: coop)
+synergyctl load [name]      # load it; players who were in it get their state back
+synergyctl saves            # list the saves
+synergyctl export [file]    # save, then pack all saves into a .tar.gz
+synergyctl import <file>    # unpack an export, e.g. from the old server
+synergyctl cmd changelevel d1_canals_01   # any server console command
 ```
+
+Moving to another VPS: `synergyctl export` on the old one, copy the file
+(`scp`), run this script on the new one, then `synergyctl import <file>` and
+`synergyctl load export`. The commands go through rcon on this server only;
+its password is random and the TCP port is not opened in the firewall.
 
 Other game servers can run on the same VPS: the script offers the first free
 port from 27015 and refuses one that another program holds, SourceTV (27020)
 is off, and apt does not restart running services.
 
-Needs 15 GB of free disk. Port: UDP/TCP 27015 by default.
+Needs 15 GB of free disk. Port: UDP 27015 by default.
 
 ## All three on one VPS
 
