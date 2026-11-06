@@ -341,6 +341,43 @@ restarts the server. Log: `journalctl -u nfsu2-web -f`.
 Needs 15 GB of free disk. Ports: TCP 80/443. Anyone who can open the site
 can play and download the game files from it.
 
+## synergy-setup.sh
+
+Synergy (Half-Life 2 co-op) dedicated server on an x86_64 VPS. It asks for
+the server name, password, max players, the start map (a numbered list of
+every chapter of HL2, Episode One and Episode Two, or any map name), the game
+port and your Steam username:
+
+- installs steamcmd and the 32-bit libraries, and creates a `steam` user
+- Steam login: you type your password and Steam Guard code into steamcmd
+  yourself; the login is cached for later runs
+- downloads Synergy (app 17520, free) and Half-Life 2 (app 220, includes both
+  episodes). The account must own Half-Life 2
+- writes `server.cfg` and runs the server as a systemd unit (`synergy`)
+
+```bash
+bash <(curl -Ls https://raw.githubusercontent.com/FarzinNs83/my-scripts/main/synergy-setup.sh)
+```
+
+The downloads are ~12 GB, so run it inside `screen -S synergy` in case SSH
+drops. If a download stalls, press Ctrl-C and run it again: it resumes,
+usually from a faster CDN server. Run it again later to change the settings
+or update the game.
+
+```bash
+synergyctl start     # start, and start at boot
+synergyctl stop      # stop, and stay off after a reboot
+synergyctl restart
+synergyctl status
+synergyctl log       # follow the server log
+```
+
+Other game servers can run on the same VPS: the script offers the first free
+port from 27015 and refuses one that another program holds, SourceTV (27020)
+is off, and apt does not restart running services.
+
+Needs 15 GB of free disk. Port: UDP/TCP 27015 by default.
+
 ## All three on one VPS
 
 `dns-setup.sh`, `n8n-setup.sh` and `3xui-setup.sh` can run on the same
