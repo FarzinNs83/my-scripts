@@ -12,10 +12,22 @@ with a QR code.
 bash <(curl -Ls https://raw.githubusercontent.com/FarzinNs83/my-scripts/main/3xui-setup.sh)
 ```
 
+Iran / GitHub blocked (ghfast.top mirror):
+
+```bash
+bash <(curl -Ls https://ghfast.top/https://raw.githubusercontent.com/FarzinNs83/my-scripts/main/3xui-setup.sh)
+```
+
 Show all options:
 
 ```bash
 bash <(curl -Ls https://raw.githubusercontent.com/FarzinNs83/my-scripts/main/3xui-setup.sh) --help
+```
+
+Iran / GitHub blocked (ghfast.top mirror):
+
+```bash
+bash <(curl -Ls https://ghfast.top/https://raw.githubusercontent.com/FarzinNs83/my-scripts/main/3xui-setup.sh) --help
 ```
 
 ## dns-setup.sh
@@ -45,6 +57,12 @@ payments. Right after the domain the installer asks whether to add this list
 bash <(curl -Ls https://raw.githubusercontent.com/FarzinNs83/my-scripts/main/dns-setup.sh)
 ```
 
+Iran / GitHub blocked (ghfast.top mirror):
+
+```bash
+bash <(curl -Ls https://ghfast.top/https://raw.githubusercontent.com/FarzinNs83/my-scripts/main/dns-setup.sh)
+```
+
 After the install:
 
 ```bash
@@ -69,17 +87,31 @@ without `dnsctl`:
 bash <(curl -Ls https://raw.githubusercontent.com/FarzinNs83/my-scripts/main/dns-setup.sh) --uninstall
 ```
 
+Iran / GitHub blocked (ghfast.top mirror):
+
+```bash
+bash <(curl -Ls https://ghfast.top/https://raw.githubusercontent.com/FarzinNs83/my-scripts/main/dns-setup.sh) --uninstall
+```
+
 Community lists you can feed to `dnsctl import`:
 
 ```bash
 dnsctl import https://raw.githubusercontent.com/filteryab/ir-sanctioned-domain/main/data/ir-sanctioned-domain
+dnsctl import https://ghfast.top/https://raw.githubusercontent.com/filteryab/ir-sanctioned-domain/main/data/ir-sanctioned-domain
 dnsctl import https://raw.githubusercontent.com/MrDevAnony/DynX-AntiBan-Domains/main/DynX-AntiBan-list.lst --force
+dnsctl import https://ghfast.top/https://raw.githubusercontent.com/MrDevAnony/DynX-AntiBan-Domains/main/DynX-AntiBan-list.lst --force
 ```
 
 Show all options:
 
 ```bash
 bash <(curl -Ls https://raw.githubusercontent.com/FarzinNs83/my-scripts/main/dns-setup.sh) --help
+```
+
+Iran / GitHub blocked (ghfast.top mirror):
+
+```bash
+bash <(curl -Ls https://ghfast.top/https://raw.githubusercontent.com/FarzinNs83/my-scripts/main/dns-setup.sh) --help
 ```
 
 Ports: TCP 53/80/443/853 and UDP 53/853. The script keeps its own paths
@@ -106,11 +138,24 @@ Installs [n8n](https://n8n.io) behind nginx with a Let's Encrypt certificate:
 bash <(curl -Ls https://raw.githubusercontent.com/FarzinNs83/my-scripts/main/n8n-setup.sh)
 ```
 
-Docker Hub and docker.n8n.io block Iranian IPs. On a server in Iran, pull
-through a mirror:
+Iran / GitHub blocked (ghfast.top mirror):
+
+```bash
+bash <(curl -Ls https://ghfast.top/https://raw.githubusercontent.com/FarzinNs83/my-scripts/main/n8n-setup.sh)
+```
+
+Docker Hub and docker.n8n.io block Iranian IPs. When a pull fails the script
+retries through Iranian mirrors (arvancloud, iranserver, docker.ir) on its own,
+and apt / the Docker repo fall back to mirrors too. To pick the mirror yourself:
 
 ```bash
 bash <(curl -Ls https://raw.githubusercontent.com/FarzinNs83/my-scripts/main/n8n-setup.sh) --registry-mirror https://docker.arvancloud.ir
+```
+
+Iran / GitHub blocked (ghfast.top mirror):
+
+```bash
+bash <(curl -Ls https://ghfast.top/https://raw.githubusercontent.com/FarzinNs83/my-scripts/main/n8n-setup.sh) --registry-mirror https://docker.arvancloud.ir
 ```
 
 **Local install** (WSL or your own Linux, no domain): press Enter at the
@@ -122,6 +167,12 @@ a WSL restart; run `n8nctl restart`.
 
 ```bash
 bash <(curl -Ls https://raw.githubusercontent.com/FarzinNs83/my-scripts/main/n8n-setup.sh) --local
+```
+
+Iran / GitHub blocked (ghfast.top mirror):
+
+```bash
+bash <(curl -Ls https://ghfast.top/https://raw.githubusercontent.com/FarzinNs83/my-scripts/main/n8n-setup.sh) --local
 ```
 
 After the install:
@@ -140,6 +191,12 @@ Show all options:
 
 ```bash
 bash <(curl -Ls https://raw.githubusercontent.com/FarzinNs83/my-scripts/main/n8n-setup.sh) --help
+```
+
+Iran / GitHub blocked (ghfast.top mirror):
+
+```bash
+bash <(curl -Ls https://ghfast.top/https://raw.githubusercontent.com/FarzinNs83/my-scripts/main/n8n-setup.sh) --help
 ```
 
 Ports: TCP 80/443. Back up `N8N_ENCRYPTION_KEY` from `/opt/n8n/.env`: saved
@@ -179,6 +236,12 @@ push.
 bash <(curl -Ls https://raw.githubusercontent.com/FarzinNs83/my-scripts/main/front-deploy.sh)
 ```
 
+Iran / GitHub blocked (ghfast.top mirror):
+
+```bash
+bash <(curl -Ls https://ghfast.top/https://raw.githubusercontent.com/FarzinNs83/my-scripts/main/front-deploy.sh)
+```
+
 After the install:
 
 ```bash
@@ -210,6 +273,12 @@ Show all options:
 
 ```bash
 bash <(curl -Ls https://raw.githubusercontent.com/FarzinNs83/my-scripts/main/front-deploy.sh) --help
+```
+
+Iran / GitHub blocked (ghfast.top mirror):
+
+```bash
+bash <(curl -Ls https://ghfast.top/https://raw.githubusercontent.com/FarzinNs83/my-scripts/main/front-deploy.sh) --help
 ```
 
 Ports: TCP 80/443. Next to `dns-setup.sh`, the sites sit behind its relay on
@@ -255,6 +324,12 @@ updates it after each push without downtime.
 
 ```bash
 bash <(curl -Ls https://raw.githubusercontent.com/FarzinNs83/my-scripts/main/back-deploy.sh)
+```
+
+Iran / GitHub blocked (ghfast.top mirror):
+
+```bash
+bash <(curl -Ls https://ghfast.top/https://raw.githubusercontent.com/FarzinNs83/my-scripts/main/back-deploy.sh)
 ```
 
 The app must listen on `process.env.PORT`; behind nginx, Express needs
@@ -320,6 +395,12 @@ Show all options:
 bash <(curl -Ls https://raw.githubusercontent.com/FarzinNs83/my-scripts/main/back-deploy.sh) --help
 ```
 
+Iran / GitHub blocked (ghfast.top mirror):
+
+```bash
+bash <(curl -Ls https://ghfast.top/https://raw.githubusercontent.com/FarzinNs83/my-scripts/main/back-deploy.sh) --help
+```
+
 Ports: TCP 80/443, plus two app ports per backend (from 3100). `app.listen(PORT)`
 binds them on all interfaces, so keep them closed in the firewall, or listen on
 `127.0.0.1`. Next to `dns-setup.sh`, the backends sit behind its relay on
@@ -346,6 +427,12 @@ Underground 2 in the browser) on its own VPS. It asks only for the domain:
 bash <(curl -Ls https://raw.githubusercontent.com/FarzinNs83/my-scripts/main/nfsu2-setup.sh)
 ```
 
+Iran / GitHub blocked (ghfast.top mirror):
+
+```bash
+bash <(curl -Ls https://ghfast.top/https://raw.githubusercontent.com/FarzinNs83/my-scripts/main/nfsu2-setup.sh)
+```
+
 Run it again to update: it pulls the project, rebuilds what changed and
 restarts the server. Log: `journalctl -u nfsu2-web -f`.
 
@@ -368,6 +455,12 @@ port and your Steam username:
 
 ```bash
 bash <(curl -Ls https://raw.githubusercontent.com/FarzinNs83/my-scripts/main/synergy-setup.sh)
+```
+
+Iran / GitHub blocked (ghfast.top mirror):
+
+```bash
+bash <(curl -Ls https://ghfast.top/https://raw.githubusercontent.com/FarzinNs83/my-scripts/main/synergy-setup.sh)
 ```
 
 The downloads are ~12 GB, so run it inside `screen -S synergy` in case SSH
@@ -418,6 +511,12 @@ stays low. It asks for the port and the players' password:
 
 ```bash
 bash <(curl -Ls https://raw.githubusercontent.com/FarzinNs83/my-scripts/main/lan-setup.sh)
+```
+
+Iran / GitHub blocked (ghfast.top mirror):
+
+```bash
+bash <(curl -Ls https://ghfast.top/https://raw.githubusercontent.com/FarzinNs83/my-scripts/main/lan-setup.sh)
 ```
 
 At the end it prints what each player enters in the client, and one

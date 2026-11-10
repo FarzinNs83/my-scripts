@@ -294,13 +294,66 @@ svc_active() {
   systemctl is-active --quiet "$1" 2> /dev/null
 }
 
-apt_install() {
-  command -v apt-get > /dev/null 2>&1 || die "apt-get is required to install: $*"
-  apt-get -o DPkg::Lock::Timeout=180 install -y -qq "$@"
+APT_OPTS=(-o DPkg::Lock::Timeout=180)
+APT_MIRROR="http://mirror-linux.runflare.com" # Iranian; apt checks signatures, so http is fine
+
+# When the configured apt sources are unreachable (international traffic
+# cut), point the rest of this run at an Iranian mirror. Sources and lists
+# live in a temp dir, so /etc/apt and /var/lib/apt/lists stay untouched.
+apt_use_mirror() {
+  local id="" code="" dir kr opt="" s
+  [[ ${APT_OPTS[*]} != *SourceList* ]] || return 1
+  if [[ -r /etc/os-release ]]; then
+    id=$(. /etc/os-release && printf '%s' "${ID:-}") || id=""
+    code=$(. /etc/os-release && printf '%s' "${VERSION_CODENAME:-}") || code=""
+  fi
+  [[ -n $code ]] || return 1
+  kr="/usr/share/keyrings/${id}-archive-keyring.gpg"
+  if [[ -f $kr ]]; then
+    opt="[signed-by=${kr}] "
+  fi
+  dir=$(mktemp -d)
+  chmod 755 "$dir"
+  mkdir -p "${dir}/parts" "${dir}/lists/partial"
+  chown _apt "${dir}/lists/partial" 2> /dev/null || true
+  case $id in
+    ubuntu)
+      # shortcut: amd64 only (other arches live in ubuntu-ports); add ports if arm VPSes need it
+      if [[ $(dpkg --print-architecture) != amd64 ]]; then
+        rm -rf "$dir"
+        return 1
+      fi
+      for s in "$code" "${code}-updates" "${code}-security"; do
+        printf 'deb %s%s/ubuntu %s main restricted universe multiverse\n' "$opt" "$APT_MIRROR" "$s"
+      done > "${dir}/sources.list"
+      ;;
+    debian)
+      {
+        printf 'deb %s%s/debian %s main\n' "$opt" "$APT_MIRROR" "$code" "$opt" "$APT_MIRROR" "${code}-updates"
+        printf 'deb %s%s/debian-security %s-security main\n' "$opt" "$APT_MIRROR" "$code"
+      } > "${dir}/sources.list"
+      ;;
+    *)
+      rm -rf "$dir"
+      return 1
+      ;;
+  esac
+  APT_OPTS+=(-o "Dir::Etc::SourceList=${dir}/sources.list" -o "Dir::Etc::SourceParts=${dir}/parts"
+    -o "Dir::State::Lists=${dir}/lists")
+  warn "apt sources are unreachable; using ${APT_MIRROR} for this run."
 }
 
 apt_update() {
-  apt-get -o DPkg::Lock::Timeout=180 update -qq
+  apt-get "${APT_OPTS[@]}" update -qq && return 0
+  apt_use_mirror && apt-get "${APT_OPTS[@]}" update -qq
+}
+
+# apt update only warns on network errors, so a failed install also
+# retries through the mirror
+apt_install() {
+  command -v apt-get > /dev/null 2>&1 || die "apt-get is required to install: $*"
+  apt-get "${APT_OPTS[@]}" install -y -qq "$@" && return 0
+  apt_use_mirror && apt-get "${APT_OPTS[@]}" update -qq && apt-get "${APT_OPTS[@]}" install -y -qq "$@"
 }
 
 apt_has() {
@@ -489,20 +542,34 @@ container_exists() {
   docker inspect "$1" > /dev/null 2>&1
 }
 
+# download.docker.com first, then mirrors of it (same packages, same signing key)
+DOCKER_REPOS=(https://download.docker.com https://mirrors.aliyun.com/docker-ce https://mirrors.tuna.tsinghua.edu.cn/docker-ce)
+REGISTRY_FALLBACKS=(https://docker.arvancloud.ir https://docker.iranserver.com https://registry.docker.ir)
+
 install_docker_official() {
+  local repo
+  for repo in "${DOCKER_REPOS[@]}"; do
+    install_docker_repo "$repo" && return 0
+    warn "Installing Docker from ${repo} failed."
+  done
+  return 1
+}
+
+install_docker_repo() {
+  local base=$1
   [[ $OS_ID == ubuntu || $OS_ID == debian ]] || return 1
   [[ -n $OS_CODENAME ]] || return 1
   local arch key=/etc/apt/keyrings/docker.asc list=/etc/apt/sources.list.d/docker.list
   arch=$(dpkg --print-architecture)
-  say "Adding the Docker apt repository (download.docker.com, ${OS_ID} ${OS_CODENAME}) ..."
+  say "Adding the Docker apt repository (${base}, ${OS_ID} ${OS_CODENAME}) ..."
   install -m 0755 -d /etc/apt/keyrings
-  if ! curl -fsSL --max-time 30 "https://download.docker.com/linux/${OS_ID}/gpg" -o "$key"; then
+  if ! curl -fsSL --max-time 30 "${base}/linux/${OS_ID}/gpg" -o "$key"; then
     rm -f "$key"
     return 1
   fi
   chmod a+r "$key"
-  printf 'deb [arch=%s signed-by=%s] https://download.docker.com/linux/%s %s stable\n' \
-    "$arch" "$key" "$OS_ID" "$OS_CODENAME" > "$list"
+  printf 'deb [arch=%s signed-by=%s] %s/linux/%s %s stable\n' \
+    "$arch" "$key" "$base" "$OS_ID" "$OS_CODENAME" > "$list"
   if apt_update && apt_install docker-ce docker-ce-cli containerd.io docker-buildx-plugin docker-compose-plugin; then
     return 0
   fi
@@ -538,7 +605,7 @@ install_docker() {
         fi
       done
     elif ! install_docker_official; then
-      warn "download.docker.com is unreachable or failed; falling back to the distro packages."
+      warn "The Docker repositories are unreachable or failed; falling back to the distro packages."
       install_docker_distro
     fi
     detect_compose || die "docker compose is still missing after the installation."
@@ -830,12 +897,29 @@ wait_n8n() {
   return 1
 }
 
-start_n8n() {
+# Docker Hub and docker.n8n.io block some regions (Iran included): on a failed
+# pull, switch to the Hub image and retry through each registry mirror.
+pull_images() {
   say "Pulling ${IMAGE_REF}:${IMAGE_TAG} ..."
-  if ! compose pull; then
-    warn "Could not pull the images. Docker Hub and docker.n8n.io block some regions (Iran included)."
-    die "Re-run with a mirror, e.g. --registry-mirror https://docker.arvancloud.ir"
-  fi
+  compose pull && return 0
+  local m
+  for m in "${REGISTRY_FALLBACKS[@]}"; do
+    [[ $m != "$REGISTRY_MIRROR" ]] || continue
+    warn "Pull failed; retrying through the Docker Hub mirror ${m} ..."
+    REGISTRY_MIRROR=$m
+    if [[ $IMAGE_REF == "$DEFAULT_IMAGE" ]]; then
+      IMAGE_REF=$HUB_IMAGE
+      write_env
+      render_compose
+    fi
+    configure_registry_mirror
+    compose pull && return 0
+  done
+  return 1
+}
+
+start_n8n() {
+  pull_images || die "Could not pull the images, mirrors included. Re-run with --registry-mirror <url>."
   say "Starting n8n ..."
   compose up -d --remove-orphans || die "docker compose up failed."
   say "Waiting for n8n to answer on 127.0.0.1:${LOCAL_PORT} (first start runs migrations) ..."
@@ -1544,8 +1628,7 @@ cmd_update() {
     write_env
   fi
   render_compose
-  say "Pulling ${IMAGE_REF}:${IMAGE_TAG} ..."
-  compose pull || die "Could not pull the image (blocked region? set a mirror in /etc/docker/daemon.json)."
+  pull_images || die "Could not pull the image, mirrors included (set one in /etc/docker/daemon.json)."
   compose up -d --remove-orphans || die "docker compose up failed."
   wait_n8n 150 || die "n8n did not come back after the update (n8nctl logs); the backup is in ${BACKUP_DIR}."
   docker image prune -f > /dev/null 2>&1 || true
