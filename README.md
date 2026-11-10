@@ -113,6 +113,17 @@ through a mirror:
 bash <(curl -Ls https://raw.githubusercontent.com/FarzinNs83/my-scripts/main/n8n-setup.sh) --registry-mirror https://docker.arvancloud.ir
 ```
 
+**Local install** (WSL or your own Linux, no domain): press Enter at the
+domain prompt, or pass `--local`. Docker and n8n are set up the same way,
+without nginx or a certificate, and n8n opens at `http://localhost:5678`
+(on WSL, from the Windows browser too). Webhooks are only reachable from
+that machine. On WSL without systemd, Docker does not start by itself after
+a WSL restart; run `n8nctl restart`.
+
+```bash
+bash <(curl -Ls https://raw.githubusercontent.com/FarzinNs83/my-scripts/main/n8n-setup.sh) --local
+```
+
 After the install:
 
 ```bash
@@ -388,6 +399,44 @@ port from 27015 and refuses one that another program holds, SourceTV (27020)
 is off, and apt does not restart running services.
 
 Needs 15 GB of free disk. Port: UDP 27015 by default.
+
+## lan-setup.sh
+
+Your own Radmin VPN / Hamachi / ZeroTier on a VPS, for games that have only a
+LAN mode. Players connect with the SoftEther VPN Client and end up on one
+virtual LAN (`10.77.77.0/24`); one of them hosts the game as usual and the
+others find it in the LAN list or join its `10.77.77.x` address. The game
+still runs on the host's PC, but the traffic goes player → VPS → player
+instead of through Radmin's relays abroad, so with a VPS in Iran the ping
+stays low. It asks for the port and the players' password:
+
+- installs SoftEther VPN Server from apt (Ubuntu 22.04+ / Debian 12+)
+- one listener on your port; the default ones (TCP and UDP 443, 992, 1194,
+  5555), SSTP, OpenVPN and VPN Azure are off
+- a hub `LAN` with one shared user `player`, and DHCP without a gateway, so
+  only LAN traffic goes through the VPS, not the players' internet
+
+```bash
+bash <(curl -Ls https://raw.githubusercontent.com/FarzinNs83/my-scripts/main/lan-setup.sh)
+```
+
+At the end it prints what each player enters in the client, and one
+PowerShell line to run once on each PC: it makes the game's LAN list use the
+VPN adapter and lets the host's firewall take players in. Run the script
+again to change the port or the password.
+
+```bash
+lanctl start     # start, and start at boot
+lanctl stop      # stop, and stay off after a reboot
+lanctl restart
+lanctl status
+lanctl who       # the players' 10.77.77.x addresses
+```
+
+Port: TCP 5555 by default (the first free one from there). If ufw or
+firewalld is on, the local UDP port range is opened too: SoftEther's UDP
+acceleration sends the game packets over UDP from a random port, and
+without it they go over TCP.
 
 ## All three on one VPS
 

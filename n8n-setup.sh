@@ -14,6 +14,10 @@
 #    6. installs `n8nctl` (a symlink to this script) for status, logs, update,
 #       backup and uninstall, then prints the login link
 #
+#  Local mode (--local, or Enter at the domain prompt): n8n on this machine
+#  only -- WSL or your own Linux. No domain, nginx or certificate: steps 2, 3
+#  and 6, with n8n at http://localhost:5678.
+#
 #  This file is independent from dns-setup.sh and 3xui-setup.sh: it owns its
 #  own paths, nginx file, renew hook and log. It serves TCP 80 and 443 through
 #  nginx. When dns-setup.sh owns 443 (nginx stream SNI relay), n8n listens on
@@ -23,6 +27,7 @@
 #  Usage:
 #    bash n8n-setup.sh n8n.example.com
 #    bash n8n-setup.sh --postgres --open-firewall n8n.example.com
+#    bash n8n-setup.sh --local
 #    bash <(curl -Ls https://raw.githubusercontent.com/USER/REPO/main/n8n-setup.sh) n8n.example.com
 #    n8nctl status
 #    n8nctl update
@@ -76,6 +81,7 @@ OWNER_EMAIL=""
 OWNER_PASS=""
 DB_TYPE=""
 
+LOCAL=0
 SKIP_DNS=0
 OPEN_FIREWALL=0
 SWAP=1
@@ -102,6 +108,8 @@ Usage:
 
 Install options:
   -d, --domain <name>       public domain, e.g. n8n.example.com (asked when omitted)
+      --local               no domain: n8n on this machine only (WSL / own Linux)
+                            at http://localhost:<port>, without nginx or certificate
   -e, --email <address>     Let's Encrypt account email (default: none)
       --postgres            use Postgres instead of SQLite (recommended for heavy use)
       --tag <tag>           n8n image tag (default: latest)
@@ -385,7 +393,9 @@ precheck_domain_free() {
 
 precheck_ports() {
   local p holder
-  if relay_active; then
+  if ((LOCAL == 1)); then
+    : # no nginx: only the n8n port matters
+  elif relay_active; then
     if ! grep -qF "$SNI_ROUTES_DIR" "$DS_STREAM_CONF"; then
       die "The dns-setup.sh relay on this server predates n8n support. Re-run the current dns-setup.sh first, then this script."
     fi
@@ -398,6 +408,7 @@ precheck_ports() {
     fi
   fi
   for p in 80 443; do
+    ((LOCAL == 0)) || break
     port_in_use "$p" || continue
     holder=$(port_holder "$p") || true
     if [[ $holder == *'"nginx"'* ]]; then
@@ -533,9 +544,32 @@ install_docker() {
     detect_compose || die "docker compose is still missing after the installation."
     say "Installed: $(docker --version 2> /dev/null || printf 'docker')"
   fi
-  systemctl enable --now docker > /dev/null 2>&1 || true
-  svc_active docker || systemctl start docker || die "The Docker service does not start (journalctl -u docker)."
+  start_docker
   configure_registry_mirror
+}
+
+has_systemd() {
+  [[ -d /run/systemd/system ]]
+}
+
+# Docker Desktop's WSL integration and WSL without systemd have no docker.service.
+start_docker() {
+  if has_systemd; then
+    systemctl enable docker > /dev/null 2>&1 || true
+  fi
+  docker info > /dev/null 2>&1 && return 0
+  if has_systemd; then
+    systemctl start docker || die "The Docker service does not start (journalctl -u docker)."
+  else
+    service docker start > /dev/null 2>&1 \
+      || die "Docker does not start. On WSL, enable systemd ([boot] systemd=true in /etc/wsl.conf, then 'wsl --shutdown') or use Docker Desktop's WSL integration."
+  fi
+  local i
+  for ((i = 0; i < 30; i++)); do
+    docker info > /dev/null 2>&1 && return 0
+    sleep 1
+  done
+  die "Docker started but does not answer (docker info)."
 }
 
 configure_registry_mirror() {
@@ -556,7 +590,12 @@ with open(path, "w") as fh:
     json.dump(data, fh, indent=2)
     fh.write("\n")
 PY
-  systemctl restart docker || die "Docker did not restart with the new daemon.json."
+  if has_systemd; then
+    systemctl restart docker
+  else
+    service docker restart > /dev/null 2>&1
+  fi || die "Docker did not restart with the new daemon.json (Docker Desktop: set the mirror in Settings > Docker Engine)."
+  start_docker
 }
 
 # ---------------------------------------------------------------------------
@@ -687,12 +726,26 @@ services:
     ports:
       - "127.0.0.1:${N8N_LOCAL_PORT}:5678"
     environment:
-      N8N_HOST: ${N8N_DOMAIN}
       N8N_PORT: "5678"
+EOF
+    if ((LOCAL == 1)); then
+      cat << 'EOF'
+      N8N_HOST: localhost
+      N8N_PROTOCOL: http
+      N8N_EDITOR_BASE_URL: http://localhost:${N8N_LOCAL_PORT}/
+      WEBHOOK_URL: http://localhost:${N8N_LOCAL_PORT}/
+      N8N_SECURE_COOKIE: "false"
+EOF
+    else
+      cat << 'EOF'
+      N8N_HOST: ${N8N_DOMAIN}
       N8N_PROTOCOL: https
       N8N_EDITOR_BASE_URL: https://${N8N_DOMAIN}/
       WEBHOOK_URL: https://${N8N_DOMAIN}/
       N8N_PROXY_HOPS: "1"
+EOF
+    fi
+    cat << 'EOF'
       N8N_ENCRYPTION_KEY: ${N8N_ENCRYPTION_KEY}
       GENERIC_TIMEZONE: ${N8N_TZ}
       TZ: ${N8N_TZ}
@@ -791,6 +844,14 @@ start_n8n() {
     die "n8n did not become healthy within 5 minutes (log above)."
   fi
   say "n8n is up: $(n8n_version)"
+}
+
+base_url() {
+  if ((LOCAL == 1)); then
+    printf 'http://localhost:%s/\n' "$LOCAL_PORT"
+  else
+    printf 'https://%s/\n' "$DOMAIN"
+  fi
 }
 
 n8n_version() {
@@ -1112,7 +1173,7 @@ print_summary() {
   printf '==============================================================\n'
   printf ' n8n was installed successfully\n'
   printf '==============================================================\n'
-  printf ' Login link  : https://%s/\n' "$DOMAIN"
+  printf ' Login link  : %s\n' "$(base_url)"
   if [[ -n $OWNER_EMAIL ]]; then
     printf ' Owner email : %s\n' "$OWNER_EMAIL"
     printf ' Password    : %s\n' "$OWNER_PASS"
@@ -1120,13 +1181,22 @@ print_summary() {
     printf ' First visit : create the owner account right away -- until\n'
     printf '               then, whoever opens the link first can claim it.\n'
   fi
-  printf ' Webhooks    : https://%s/webhook/...\n' "$DOMAIN"
+  printf ' Webhooks    : %swebhook/...\n' "$(base_url)"
   printf ' Version     : %s (%s:%s)\n' "$(n8n_version)" "$IMAGE_REF" "$IMAGE_TAG"
   printf ' Database    : %s\n' "$DB_TYPE"
   printf ' Data        : %s/data (files for nodes: %s/files -> /files)\n' "$N8N_DIR" "$N8N_DIR"
   printf ' Settings    : %s\n' "$ENV_FILE"
-  printf ' Certificate : %s (expires %s, renews automatically)\n' "$CERT_FULLCHAIN" "${expires:-unknown}"
-  if [[ $(listen_mode) == loopback ]]; then
+  if ((LOCAL == 1)); then
+    printf ' Local mode  : reachable from this machine only (on WSL, from the\n'
+    printf '               Windows browser too). Outside services cannot call\n'
+    printf '               the webhooks without a tunnel (cloudflared, ngrok).\n'
+    if ! has_systemd; then
+      printf ' After a WSL restart: n8nctl restart (nothing starts Docker at boot)\n'
+    fi
+  else
+    printf ' Certificate : %s (expires %s, renews automatically)\n' "$CERT_FULLCHAIN" "${expires:-unknown}"
+  fi
+  if ((LOCAL == 0)) && [[ $(listen_mode) == loopback ]]; then
     printf ' HTTPS       : 127.0.0.1:%s, reached through the dns-setup.sh relay on :443\n' "$TLS_PORT"
   fi
   printf '%s\n' '--------------------------------------------------------------'
@@ -1151,6 +1221,10 @@ parse_args() {
         (($# >= 2)) || die "Option $1 needs a value."
         EMAIL="$2"
         shift 2
+        ;;
+      --local)
+        LOCAL=1
+        shift
         ;;
       --postgres)
         WANT_POSTGRES=1
@@ -1244,10 +1318,19 @@ parse_args() {
 }
 
 resolve_domain() {
+  if ((LOCAL == 1)); then
+    [[ -z $DOMAIN ]] || die "--local takes no domain."
+    return 0
+  fi
   if [[ -z $DOMAIN ]]; then
-    [[ -t 0 ]] || die "No domain given. Usage: bash $0 n8n.example.com"
-    printf 'Domain for n8n (e.g. n8n.example.com): '
+    [[ -t 0 ]] || die "No domain given. Usage: bash $0 n8n.example.com (or --local)"
+    printf 'Domain for n8n (e.g. n8n.example.com), or Enter for a local install (WSL / own Linux): '
     read -r DOMAIN || die "No input."
+    if [[ -z ${DOMAIN//[[:space:]]/} ]]; then
+      DOMAIN=""
+      LOCAL=1
+      return 0
+    fi
   fi
   DOMAIN=$(normalize_domain "$DOMAIN")
   if [[ -z $DOMAIN ]] || ! is_domain "$DOMAIN"; then
@@ -1261,16 +1344,22 @@ install_all() {
   setup_logging
   trap '_on_err $LINENO' ERR
 
-  say "=== n8n-setup ${SCRIPT_VERSION}: n8n + Docker + nginx + Let's Encrypt ==="
-  say "domain : ${DOMAIN}"
+  if ((LOCAL == 1)); then
+    say "=== n8n-setup ${SCRIPT_VERSION}: n8n + Docker, local (no domain) ==="
+  else
+    say "=== n8n-setup ${SCRIPT_VERSION}: n8n + Docker + nginx + Let's Encrypt ==="
+    say "domain : ${DOMAIN}"
+  fi
 
   load_os
   ensure_base_packages
   prepare_settings
   say "image  : ${IMAGE_REF}:${IMAGE_TAG} (${DB_TYPE}, timezone ${TIMEZONE})"
   precheck_disk
-  precheck_dns
-  precheck_domain_free
+  if ((LOCAL == 0)); then
+    precheck_dns
+    precheck_domain_free
+  fi
   precheck_ports
   ensure_swap
   set_cert_paths
@@ -1284,6 +1373,12 @@ install_all() {
   render_compose
   start_n8n
   setup_owner
+
+  if ((LOCAL == 1)); then
+    install_self
+    print_summary
+    return 0
+  fi
 
   # --- 3. nginx (port 80 first: needed for the ACME challenge) ------------
   ensure_nginx
@@ -1319,6 +1414,7 @@ install_all() {
 load_installed() {
   load_env || die "No install found (${ENV_FILE} is missing); run the installer first."
   DOMAIN="${N8N_DOMAIN:-}"
+  [[ -n $DOMAIN ]] || LOCAL=1
   IMAGE_REF="${N8N_SETUP_IMAGE:-${N8N_IMAGE:-$DEFAULT_IMAGE}}"
   IMAGE_TAG="${N8N_SETUP_TAG:-${N8N_TAG:-latest}}"
   TIMEZONE="${N8N_TZ:-UTC}"
@@ -1341,7 +1437,7 @@ cmd_status() {
   local state expires
   state=$(docker inspect -f '{{.State.Status}} (restarts: {{.RestartCount}})' n8n 2> /dev/null) || state="missing"
   expires=$(openssl x509 -in "$CERT_FULLCHAIN" -noout -enddate 2> /dev/null | sed -n 's/^notAfter=//p') || expires=""
-  printf 'Domain      : https://%s/\n' "$DOMAIN"
+  printf 'Link        : %s\n' "$(base_url)"
   printf 'Container   : %s\n' "$state"
   printf 'Version     : %s (%s:%s)\n' "$(n8n_version)" "$IMAGE_REF" "$IMAGE_TAG"
   printf 'Database    : %s\n' "$DB_TYPE"
@@ -1349,6 +1445,10 @@ cmd_status() {
     printf 'Postgres    : %s\n' "$(docker inspect -f '{{.State.Status}} / {{if .State.Health}}{{.State.Health.Status}}{{end}}' n8n-postgres 2> /dev/null || printf missing)"
   fi
   printf 'Local health: %s\n' "$(n8n_healthy && printf 'OK (127.0.0.1:%s)' "$LOCAL_PORT" || printf 'FAIL')"
+  if ((LOCAL == 1)); then
+    printf 'Disk (data) : %s\n' "$(du -sh "$N8N_DIR" 2> /dev/null | awk '{print $1}')"
+    return 0
+  fi
   printf 'HTTPS health: %s\n' "$(verify_https && printf OK || printf FAIL)"
   printf 'nginx       : %s\n' "$(svc_active nginx && printf active || printf inactive)"
   if [[ $(listen_mode) == loopback ]]; then
@@ -1362,12 +1462,12 @@ cmd_status() {
 
 cmd_info() {
   load_installed
-  printf 'Login link  : https://%s/\n' "$DOMAIN"
+  printf 'Login link  : %s\n' "$(base_url)"
   if [[ -n $OWNER_EMAIL ]]; then
     printf 'Owner email : %s\n' "$OWNER_EMAIL"
     printf 'Password    : %s\n' "$OWNER_PASS"
   fi
-  printf 'Webhook URL : https://%s/webhook/<path>\n' "$DOMAIN"
+  printf 'Webhook URL : %swebhook/<path>\n' "$(base_url)"
   printf 'Data dir    : %s\n' "$N8N_DIR"
   printf 'Settings    : %s\n' "$ENV_FILE"
   printf 'Enc. key    : %s\n' "$ENCRYPTION_KEY"
@@ -1386,6 +1486,7 @@ cmd_logs() {
 
 cmd_restart() {
   load_installed
+  start_docker # down after a WSL restart without systemd
   compose up -d --force-recreate --remove-orphans || die "docker compose up failed."
   wait_n8n 90 || die "n8n did not come back (n8nctl logs)."
   say "n8n restarted: $(n8n_version)"
@@ -1453,6 +1554,7 @@ cmd_update() {
 
 cmd_renew() {
   load_installed
+  ((LOCAL == 0)) || die "Local install: there is no certificate."
   certbot renew --cert-name "$DOMAIN" --force-renewal || die "certbot renew failed."
   systemctl reload nginx 2> /dev/null || true
   say "Certificate renewed and nginx reloaded."
@@ -1461,6 +1563,10 @@ cmd_renew() {
 # dns-setup.sh calls this when its relay takes :443 over or gives it back.
 cmd_nginx() {
   load_installed
+  if ((LOCAL == 1)); then
+    say "Local install: no nginx site."
+    return 0
+  fi
   if cert_valid; then
     render_nginx https
   else
@@ -1543,6 +1649,6 @@ main() {
 
 if [[ ${BASH_SOURCE[0]} == "$0" ]]; then
   # untouched defaults, used to rebuild n8nctl after a piped run
-  PRISTINE_VARS=$(declare -p SCRIPT_VERSION N8N_DIR ENV_FILE COMPOSE_FILE LOG_FILE     BACKUP_DIR BACKUP_KEEP NGINX_CONF ACME_ROOT RENEW_HOOK TLS_DIR DS_STREAM_CONF     SNI_ROUTES_DIR SNI_MAP COMPOSE_PROJECT DEFAULT_IMAGE HUB_IMAGE POSTGRES_IMAGE     DOMAIN EMAIL IMAGE_TAG IMAGE_REF TIMEZONE LOCAL_PORT TLS_PORT MAX_BODY     REGISTRY_MIRROR OWNER_EMAIL OWNER_PASS DB_TYPE SKIP_DNS OPEN_FIREWALL SWAP     STAGING WANT_POSTGRES ENCRYPTION_KEY POSTGRES_PASSWORD PUBLIC_IPV4 COMPOSE_BIN     NGINX_RESTART OS_ID OS_CODENAME CERT_FULLCHAIN CERT_PRIVKEY)
+  PRISTINE_VARS=$(declare -p SCRIPT_VERSION N8N_DIR ENV_FILE COMPOSE_FILE LOG_FILE     BACKUP_DIR BACKUP_KEEP NGINX_CONF ACME_ROOT RENEW_HOOK TLS_DIR DS_STREAM_CONF     SNI_ROUTES_DIR SNI_MAP COMPOSE_PROJECT DEFAULT_IMAGE HUB_IMAGE POSTGRES_IMAGE     DOMAIN EMAIL IMAGE_TAG IMAGE_REF TIMEZONE LOCAL_PORT TLS_PORT MAX_BODY     REGISTRY_MIRROR OWNER_EMAIL OWNER_PASS DB_TYPE LOCAL SKIP_DNS OPEN_FIREWALL SWAP     STAGING WANT_POSTGRES ENCRYPTION_KEY POSTGRES_PASSWORD PUBLIC_IPV4 COMPOSE_BIN     NGINX_RESTART OS_ID OS_CODENAME CERT_FULLCHAIN CERT_PRIVKEY)
   main "$@"
 fi
