@@ -4,9 +4,10 @@ Standalone scripts for setting up Linux VPS servers. Run them as root.
 
 ## 3xui-setup.sh
 
-Installs the 3x-ui panel with a Let's Encrypt certificate, creates three VLESS
-inbounds (XHTTP, WebSocket, mKCP) with a client, and prints a subscription link
-with a QR code.
+Installs the latest 3x-ui release with a Let's Encrypt certificate, adds a
+set of configs under one client, tests every config, and prints the
+subscription links with a QR code. The config set is based on
+[3x-ui-pro-configs](https://github.com/pdnczone/3x-ui-pro-configs).
 
 ```bash
 bash <(curl -Ls https://raw.githubusercontent.com/FarzinNs83/my-scripts/main/3xui-setup.sh)
@@ -29,6 +30,76 @@ Iran / GitHub blocked (ghfast.top mirror):
 ```bash
 bash <(curl -Ls https://ghfast.top/https://raw.githubusercontent.com/FarzinNs83/my-scripts/main/3xui-setup.sh) --help
 ```
+
+### Configs
+
+Current Xray refuses VLESS without a security layer, so every config carries
+REALITY, TLS or VLESS Encryption (Shadowsocks-2022 encrypts by itself).
+
+| Key | Config | Default port |
+| --- | --- | --- |
+| `rv` | REALITY Vision (main) | TCP 443 |
+| `rx` | REALITY XHTTP | TCP 8443 |
+| `ro` | REALITY XHTTP with extra (obfuscated padding) | TCP 2443 |
+| `rp` | REALITY XHTTP packet-up | TCP 3443 |
+| `rg` | REALITY gRPC | TCP 4443 |
+| `tv` | TLS Vision, plus Fragment and IPv6 links | TCP 9443 |
+| `tx` | TLS XHTTP, plus Fragment and IPv6 links (and a CDN link with `--cdn`) | TCP 2087 |
+| `hy` | Hysteria2 with Salamander | UDP 443 |
+| `th` | TLS XHTTP over HTTP/3 (QUIC) | UDP 8443 |
+| `pq` | VLESS Encryption (post-quantum) with Sudoku | TCP 10443 |
+| `ew` | VLESS Encryption over WebSocket, no TLS (plus a Cloudflare HTTP link with `--cdn`) | TCP 8880 |
+| `ex` | VLESS Encryption over XHTTP, no TLS (plus a Cloudflare HTTP link with `--cdn`) | TCP 2052 |
+| `tt` | Trojan TLS | TCP 14443 |
+| `tr` | Trojan REALITY | TCP 14444 |
+| `ss` | Shadowsocks-2022 | TCP+UDP 8080 |
+| `ws` | Cloudflare CDN WebSocket, plus clean IPs | TCP 2053, only with `--cdn` |
+| `hu` | Cloudflare CDN HTTPUpgrade | TCP 2083, only with `--cdn` |
+| `cg` | Cloudflare CDN gRPC (turn gRPC on in Cloudflare > Network) | TCP 2096, only with `--cdn` |
+| `kc` | VLESS Encryption over mKCP. Not part of `all`, because most networks block mKCP now; ask for it with `--configs` | UDP 9443 |
+
+- A busy port moves the config to the next free one. The final summary lists
+  the ports that were really used; open them in the provider firewall
+  (IPv4 and IPv6, UDP for Hysteria2 and HTTP/3).
+- A config that Xray rejects is removed again. `ro`, `rp`, `cg`, `th`, `ew`,
+  `ex`, `tt`, `tr` and `kc` are also removed when they fail the end-to-end
+  test.
+- Two links are printed: the normal subscription and the JSON subscription.
+  Use the JSON one for the Fragment / FinalMask configs, with a client on
+  Xray-core 26 or newer (recent v2rayNG / v2rayN).
+
+### Updating a server
+
+Run the same command again. The panel is not reinstalled and no existing
+inbound, client or host is changed. The script finds the client it made
+before and adds only the configs that client does not have yet, under the
+same subscription link, so clients just refresh the subscription. It knows a
+config by its inbound name, so a renamed inbound is added again.
+
+`--add-configs` makes a second, separate set with a new client instead, and
+`--force-install` also updates the panel itself to the newest release.
+
+### Options
+
+| Option | |
+| --- | --- |
+| `--cdn <name>` | Subdomain proxied by Cloudflare (orange cloud, SSL/TLS Full) to this server. Adds the CDN configs and clean-IP links |
+| `--configs <list>` | `all` (default) or a comma list of keys, e.g. `rv,rx,tv,hy` |
+| `--clean <n>` | Number of Cloudflare clean-IP links with `--cdn` (0-30, default 20) |
+| `--add-configs` | Make a second, separate set (new client) instead of adding the missing configs to the existing client |
+| `--no-inbounds` | Install the panel only, no configs |
+| `--open-firewall` | Open the panel, config and subscription ports in ufw / firewalld |
+| `--force-install` | Update an installed panel to the newest release |
+| `--no-bbr` | Do not enable BBR (it is enabled by default) |
+| `--no-test` | Skip the end-to-end test |
+| `--skip-dns-check` | Do not verify that the subdomain points to this server |
+
+`XUI_VERSION=v3.10.2` pins a panel version instead of the latest one.
+
+Besides adding the configs, the script changes three panel settings: link
+names come from Hosts (`remarkTemplate` = `{{HOST}}`), the JSON subscription
+is turned on, and the subscription gets the panel certificate when it has
+none. The panel database is backed up first to `/etc/x-ui/x-ui.db.bak-pro-*`.
 
 ## dns-setup.sh
 
@@ -552,7 +623,8 @@ already uses. The smoothest order is dns-setup, then n8n, then 3x-ui.
 | TCP 443 | nginx SNI relay (dns-setup): the DNS domain goes to AdGuard, the n8n domain to n8n on `127.0.0.1:10443`, the relay list to the real sites. Without dns-setup, n8n's own nginx site |
 | TCP+UDP 853 | DoT / DoQ (AdGuard Home) |
 | random TCP 20000-40000 | 3x-ui panel |
-| TCP 8080, 8585, 2096, UDP 8443 | 3x-ui inbounds and subscription |
+| TCP 2096 | 3x-ui subscription |
+| see the [config table](#configs) | 3x-ui configs. Ports that are taken (TCP 443 by nginx, for example) are skipped, so REALITY Vision lands on TCP 2443 here; the script prints the final list |
 | loopback only | 3000 and 18443 (AdGuard), 5678 and 10443 (n8n) |
 
 How the overlaps are handled:
