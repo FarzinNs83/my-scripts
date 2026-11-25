@@ -1,0 +1,20 @@
+{% if i18n %}
+import { useTranslation } from 'react-i18next'
+{% endif %}
+
+export default function HomePage() {
+{% if i18n %}
+  const { t } = useTranslation()
+{% endif %}
+  return (
+    <section className="flex flex-col items-center gap-4 py-24 text-center">
+{% if i18n %}
+      <h1 className="text-4xl font-bold tracking-tight">{t('home.title')}</h1>
+      <p className="max-w-xl text-muted-foreground">{t('home.subtitle')}</p>
+{% else %}
+      <h1 className="text-4xl font-bold tracking-tight">{{ title }}</h1>
+      <p className="max-w-xl text-muted-foreground">Edit src/features/home/pages/home-page.tsx to get started.</p>
+{% endif %}
+    </section>
+  )
+}

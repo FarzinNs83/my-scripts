@@ -1,0 +1,28 @@
+import { Link } from 'react-router'
+import { paths } from '@/app/paths'
+import { Card, CardContent, CardDescription, CardHeader, CardTitle } from '@/components/ui/card'
+import { LoginForm } from '../components/login-form'
+import { useLogin } from '../hooks'
+
+export default function LoginPage() {
+  const login = useLogin()
+  return (
+    <div className="flex min-h-svh items-center justify-center p-4">
+      <Card className="w-full max-w-sm">
+        <CardHeader>
+          <CardTitle className="text-xl">Sign in</CardTitle>
+          <CardDescription>Enter your email and password.</CardDescription>
+        </CardHeader>
+        <CardContent className="grid gap-4">
+          <LoginForm onSubmit={(values) => login.mutateAsync(values)} submitLabel="Sign in" />
+          <p className="text-center text-sm text-muted-foreground">
+            No account?{' '}
+            <Link to={paths.register} className="text-foreground underline underline-offset-4">
+              Sign up
+            </Link>
+          </p>
+        </CardContent>
+      </Card>
+    </div>
+  )
+}

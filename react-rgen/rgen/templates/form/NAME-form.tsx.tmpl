@@ -1,0 +1,61 @@
+import { zodResolver } from '@hookform/resolvers/zod'
+import { {{ rhf_imports }} } from 'react-hook-form'
+{% if schema_inline %}
+import { z } from 'zod'
+{% endif %}
+{{ ui_imports }}
+import { ApiError } from '@/lib/api-error'
+{% if not schema_inline %}
+import { {{ schema_name }}, type {{ values_type }} } from '{{ schema_from }}'
+{% endif %}
+{% if schema_inline %}
+
+export const {{ schema_name }} = z.object({
+  {{ schema_body }}
+})
+export type {{ values_type }} = z.infer<typeof {{ schema_name }}>
+{% endif %}
+
+type Props = {
+  defaultValues?: Partial<{{ values_type }}>
+  onSubmit: (values: {{ values_type }}) => unknown
+  submitLabel?: string
+}
+
+export function {{ n.pascal }}Form({ defaultValues, onSubmit, submitLabel = 'Submit' }: Props) {
+  const {
+{% if uses_register %}
+    register,
+{% endif %}
+{% if controller %}
+    control,
+{% endif %}
+    handleSubmit,
+    setError,
+    formState: { errors, isSubmitting },
+  } = useForm<{{ values_type }}>({
+    resolver: zodResolver({{ schema_name }}),
+    defaultValues: {{ defaults_expr }},
+  })
+
+  const submit = handleSubmit(async (values) => {
+    try {
+      await onSubmit(values)
+    } catch (error) {
+      // server-side validation errors (e.g. 422 { errors: { email: [...] } }) go next to their fields;
+      // the error toast comes from the query client
+      for (const [name, message] of Object.entries(ApiError.from(error).fieldErrors)) {
+        setError(name as Path<{{ values_type }}>, { message })
+      }
+    }
+  })
+
+  return (
+    <form onSubmit={submit} className="grid gap-4" noValidate>
+      {{ controls }}
+      <Button type="submit" disabled={isSubmitting}>
+        {isSubmitting ? 'Saving…' : submitLabel}
+      </Button>
+    </form>
+  )
+}

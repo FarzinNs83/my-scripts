@@ -1,0 +1,16 @@
+import { useTranslation } from 'react-i18next'
+import { Button } from '@/components/ui/button'
+import { languages, type Language } from '@/lib/i18n'
+
+/** Switches between the languages in src/lib/i18n.ts (direction follows). */
+export function LanguageToggle() {
+  const { i18n } = useTranslation()
+  const codes = Object.keys(languages) as Language[]
+  const current = (i18n.resolvedLanguage ?? 'en') as Language
+  const next = codes[(codes.indexOf(current) + 1) % codes.length]
+  return (
+    <Button variant="ghost" size="sm" onClick={() => i18n.changeLanguage(next)}>
+      {languages[next].label}
+    </Button>
+  )
+}

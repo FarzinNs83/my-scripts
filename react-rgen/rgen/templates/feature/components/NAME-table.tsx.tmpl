@@ -1,0 +1,48 @@
+import { Pencil, Trash2 } from 'lucide-react'
+{% if detail %}
+import { Link } from 'react-router'
+import { href, paths } from '@/app/paths'
+{% endif %}
+import { Button } from '@/components/ui/button'
+import { Table, TableBody, TableCell, TableHead, TableHeader, TableRow } from '@/components/ui/table'
+import type { {{ n.pascal }} } from '../types'
+
+type Props = {
+  items: {{ n.pascal }}[]
+  onEdit?: (item: {{ n.pascal }}) => void
+  onDelete?: (item: {{ n.pascal }}) => void
+}
+
+export function {{ n.pascal }}Table({ items, onEdit, onDelete }: Props) {
+  return (
+    <div className="rounded-md border">
+      <Table>
+        <TableHeader>
+          <TableRow>
+            {{ heads }}
+            <TableHead className="w-24" />
+          </TableRow>
+        </TableHeader>
+        <TableBody>
+          {items.map((item) => (
+            <TableRow key={item.id}>
+              {{ cells }}
+              <TableCell className="text-end">
+                {onEdit && (
+                  <Button variant="ghost" size="icon" onClick={() => onEdit(item)} aria-label="Edit">
+                    <Pencil className="size-4" />
+                  </Button>
+                )}
+                {onDelete && (
+                  <Button variant="ghost" size="icon" onClick={() => onDelete(item)} aria-label="Delete">
+                    <Trash2 className="size-4 text-destructive" />
+                  </Button>
+                )}
+              </TableCell>
+            </TableRow>
+          ))}
+        </TableBody>
+      </Table>
+    </div>
+  )
+}

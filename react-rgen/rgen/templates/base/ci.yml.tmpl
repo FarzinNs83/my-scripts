@@ -1,0 +1,30 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+{% if pm == 'pnpm' %}
+      - uses: pnpm/action-setup@v4
+{% endif %}
+{% if pm == 'bun' %}
+      - uses: oven-sh/setup-bun@v2
+{% else %}
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: {{ pm }}
+{% endif %}
+      - run: {{ {'npm': 'npm ci', 'pnpm': 'pnpm install --frozen-lockfile', 'yarn': 'yarn install --frozen-lockfile', 'bun': 'bun install --frozen-lockfile'}[pm] }}
+      - run: {{ pm }} run lint
+      - run: {{ pm }} run typecheck
+{% if tests %}
+      - run: {{ pm }} run test:run
+{% endif %}
+      - run: {{ pm }} run build

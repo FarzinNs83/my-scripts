@@ -1,0 +1,31 @@
+import type { ComponentType } from 'react'
+import { createBrowserRouter } from 'react-router'
+import { paths } from '@/app/paths'
+import { ProtectedRoute } from '@/components/common/protected-route'
+import { RouteError } from '@/components/common/route-error'
+import { AppLayout } from '@/components/layout/app-layout'
+
+/** Lazy-loads a page module with a default export (one JS chunk per page). */
+const page = (load: () => Promise<{ default: ComponentType }>) => async () => ({ Component: (await load()).default })
+
+export const router = createBrowserRouter([
+  {
+    element: <AppLayout />,
+    errorElement: <RouteError />,
+    hydrateFallbackElement: null,
+    children: [
+      { path: paths.home, lazy: page(() => import('@/features/home/pages/home-page')) },
+      // rgen:routes
+      {
+        // pages that need a signed-in user
+        element: <ProtectedRoute />,
+        children: [
+          // rgen:protected-routes
+        ],
+      },
+      { path: '*', lazy: page(() => import('@/components/common/not-found')) },
+    ],
+  },
+  // pages without the app layout (login, register, ...)
+  // rgen:bare-routes
+])

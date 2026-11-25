@@ -1,0 +1,15 @@
+import { Navigate, Outlet, useLocation } from 'react-router'
+import { useAuthStore } from '@/stores/auth-store'
+
+const LOGIN_PATH = '/login'
+
+/** Renders the child routes for a signed-in user; otherwise sends them to the login page and back afterwards. */
+export function ProtectedRoute() {
+  const signedIn = useAuthStore((s) => !!s.accessToken)
+  const location = useLocation()
+  if (!signedIn) {
+    const state = { from: location.pathname + location.search }
+    return <Navigate to={LOGIN_PATH} replace state={state} />
+  }
+  return <Outlet />
+}

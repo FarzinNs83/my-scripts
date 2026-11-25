@@ -1,0 +1,27 @@
+import { MutationCache, QueryClient } from '@tanstack/react-query'
+import { toast } from 'sonner'
+import { ApiError, getErrorMessage } from '@/lib/api-error'
+
+declare module '@tanstack/react-query' {
+  interface Register {
+    defaultError: ApiError
+    /** useMutation({ meta: { silent: true } }) turns off the error toast for that mutation. */
+    mutationMeta: { silent?: boolean }
+  }
+}
+
+export const queryClient = new QueryClient({
+  mutationCache: new MutationCache({
+    onError: (error, _vars, _ctx, mutation) => {
+      if (!mutation.meta?.silent) toast.error(getErrorMessage(error))
+    },
+  }),
+  defaultOptions: {
+    queries: {
+      staleTime: 30_000,
+      refetchOnWindowFocus: false,
+      // client errors (4xx) will not fix themselves: retry only network and server errors
+      retry: (count, error) => !(error.status && error.status < 500) && count < 2,
+    },
+  },
+})

@@ -1,0 +1,59 @@
+import axios, { type AxiosError, type InternalAxiosRequestConfig } from 'axios'
+import { ApiError } from '@/lib/api-error'
+import { env } from '@/lib/env'
+import { useAuthStore } from '@/stores/auth-store'
+
+/** Refresh endpoint: POST { refreshToken } -> { accessToken, refreshToken? }. Change it to match your API. */
+const REFRESH_PATH = '/auth/refresh'
+
+export const apiClient = axios.create({
+  baseURL: env.VITE_API_URL,
+  headers: { 'Content-Type': 'application/json' },
+  timeout: 30_000,
+})
+
+apiClient.interceptors.request.use((config) => {
+  const token = useAuthStore.getState().accessToken
+  if (token) config.headers.Authorization = `Bearer ${token}`
+  return config
+})
+
+// One refresh at a time: requests that fail with 401 while it runs wait for it.
+let refreshing: Promise<string> | null = null
+
+async function refreshAccessToken(): Promise<string> {
+  const { refreshToken, setTokens } = useAuthStore.getState()
+  const { data } = await axios.post<{ accessToken: string; refreshToken?: string }>(
+    `${env.VITE_API_URL}${REFRESH_PATH}`,
+    { refreshToken },
+  )
+  setTokens(data.accessToken, data.refreshToken ?? refreshToken)
+  return data.accessToken
+}
+
+type RetryConfig = InternalAxiosRequestConfig & { _retry?: boolean }
+
+apiClient.interceptors.response.use(
+  (response) => response,
+  async (error: AxiosError) => {
+    const original = error.config as RetryConfig | undefined
+    const auth = useAuthStore.getState()
+    if (error.response?.status === 401 && original && !original._retry && original.url !== REFRESH_PATH) {
+      if (auth.refreshToken) {
+        original._retry = true
+        try {
+          refreshing ??= refreshAccessToken().finally(() => {
+            refreshing = null
+          })
+          original.headers.Authorization = `Bearer ${await refreshing}`
+          return apiClient(original)
+        } catch {
+          auth.logout()
+        }
+      } else if (auth.accessToken) {
+        auth.logout()
+      }
+    }
+    return Promise.reject(ApiError.from(error))
+  },
+)

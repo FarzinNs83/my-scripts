@@ -1,0 +1,61 @@
+import { {{ 'keepPreviousData, ' if paginated else '' }}useMutation, useQuery, useQueryClient } from '@tanstack/react-query'
+import type { Id, ListParams } from '@/types/api'
+import { {{ n.camel }}Api } from './api'
+import type { {{ n.pascal }}Input } from './types'
+
+/** Query keys: invalidate {{ n.camel }}Keys.all to refetch everything about {{ p.title.lower() }}. */
+export const {{ n.camel }}Keys = {
+  all: ['{{ p.kebab }}'] as const,
+  lists: () => [...{{ n.camel }}Keys.all, 'list'] as const,
+  list: (params?: ListParams) => [...{{ n.camel }}Keys.lists(), params ?? {}] as const,
+  details: () => [...{{ n.camel }}Keys.all, 'detail'] as const,
+  detail: (id: Id) => [...{{ n.camel }}Keys.details(), id] as const,
+}
+
+export function use{{ p.pascal }}(params?: ListParams) {
+  return useQuery({
+    queryKey: {{ n.camel }}Keys.list(params),
+    queryFn: () => {{ n.camel }}Api.list(params),
+{% if paginated %}
+    placeholderData: keepPreviousData, // keep the current page on screen while the next one loads
+{% endif %}
+  })
+}
+
+export function use{{ n.pascal }}(id: Id | undefined) {
+  return useQuery({
+    queryKey: {{ n.camel }}Keys.detail(id ?? ''),
+    queryFn: () => {{ n.camel }}Api.get(id!),
+    enabled: id != null && id !== '',
+  })
+}
+
+export function useCreate{{ n.pascal }}() {
+  const queryClient = useQueryClient()
+  return useMutation({
+    mutationFn: (input: {{ n.pascal }}Input) => {{ n.camel }}Api.create(input),
+    onSuccess: () => queryClient.invalidateQueries({ queryKey: {{ n.camel }}Keys.lists() }),
+  })
+}
+
+export function useUpdate{{ n.pascal }}() {
+  const queryClient = useQueryClient()
+  return useMutation({
+    mutationFn: ({ id, input }: { id: Id; input: Partial<{{ n.pascal }}Input> }) => {{ n.camel }}Api.update(id, input),
+    onSuccess: (data, { id }) => {
+      queryClient.setQueryData({{ n.camel }}Keys.detail(id), data)
+      return queryClient.invalidateQueries({ queryKey: {{ n.camel }}Keys.lists() })
+    },
+  })
+}
+
+export function useDelete{{ n.pascal }}() {
+  const queryClient = useQueryClient()
+  return useMutation({
+    mutationFn: (id: Id) => {{ n.camel }}Api.remove(id),
+    onSuccess: (_data, id) => {
+      queryClient.removeQueries({ queryKey: {{ n.camel }}Keys.detail(id) })
+      return queryClient.invalidateQueries({ queryKey: {{ n.camel }}Keys.lists() })
+    },
+  })
+}

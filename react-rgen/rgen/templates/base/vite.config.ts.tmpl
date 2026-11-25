@@ -1,0 +1,24 @@
+{% if tests %}
+/// <reference types="vitest/config" />
+{% endif %}
+import path from 'node:path'
+import tailwindcss from '@tailwindcss/vite'
+import react from '@vitejs/plugin-react'
+import { defineConfig } from 'vite'
+
+export default defineConfig({
+  plugins: [react(), tailwindcss()],
+  resolve: {
+    alias: { '@': path.resolve(import.meta.dirname, './src') },
+  },
+{% if tests %}
+  test: {
+    environment: 'jsdom',
+    // same origin for the page and the API, so jsdom does not apply CORS to the fake API
+    environmentOptions: { jsdom: { url: 'http://localhost:3000' } },
+    setupFiles: './src/test/setup.ts',
+    css: false,
+    env: { VITE_API_URL: 'http://localhost:3000/api' },
+  },
+{% endif %}
+})

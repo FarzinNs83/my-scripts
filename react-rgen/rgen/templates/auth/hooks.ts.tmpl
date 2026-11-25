@@ -1,0 +1,49 @@
+import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query'
+import { useLocation, useNavigate } from 'react-router'
+import { paths } from '@/app/paths'
+import { useAuthStore } from '@/stores/auth-store'
+import { authApi } from './api'
+import type { AuthResponse } from './types'
+
+export const authKeys = { me: ['auth', 'me'] as const }
+
+/** Stores the tokens and goes back to the page that sent the user to login (or home). */
+function useSignIn() {
+  const setTokens = useAuthStore((s) => s.setTokens)
+  const setUser = useAuthStore((s) => s.setUser)
+  const navigate = useNavigate()
+  const location = useLocation()
+  return (response: AuthResponse) => {
+    setTokens(response.accessToken, response.refreshToken)
+    if (response.user) setUser(response.user)
+    const from = (location.state as { from?: string } | null)?.from
+    navigate(from ?? paths.home, { replace: true })
+  }
+}
+
+export function useLogin() {
+  const signIn = useSignIn()
+  return useMutation({ mutationFn: authApi.login, onSuccess: signIn })
+}
+
+export function useRegister() {
+  const signIn = useSignIn()
+  return useMutation({ mutationFn: authApi.register, onSuccess: signIn })
+}
+
+/** The signed-in user from /auth/me (only runs with a token). */
+export function useMe() {
+  const signedIn = useAuthStore((s) => !!s.accessToken)
+  return useQuery({ queryKey: authKeys.me, queryFn: authApi.me, enabled: signedIn })
+}
+
+export function useLogout() {
+  const logout = useAuthStore((s) => s.logout)
+  const queryClient = useQueryClient()
+  const navigate = useNavigate()
+  return () => {
+    logout()
+    queryClient.clear()
+    navigate(paths.login, { replace: true })
+  }
+}

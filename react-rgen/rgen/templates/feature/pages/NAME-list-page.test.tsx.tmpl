@@ -1,0 +1,21 @@
+import { describe, expect, it } from 'vitest'
+import { renderWithProviders, screen } from '@/test/render'
+import {{ n.pascal }}ListPage from './{{ n.kebab }}-list-page'
+
+describe('{{ n.pascal }}ListPage', () => {
+  it('shows the {{ p.title.lower() }} from the API', async () => {
+    renderWithProviders(<{{ n.pascal }}ListPage />)
+    expect((await screen.findAllByText({{ first_value }})).length).toBeGreaterThan(0)
+  })
+
+  it('validates the form before sending it', async () => {
+    const { user } = renderWithProviders(<{{ n.pascal }}ListPage />)
+    await user.click(await screen.findByRole('button', { name: /new {{ n.title.lower() }}/i }))
+    await user.click(await screen.findByRole('button', { name: 'Create' }))
+{% if has_required %}
+    expect((await screen.findAllByText(/required|pick one|invalid|at least/i)).length).toBeGreaterThan(0)
+{% else %}
+    expect(await screen.findByText('{{ n.title }} created')).toBeInTheDocument()
+{% endif %}
+  })
+})

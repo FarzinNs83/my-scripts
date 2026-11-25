@@ -1,0 +1,36 @@
+import { delay, http, HttpResponse } from 'msw'
+import { apiUrl } from '@/mocks/utils'
+import type { LoginValues, RegisterValues } from './types'
+
+const user = { id: 1, name: 'Demo User', email: 'demo@example.com' }
+const session = () => ({ accessToken: `mock-access-${Date.now()}`, refreshToken: 'mock-refresh', user })
+
+/**
+ * Fake auth API: any email signs in with the password 'password', and registering
+ * taken@example.com returns a 422 with field errors. Registered in src/mocks/handlers.ts.
+ */
+export const authHandlers = [
+  http.post(apiUrl('/auth/login'), async ({ request }) => {
+    await delay()
+    const body = (await request.json()) as LoginValues
+    if (body.password !== 'password') {
+      return HttpResponse.json({ message: 'Wrong email or password (mock password: password)' }, { status: 401 })
+    }
+    return HttpResponse.json({ ...session(), user: { ...user, email: body.email } })
+  }),
+  http.post(apiUrl('/auth/register'), async ({ request }) => {
+    await delay()
+    const body = (await request.json()) as RegisterValues
+    if (body.email === 'taken@example.com') {
+      return HttpResponse.json(
+        { message: 'Please fix the errors', errors: { email: ['This email is already registered'] } },
+        { status: 422 },
+      )
+    }
+    return HttpResponse.json({ ...session(), user: { ...user, name: body.name, email: body.email } })
+  }),
+  http.post(apiUrl('/auth/refresh'), () => HttpResponse.json(session())),
+  http.get(apiUrl('/auth/me'), ({ request }) =>
+    request.headers.get('Authorization') ? HttpResponse.json(user) : HttpResponse.json({ message: 'Unauthorized' }, { status: 401 }),
+  ),
+]

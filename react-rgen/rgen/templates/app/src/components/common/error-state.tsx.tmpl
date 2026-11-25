@@ -1,0 +1,18 @@
+import { AlertTriangle } from 'lucide-react'
+import { Button } from '@/components/ui/button'
+import { getErrorMessage } from '@/lib/api-error'
+
+/** Shown when a query fails. */
+export function ErrorState({ error, onRetry }: { error: unknown; onRetry?: () => void }) {
+  return (
+    <div role="alert" className="flex flex-col items-center justify-center gap-3 rounded-lg border border-destructive/40 p-8 text-center">
+      <AlertTriangle className="size-8 text-destructive" />
+      <p className="text-sm">{getErrorMessage(error)}</p>
+      {onRetry && (
+        <Button variant="outline" size="sm" onClick={onRetry}>
+          Try again
+        </Button>
+      )}
+    </div>
+  )
+}

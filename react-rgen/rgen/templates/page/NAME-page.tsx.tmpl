@@ -1,0 +1,17 @@
+{% if params %}
+import { useParams } from 'react-router'
+
+{% endif %}
+export default function {{ n.pascal }}Page() {
+{% if params %}
+  const { {{ ', '.join(params) }} } = useParams()
+{% endif %}
+  return (
+    <div className="space-y-4">
+      <h1 className="text-2xl font-semibold">{{ n.title }}</h1>
+{% if params %}
+      <p className="text-muted-foreground">{{ params_jsx }}</p>
+{% endif %}
+    </div>
+  )
+}

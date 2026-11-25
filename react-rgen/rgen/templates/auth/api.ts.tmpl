@@ -1,0 +1,10 @@
+import { apiClient } from '@/lib/api-client'
+import type { AuthUser } from '@/stores/auth-store'
+import type { AuthResponse, LoginValues, RegisterValues } from './types'
+
+/** Auth endpoints. The refresh endpoint lives in src/lib/api-client.ts. */
+export const authApi = {
+  login: async (values: LoginValues) => (await apiClient.post<AuthResponse>('/auth/login', values)).data,
+  register: async (values: RegisterValues) => (await apiClient.post<AuthResponse>('/auth/register', values)).data,
+  me: async () => (await apiClient.get<AuthUser>('/auth/me')).data,
+}

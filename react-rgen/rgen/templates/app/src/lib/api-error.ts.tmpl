@@ -1,0 +1,39 @@
+import axios from 'axios'
+
+/** Every failed request becomes an ApiError, so UI code handles one shape. */
+export class ApiError extends Error {
+  readonly status?: number
+  readonly data?: unknown
+
+  constructor(message: string, status?: number, data?: unknown) {
+    super(message)
+    this.name = 'ApiError'
+    this.status = status
+    this.data = data
+  }
+
+  /** Field errors from a 422 response shaped like { errors: { email: ['taken'] } }. */
+  get fieldErrors(): Record<string, string> {
+    const errors = (this.data as { errors?: Record<string, string[] | string> } | undefined)?.errors
+    if (!errors || typeof errors !== 'object') return {}
+    return Object.fromEntries(Object.entries(errors).map(([k, v]) => [k, Array.isArray(v) ? v[0] : String(v)]))
+  }
+
+  static from(error: unknown): ApiError {
+    if (error instanceof ApiError) return error
+    if (axios.isAxiosError(error)) {
+      const data = error.response?.data as { message?: string; detail?: string; error?: string } | undefined
+      const message =
+        data?.message ??
+        data?.detail ??
+        data?.error ??
+        (error.response ? `Request failed (${error.response.status})` : 'Network error: check your connection')
+      return new ApiError(message, error.response?.status, error.response?.data)
+    }
+    return new ApiError(error instanceof Error ? error.message : 'Something went wrong')
+  }
+}
+
+export function getErrorMessage(error: unknown): string {
+  return ApiError.from(error).message
+}

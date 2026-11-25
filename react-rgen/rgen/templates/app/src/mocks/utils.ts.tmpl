@@ -1,0 +1,39 @@
+import { env } from '@/lib/env'
+
+/** The full URL a handler must match: apiUrl('/products') -> '<VITE_API_URL>/products' */
+export const apiUrl = (path: string) => env.VITE_API_URL.replace(/\/$/, '') + path
+
+/** An in-memory table for mock handlers: the data lives until the page reloads. */
+export function createTable<T extends { id: string | number }>(rows: T[]) {
+  let items = [...rows]
+  let nextId = Math.max(0, ...items.map((x) => Number(x.id) || 0)) + 1
+  return {
+    all: () => items,
+    find: (id: unknown) => items.find((x) => String(x.id) === String(id)),
+    insert: (data: Omit<T, 'id'>) => {
+      const item = { ...data, id: nextId++ } as T
+      items = [...items, item]
+      return item
+    },
+    update: (id: unknown, data: Partial<T>) => {
+      const current = items.find((x) => String(x.id) === String(id))
+      if (!current) return undefined
+      const item = { ...current, ...data, id: current.id }
+      items = items.map((x) => (x === current ? item : x))
+      return item
+    },
+    remove: (id: unknown) => {
+      const before = items.length
+      items = items.filter((x) => String(x.id) !== String(id))
+      return items.length < before
+    },
+    /** ?q= filters on every value, ?page & ?pageSize slice. */
+    query: (url: URL) => {
+      const q = url.searchParams.get('q')?.toLowerCase()
+      const filtered = q ? items.filter((x) => JSON.stringify(Object.values(x)).toLowerCase().includes(q)) : items
+      const page = Math.max(1, Number(url.searchParams.get('page')) || 1)
+      const pageSize = Math.max(1, Number(url.searchParams.get('pageSize')) || 10)
+      return { items: filtered.slice((page - 1) * pageSize, page * pageSize), total: filtered.length, page, pageSize, filtered }
+    },
+  }
+}

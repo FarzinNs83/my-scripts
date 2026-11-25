@@ -17,6 +17,13 @@
 #       long caching for fingerprinted bundles and none for index.html
 #    5. gets a Let's Encrypt certificate (HTTP-01, webroot) with auto-renewal
 #
+#  For an app split over two repositories (e.g. an admin panel that imports
+#  the public site's source from ../site), --with-repo clones the second one
+#  next to the checkout and pulls it before every build. --backend serves the
+#  site's /api/ from a back-deploy.sh app that already runs on its own domain
+#  (one process and one database for both), and --noindex keeps the site out
+#  of search engines.
+#
 #  After a push, `front-update` pulls, builds and switches to the new release
 #  in one step; `front-update rollback` goes back to the previous one.
 #
@@ -57,11 +64,13 @@ RENEW_HOOK="${FD_RENEW_HOOK:-/etc/letsencrypt/renewal-hooks/deploy/front-deploy-
 DS_STREAM_CONF="/etc/nginx/stream.d/dns-setup-relay.conf"
 SNI_ROUTES_DIR="${FD_SNI_ROUTES_DIR:-/etc/nginx/sni-routes.d}"
 UPDATE_BIN="${FD_UPDATE_BIN:-/usr/local/bin/front-update}"
+BD_APPS_DIR="${FD_BD_APPS_DIR:-/etc/back-deploy/apps}"
 UPDATE_URL="${FD_UPDATE_URL:-https://raw.githubusercontent.com/FarzinNs83/my-scripts/main/front-update.sh}"
 
 SITE_VARS=(SITE_DOMAIN SITE_WWW SITE_SOURCE SITE_REPO SITE_BRANCH SITE_KEY
   SITE_APP_DIR SITE_INSTALL_CMD SITE_BUILD_CMD SITE_BUILD_DIR SITE_NODE
-  SITE_NPM_REGISTRY SITE_EMAIL SITE_STAGING SITE_TLS_PORT SITE_KEEP SITE_CREATED)
+  SITE_NPM_REGISTRY SITE_EMAIL SITE_STAGING SITE_TLS_PORT SITE_KEEP SITE_CREATED
+  SITE_WITH_REPO SITE_WITH_BRANCH SITE_WITH_KEY SITE_WITH_DIR SITE_BACKEND SITE_NOINDEX)
 for _v in "${SITE_VARS[@]}"; do
   printf -v "$_v" '%s' ''
 done
@@ -83,6 +92,11 @@ OPT_REGISTRY=""
 OPT_EMAIL=""
 OPT_TLS_PORT=""
 OPT_KEEP=""
+OPT_WITH_REPO=""
+OPT_WITH_BRANCH=""
+OPT_WITH_DIR=""
+OPT_BACKEND=""
+OPT_NOINDEX=""
 NO_WWW=0
 SKIP_DNS=0
 OPEN_FIREWALL=0
@@ -120,6 +134,16 @@ Options:
       --install-cmd <cmd>   dependency install (default: from the lockfile)
       --node <major>        Node.js major, e.g. 22 (default: .nvmrc, engines, 24)
       --env-file <path>     .env with build-time variables (VITE_*, REACT_APP_*)
+      --with-repo <url>     a second repository the build needs, cloned next to
+                            the checkout as <dir> and pulled before each build
+                            ("none" drops it)
+      --with-branch <name>  its branch (default: its default branch)
+      --with-dir <name>     its folder name, as the build imports it (default:
+                            the repository name, e.g. ../gvb)
+      --backend <app>       serve /api/ (and uploads under /media/) from this
+                            back-deploy.sh app, e.g. api.example.com ("none"
+                            drops it); the app keeps its own domain too
+      --noindex             X-Robots-Tag: noindex (admin panels); --index undoes it
       --npm-registry <url>  npm registry, e.g. https://registry.npmmirror.com
                             (default: registry.npmjs.org, a mirror when blocked)
   -e, --email <address>     Let's Encrypt account email (default: none)
@@ -658,8 +682,8 @@ print_deploy_key() { # key
 
 # Public repositories are read over HTTPS. Anything else gets its own
 # ed25519 deploy key (GitHub accepts a key on one repository only).
-ensure_repo_access() {
-  local key="${FD_HOME}/keys/${DOMAIN}" candidates=() c ans shown=0
+ensure_repo_access() { # [key name]
+  local key="${FD_HOME}/keys/${1:-$DOMAIN}" candidates=() c ans shown=0
   ensure_build_user
   if [[ $SITE_REPO == http://* || $SITE_REPO == https://* ]]; then
     say "Checking $(mask_url "$SITE_REPO") ..."
@@ -708,6 +732,39 @@ ensure_repo_access() {
   done
 }
 
+# --with-repo: same access rules as the main repository (HTTPS when public, else its own deploy key:
+# GitHub takes a key on one repository only). The main repository's settings are kept aside meanwhile.
+resolve_with_repo() {
+  if [[ $OPT_WITH_REPO == none ]]; then
+    SITE_WITH_REPO="" SITE_WITH_BRANCH="" SITE_WITH_KEY="" SITE_WITH_DIR=""
+    return 0
+  fi
+  if [[ -z $OPT_WITH_REPO ]]; then
+    [[ -n $OPT_WITH_BRANCH && -n $SITE_WITH_REPO ]] && SITE_WITH_BRANCH=$OPT_WITH_BRANCH
+    return 0
+  fi
+  local repo=$SITE_REPO key=$SITE_KEY host=$REPO_HOST path=$REPO_PATH head=$REMOTE_HEAD src=$OPT_WITH_REPO out
+  if [[ $src != *://* && $src != *@*:* && $src =~ ^[A-Za-z0-9.-]+\.[A-Za-z]{2,}/ ]]; then
+    src="https://${src}"
+  fi
+  parse_repo_url "$src" || die "--with-repo: '$(mask_url "$src")' is not a git URL."
+  SITE_REPO=$src
+  REMOTE_HEAD=""
+  ensure_repo_access "${DOMAIN}--with"
+  SITE_WITH_REPO=$SITE_REPO
+  SITE_WITH_KEY=$SITE_KEY
+  SITE_WITH_DIR=${OPT_WITH_DIR:-${REPO_PATH##*/}}
+  SITE_WITH_BRANCH=${OPT_WITH_BRANCH:-${REMOTE_HEAD:-main}}
+  SITE_REPO=$repo SITE_KEY=$key REPO_HOST=$host REPO_PATH=$path REMOTE_HEAD=$head
+  [[ $SITE_WITH_DIR =~ ^[A-Za-z0-9._-]+$ && ! $SITE_WITH_DIR =~ ^(\.|\.\.|repo|releases|meta|shared|current)$ ]] \
+    || die "--with-dir: '${SITE_WITH_DIR}' is not a usable folder name."
+  [[ $SITE_WITH_BRANCH =~ ^[A-Za-z0-9._/-]+$ ]] || die "Invalid --with-branch '${SITE_WITH_BRANCH}'."
+  out=$(as_builder "$SITE_WITH_KEY" timeout 60 git ls-remote --heads -- "$SITE_WITH_REPO" "refs/heads/${SITE_WITH_BRANCH}" 2> /dev/null) || true
+  [[ -n $out ]] || die "Branch '${SITE_WITH_BRANCH}' does not exist in $(mask_url "$SITE_WITH_REPO")."
+  rm -rf "${WWW_ROOT}/${DOMAIN}/${SITE_WITH_DIR}" # a fresh clone at the next build
+  say "Also cloned for the build: $(mask_url "$SITE_WITH_REPO") (${SITE_WITH_BRANCH}) as ../${SITE_WITH_DIR}"
+}
+
 resolve_branch() {
   local def=${OPT_BRANCH:-${SITE_BRANCH:-${REMOTE_HEAD:-main}}}
   if [[ -n $OPT_BRANCH || ! -t 0 ]]; then
@@ -735,6 +792,14 @@ apply_options() {
   [[ -n $OPT_EMAIL ]] && SITE_EMAIL=$OPT_EMAIL
   [[ -n $OPT_TLS_PORT ]] && SITE_TLS_PORT=$OPT_TLS_PORT
   [[ -n $OPT_KEEP ]] && SITE_KEEP=$OPT_KEEP
+  [[ -n $OPT_NOINDEX ]] && SITE_NOINDEX=$OPT_NOINDEX
+  if [[ $OPT_BACKEND == none ]]; then
+    SITE_BACKEND=""
+  elif [[ -n $OPT_BACKEND ]]; then
+    [[ -r ${BD_APPS_DIR}/${OPT_BACKEND}.conf ]] \
+      || die "--backend: no back-deploy.sh app '${OPT_BACKEND}' (${BD_APPS_DIR}/${OPT_BACKEND}.conf). Deploy it first, then re-run."
+    SITE_BACKEND=$OPT_BACKEND
+  fi
   SITE_DOMAIN=$DOMAIN
   SITE_STAGING=$STAGING
   : "${SITE_TLS_PORT:=10444}" "${SITE_KEEP:=5}" "${SITE_WWW:=0}"
@@ -917,6 +982,18 @@ print_summary() {
       printf ' Deploy key  : %s.pub (read-only)\n' "$SITE_KEY"
     fi
     printf ' Build       : %s -> %s\n' "${SITE_APP_DIR:-.}" "${SITE_BUILD_DIR:-?}"
+    if [[ -n $SITE_WITH_REPO ]]; then
+      printf ' Also pulled : %s (%s) as ../%s\n' "$(mask_url "$SITE_WITH_REPO")" "$SITE_WITH_BRANCH" "$SITE_WITH_DIR"
+      if [[ -n $SITE_WITH_KEY ]]; then
+        printf ' Its key     : %s.pub (read-only)\n' "$SITE_WITH_KEY"
+      fi
+    fi
+  fi
+  if [[ -n $SITE_BACKEND ]]; then
+    printf ' /api/       : the back-deploy.sh app %s (its uploads under /media/ too)\n' "$SITE_BACKEND"
+  fi
+  if [[ $SITE_NOINDEX == 1 ]]; then
+    printf ' Search      : noindex, nofollow\n'
   fi
   printf ' Release     : %s\n' "${live##*/}"
   printf ' Build env   : %s/shared/.env%s\n' "$root" "$([[ -s ${root}/shared/.env ]] || printf ' (none yet)')"
@@ -1011,6 +1088,34 @@ parse_args() {
         OPT_KEEP="$2"
         shift 2
         ;;
+      --with-repo)
+        (($# >= 2)) || die "Option $1 needs a value."
+        OPT_WITH_REPO="$2"
+        shift 2
+        ;;
+      --with-branch)
+        (($# >= 2)) || die "Option $1 needs a value."
+        OPT_WITH_BRANCH="$2"
+        shift 2
+        ;;
+      --with-dir)
+        (($# >= 2)) || die "Option $1 needs a value."
+        OPT_WITH_DIR="$2"
+        shift 2
+        ;;
+      --backend)
+        (($# >= 2)) || die "Option $1 needs a value."
+        OPT_BACKEND="$2"
+        shift 2
+        ;;
+      --noindex)
+        OPT_NOINDEX=1
+        shift
+        ;;
+      --index)
+        OPT_NOINDEX=0
+        shift
+        ;;
       --no-www)
         NO_WWW=1
         shift
@@ -1077,6 +1182,7 @@ install_all() {
   if [[ $SITE_SOURCE == git ]]; then
     ensure_repo_access
     resolve_branch
+    resolve_with_repo
     ensure_swap
   fi
   prepare_site_dirs

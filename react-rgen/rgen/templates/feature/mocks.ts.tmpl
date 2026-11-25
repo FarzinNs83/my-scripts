@@ -1,0 +1,48 @@
+import { delay, http, HttpResponse } from 'msw'
+import { apiUrl, createTable } from '@/mocks/utils'
+import { ENDPOINT } from './api'
+import type { {{ n.pascal }}, {{ n.pascal }}Input } from './types'
+
+const table = createTable<{{ n.pascal }}>(
+  Array.from({ length: {{ seed_count }} }, (_, index) => {
+    const i = index + 1
+    return {
+      id: i,
+      {{ seed }}
+    }
+  }),
+)
+
+const url = apiUrl(ENDPOINT)
+const notFound = () => HttpResponse.json({ message: '{{ n.title }} not found' }, { status: 404 })
+
+/** Fake {{ p.title.lower() }} API (in memory). Registered in src/mocks/handlers.ts. */
+export const {{ n.camel }}Handlers = [
+  http.get(url, async ({ request }) => {
+    await delay()
+    const result = table.query(new URL(request.url))
+{% if paginated %}
+    return HttpResponse.json({ items: result.items, total: result.total, page: result.page, pageSize: result.pageSize })
+{% else %}
+    return HttpResponse.json(result.filtered)
+{% endif %}
+  }),
+  http.get(`${url}/:id`, async ({ params }) => {
+    await delay()
+    const item = table.find(params.id)
+    return item ? HttpResponse.json(item) : notFound()
+  }),
+  http.post(url, async ({ request }) => {
+    await delay()
+    return HttpResponse.json(table.insert((await request.json()) as {{ n.pascal }}Input), { status: 201 })
+  }),
+  http.patch(`${url}/:id`, async ({ params, request }) => {
+    await delay()
+    const item = table.update(params.id, (await request.json()) as Partial<{{ n.pascal }}>)
+    return item ? HttpResponse.json(item) : notFound()
+  }),
+  http.delete(`${url}/:id`, async ({ params }) => {
+    await delay()
+    return table.remove(params.id) ? new HttpResponse(null, { status: 204 }) : notFound()
+  }),
+]

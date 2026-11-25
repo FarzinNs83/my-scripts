@@ -1,0 +1,10 @@
+import type { AxiosRequestConfig } from 'axios'
+import { apiClient } from '@/lib/api-client'
+import type { ApiError } from '@/lib/api-error'
+
+/** orval's generated hooks call the app's apiClient (auth header, token refresh, ApiError). */
+export const customInstance = <T>(config: AxiosRequestConfig, options?: AxiosRequestConfig): Promise<T> =>
+  apiClient({ ...config, ...options }).then((response) => response.data as T)
+
+export type ErrorType<E> = ApiError & { data?: E }
+export type BodyType<B> = B

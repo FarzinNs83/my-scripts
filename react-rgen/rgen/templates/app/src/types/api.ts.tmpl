@@ -1,0 +1,12 @@
+export type Id = string | number
+
+/** Query string for list endpoints: ?page=1&search=foo */
+export type ListParams = Record<string, string | number | boolean | undefined>
+
+/** A paged list response. Change it to match your API. */
+export type Paginated<T> = {
+  items: T[]
+  total: number
+  page: number
+  pageSize: number
+}

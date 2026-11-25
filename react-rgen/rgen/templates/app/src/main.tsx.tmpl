@@ -1,0 +1,40 @@
+import { StrictMode } from 'react'
+import { createRoot } from 'react-dom/client'
+import { RouterProvider } from 'react-router'
+import { AppProviders } from '@/app/providers'
+import { router } from '@/app/router'
+{% if mocks %}
+import { env } from '@/lib/env'
+{% endif %}
+{% if i18n %}
+import '@/lib/i18n'
+{% endif %}
+import './index.css'
+{% if mocks %}
+
+/** With VITE_MOCK_API=true the fake API in src/mocks answers requests (no backend needed). */
+async function enableMocking() {
+  if (!env.VITE_MOCK_API) return
+  const { worker } = await import('@/mocks/browser')
+  await worker.start({ onUnhandledFrame: 'bypass', quiet: true })
+}
+
+enableMocking().then(() => {
+  createRoot(document.getElementById('root')!).render(
+    <StrictMode>
+      <AppProviders>
+        <RouterProvider router={router} />
+      </AppProviders>
+    </StrictMode>,
+  )
+})
+{% else %}
+
+createRoot(document.getElementById('root')!).render(
+  <StrictMode>
+    <AppProviders>
+      <RouterProvider router={router} />
+    </AppProviders>
+  </StrictMode>,
+)
+{% endif %}

@@ -1,0 +1,53 @@
+import js from '@eslint/js'
+import reactHooks from 'eslint-plugin-react-hooks'
+import reactRefresh from 'eslint-plugin-react-refresh'
+import { defineConfig, globalIgnores } from 'eslint/config'
+import globals from 'globals'
+import tseslint from 'typescript-eslint'
+
+export default defineConfig([
+  globalIgnores(['dist', 'public', 'src/api/generated']),
+  {
+    files: ['**/*.{ts,tsx}'],
+    extends: [
+      js.configs.recommended,
+      tseslint.configs.recommended,
+      reactHooks.configs.flat.recommended,
+      reactRefresh.configs.vite,
+    ],
+    languageOptions: {
+      ecmaVersion: 2022,
+      globals: globals.browser,
+    },
+  },
+  {
+    // shadcn and generated files export helpers next to components
+    files: [
+      'src/components/ui/**',
+      'src/components/bits/**',
+      'src/components/theme-provider.tsx',
+      'src/**/*-form.tsx',
+      'src/test/**',
+    ],
+    rules: { 'react-refresh/only-export-components': 'off' },
+  },
+  {
+    // vendored components (shadcn, React Bits, other registries): the strict React Compiler rules
+    // flag patterns that work fine in them, and the code is not yours to rewrite
+    files: ['src/components/ui/**', 'src/components/bits/**', 'src/hooks/use-mobile.ts'],
+    rules: {
+      'react-hooks/exhaustive-deps': 'off',
+      'react-hooks/globals': 'off',
+      'react-hooks/immutability': 'off',
+      'react-hooks/incompatible-library': 'off',
+      'react-hooks/preserve-manual-memoization': 'off',
+      'react-hooks/purity': 'off',
+      'react-hooks/refs': 'off',
+      'react-hooks/set-state-in-effect': 'off',
+      'react-hooks/set-state-in-render': 'off',
+      'react-hooks/static-components': 'off',
+      'react-hooks/unsupported-syntax': 'off',
+      'react-hooks/use-memo': 'off',
+    },
+  },
+])

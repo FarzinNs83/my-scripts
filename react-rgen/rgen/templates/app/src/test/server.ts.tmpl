@@ -1,0 +1,5 @@
+import { setupServer } from 'msw/node'
+import { handlers } from '@/mocks/handlers'
+
+/** The same fake API as 'npm run dev'. Override one endpoint in a test with server.use(http.get(...)). */
+export const server = setupServer(...handlers)

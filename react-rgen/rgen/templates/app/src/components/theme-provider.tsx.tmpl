@@ -1,0 +1,49 @@
+import { createContext, useContext, useEffect, useState, type ReactNode } from 'react'
+
+export type Theme = 'dark' | 'light' | 'system'
+
+type ThemeState = { theme: Theme; setTheme: (theme: Theme) => void }
+
+const ThemeContext = createContext<ThemeState>({ theme: 'system', setTheme: () => undefined })
+
+const STORAGE_KEY = 'theme'
+
+function readTheme(fallback: Theme): Theme {
+  try {
+    return (localStorage.getItem(STORAGE_KEY) as Theme | null) ?? fallback
+  } catch {
+    return fallback
+  }
+}
+
+export function ThemeProvider({ children, defaultTheme = 'system' }: { children: ReactNode; defaultTheme?: Theme }) {
+  const [theme, setThemeState] = useState<Theme>(() => readTheme(defaultTheme))
+
+  useEffect(() => {
+    const root = document.documentElement
+    const media = window.matchMedia('(prefers-color-scheme: dark)')
+    const apply = () => {
+      const resolved = theme === 'system' ? (media.matches ? 'dark' : 'light') : theme
+      root.classList.remove('light', 'dark')
+      root.classList.add(resolved)
+    }
+    apply()
+    if (theme !== 'system') return
+    media.addEventListener('change', apply)
+    return () => media.removeEventListener('change', apply)
+  }, [theme])
+
+  const setTheme = (next: Theme) => {
+    try {
+      localStorage.setItem(STORAGE_KEY, next)
+    } catch {
+      // storage blocked: keep the theme for this visit only
+    }
+    setThemeState(next)
+  }
+
+  const value = { theme, setTheme }
+  return <ThemeContext.Provider value={value}>{children}</ThemeContext.Provider>
+}
+
+export const useTheme = () => useContext(ThemeContext)

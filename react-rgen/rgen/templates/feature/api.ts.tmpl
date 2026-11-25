@@ -1,0 +1,29 @@
+import { apiClient } from '@/lib/api-client'
+{% if paginated %}
+import type { Id, ListParams, Paginated } from '@/types/api'
+{% else %}
+import type { Id, ListParams } from '@/types/api'
+{% endif %}
+import type { {{ n.pascal }}, {{ n.pascal }}Input } from './types'
+
+export const ENDPOINT = '{{ endpoint }}'
+
+{% if paginated %}
+/** REST calls for {{ p.title.lower() }}. list() sends ?page&pageSize&q and expects Paginated<T> (src/types/api.ts). */
+{% else %}
+/** REST calls for {{ p.title.lower() }}. A paged API: rgen feature {{ n.kebab }} --paginated -f */
+{% endif %}
+export const {{ n.camel }}Api = {
+{% if paginated %}
+  list: async (params?: ListParams) => (await apiClient.get<Paginated<{{ n.pascal }}>>(ENDPOINT, { params })).data,
+{% else %}
+  list: async (params?: ListParams) => (await apiClient.get<{{ n.pascal }}[]>(ENDPOINT, { params })).data,
+{% endif %}
+  get: async (id: Id) => (await apiClient.get<{{ n.pascal }}>(`${ENDPOINT}/${id}`)).data,
+  create: async (input: {{ n.pascal }}Input) => (await apiClient.post<{{ n.pascal }}>(ENDPOINT, input)).data,
+  update: async (id: Id, input: Partial<{{ n.pascal }}Input>) =>
+    (await apiClient.patch<{{ n.pascal }}>(`${ENDPOINT}/${id}`, input)).data,
+  remove: async (id: Id) => {
+    await apiClient.delete(`${ENDPOINT}/${id}`)
+  },
+}

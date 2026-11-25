@@ -1,0 +1,9 @@
+import { cn } from '@/lib/utils'
+
+export type {{ n.pascal }}Props = {
+  className?: string
+}
+
+export function {{ n.pascal }}({ className }: {{ n.pascal }}Props) {
+  return <div className={cn('', className)}>{{ n.title }}</div>
+}

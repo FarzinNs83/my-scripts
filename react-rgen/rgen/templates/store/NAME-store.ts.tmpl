@@ -1,0 +1,35 @@
+import { create } from 'zustand'
+{% if persist %}
+import { persist } from 'zustand/middleware'
+{% endif %}
+
+type {{ n.pascal }}State = {
+  items: string[]
+  add: (item: string) => void
+  remove: (item: string) => void
+  reset: () => void
+}
+
+const initialState = { items: [] as string[] }
+
+/** Use with a selector so components re-render only for what they read: use{{ n.pascal }}Store((s) => s.items) */
+export const use{{ n.pascal }}Store = create<{{ n.pascal }}State>()(
+{% if persist %}
+  persist(
+    (set) => ({
+      ...initialState,
+      add: (item) => set((s) => ({ items: [...s.items, item] })),
+      remove: (item) => set((s) => ({ items: s.items.filter((x) => x !== item) })),
+      reset: () => set(initialState),
+    }),
+    { name: '{{ n.kebab }}' },
+  ),
+{% else %}
+  (set) => ({
+    ...initialState,
+    add: (item) => set((s) => ({ items: [...s.items, item] })),
+    remove: (item) => set((s) => ({ items: s.items.filter((x) => x !== item) })),
+    reset: () => set(initialState),
+  }),
+{% endif %}
+)

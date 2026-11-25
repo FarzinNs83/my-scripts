@@ -1,0 +1,11 @@
+import type { RequestHandler } from 'msw'
+// rgen:mock-imports
+
+/**
+ * Fake API used by 'npm run dev' when VITE_MOCK_API=true (.env.development) and by the tests.
+ * Each feature keeps its handlers in src/features/<name>/mocks.ts. Requests without a handler
+ * go to the real API.
+ */
+export const handlers: RequestHandler[] = [
+  // rgen:mock-handlers
+]

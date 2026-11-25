@@ -1,0 +1,10 @@
+/** Every route path in one place: use paths.x in <Link to> and navigate() instead of strings. */
+export const paths = {
+  home: '/',
+  // rgen:paths
+} as const
+
+/** Fills ':param' segments: href(paths.productDetail, { id: 5 }) -> '/products/5' */
+export function href(path: string, params: Record<string, string | number> = {}): string {
+  return path.replace(/:(\w+)/g, (_, key: string) => encodeURIComponent(String(params[key] ?? '')))
+}

@@ -12,7 +12,7 @@
 #       timeouts, large uploads)
 #    5. gets a Let's Encrypt certificate (HTTP-01, webroot) with auto-renewal
 #    6. installs `n8nctl` (a symlink to this script) for status, logs, update,
-#       backup and uninstall, then prints the login link
+#       backup, restore and uninstall, then prints the login link
 #
 #  Local mode (--local, or Enter at the domain prompt): n8n on this machine
 #  only -- WSL or your own Linux. No domain, nginx or certificate: steps 2, 3
@@ -40,7 +40,7 @@ export LC_ALL=C
 export DEBIAN_FRONTEND=noninteractive
 export NEEDRESTART_MODE=a
 
-SCRIPT_VERSION="1.1.0"
+SCRIPT_VERSION="1.2.0"
 
 # ---------------------------------------------------------------------------
 # Paths (all overridable from the environment for testing)
@@ -137,6 +137,9 @@ Commands (same as n8nctl):
   restart             restart the containers
   update [<tag>]      back up, pull the image (optionally a new tag) and restart
   backup              archive data, .env and the database to /root/n8n-backups
+  restore <archive> [--check | --yes] [--tag <tag>]
+                      validate or restore a trusted backup (same database type)
+                      optionally restore with a specific n8n image tag
   renew               force a certificate renewal and reload nginx
   nginx               re-render the nginx site (:443, or behind the dns-setup.sh
                       relay when it is installed); dns-setup.sh calls this
@@ -628,7 +631,7 @@ start_docker() {
   if has_systemd; then
     systemctl start docker || die "The Docker service does not start (journalctl -u docker)."
   else
-    service docker start > /dev/null 2>&1 \
+    service docker start 9>&- > /dev/null 2>&1 \
       || die "Docker does not start. On WSL, enable systemd ([boot] systemd=true in /etc/wsl.conf, then 'wsl --shutdown') or use Docker Desktop's WSL integration."
   fi
   local i
@@ -750,6 +753,8 @@ prepare_settings() {
 }
 
 write_env() {
+  [[ $ENCRYPTION_KEY != *"'"* && $ENCRYPTION_KEY != *\\* && $ENCRYPTION_KEY != *$'\n'* && $ENCRYPTION_KEY != *$'\r'* ]] \
+    || die "The encryption key cannot be represented safely in .env."
   install -d -m 700 "$N8N_DIR"
   local tmp
   tmp=$(mktemp)
@@ -762,7 +767,7 @@ write_env() {
     printf 'N8N_TAG=%s\n' "$IMAGE_TAG"
     printf 'N8N_TZ=%s\n' "$TIMEZONE"
     printf 'N8N_LOCAL_PORT=%s\n' "$LOCAL_PORT"
-    printf 'N8N_ENCRYPTION_KEY=%s\n' "$ENCRYPTION_KEY"
+    printf "N8N_ENCRYPTION_KEY='%s'\n" "$ENCRYPTION_KEY"
     if [[ $DB_TYPE == postgres ]]; then
       printf 'N8N_POSTGRES_PASSWORD=%s\n' "$POSTGRES_PASSWORD"
     fi
@@ -1286,7 +1291,7 @@ print_summary() {
   printf '%s\n' '--------------------------------------------------------------'
   printf ' Back up N8N_ENCRYPTION_KEY from %s: saved\n' "$ENV_FILE"
   printf ' credentials cannot be decrypted without it.\n\n'
-  printf ' n8nctl status | logs | restart | update | backup | uninstall\n'
+  printf ' n8nctl status | logs | restart | update | backup | restore | uninstall\n'
   printf '==============================================================\n'
 }
 
@@ -1498,6 +1503,7 @@ install_all() {
 load_installed() {
   load_env || die "No install found (${ENV_FILE} is missing); run the installer first."
   DOMAIN="${N8N_DOMAIN:-}"
+  LOCAL=0
   [[ -n $DOMAIN ]] || LOCAL=1
   IMAGE_REF="${N8N_SETUP_IMAGE:-${N8N_IMAGE:-$DEFAULT_IMAGE}}"
   IMAGE_TAG="${N8N_SETUP_TAG:-${N8N_TAG:-latest}}"
@@ -1576,52 +1582,274 @@ cmd_restart() {
   say "n8n restarted: $(n8n_version)"
 }
 
-cmd_backup() {
+cmd_backup() (
   load_installed
+  [[ $BACKUP_KEEP =~ ^[1-9][0-9]*$ ]] || die "NS_BACKUP_KEEP must be a positive integer."
   install -d -m 700 "$BACKUP_DIR"
-  local stamp out tmp rc=0
-  stamp=$(date +%Y%m%d-%H%M%S)
+  local stamp out tmp running restart=0
+  stamp=$(date +%Y%m%d-%H%M%S-%N)
   out="${BACKUP_DIR}/n8n-${stamp}.tar.gz"
-  tmp=$(mktemp -d)
+  tmp=$(mktemp -d "${BACKUP_DIR}/.backup.XXXXXX")
+  trap 'if ((restart)); then compose start n8n || warn "Could not restart n8n after the backup."; fi; rm -rf -- "$tmp"' EXIT
+  trap 'exit 130' INT
+  trap 'exit 143' TERM
 
+  running=$(compose ps --services --filter status=running) || die "Could not check which containers are running."
+  if [[ $'\n'${running}$'\n' == *$'\nn8n\n'* ]]; then
+    say "Stopping n8n while saving its database and files ..."
+    restart=1
+    compose stop n8n || die "Could not stop n8n for the backup."
+  fi
   if [[ $DB_TYPE == postgres ]]; then
     say "Dumping the Postgres database ..."
-    docker exec n8n-postgres pg_dump -U n8n -d n8n --no-owner > "${tmp}/postgres.sql" \
-      || { rm -rf "$tmp"; die "pg_dump failed."; }
-    tar -czf "$out" -C "$N8N_DIR" .env docker-compose.yml data files \
-      -C "$tmp" postgres.sql || rc=$?
+    if ! grep -Fxq postgres <<< "$running"; then
+      die "PostgreSQL is stopped. Run n8nctl restart before making a backup."
+    fi
+    compose exec -T postgres pg_dump -U n8n -d n8n --no-owner > "${tmp}/postgres.sql" \
+      || die "pg_dump failed."
+    tar -czf "${tmp}/archive" -C "$N8N_DIR" .env docker-compose.yml data files \
+      -C "$(realpath -- "$tmp")" postgres.sql || die "Backup failed (tar)."
   else
-    # SQLite: stop n8n for a consistent copy of database.sqlite
-    say "Stopping n8n for a consistent SQLite copy ..."
-    compose stop n8n > /dev/null 2>&1 || true
-    tar -czf "$out" -C "$N8N_DIR" .env docker-compose.yml data files || rc=$?
-    compose start n8n > /dev/null 2>&1 || true
+    tar -czf "${tmp}/archive" -C "$N8N_DIR" .env docker-compose.yml data files \
+      || die "Backup failed (tar)."
   fi
-  rm -rf "$tmp"
-  if ((rc != 0)); then
-    rm -f "$out"
-    die "Backup failed (tar exit ${rc})."
+  chmod 600 "${tmp}/archive"
+  mv -T -- "${tmp}/archive" "$out"
+  if ((restart)); then
+    compose start n8n || die "Could not restart n8n. The backup was written to ${out}."
+    restart=0
+    wait_n8n 90 || warn "n8n did not come back after the backup (n8nctl logs)."
   fi
-  chmod 600 "$out"
 
   local old
   while IFS= read -r old; do
     rm -f "$old"
   done < <(ls -1t "$BACKUP_DIR"/n8n-*.tar.gz 2> /dev/null | tail -n +"$((BACKUP_KEEP + 1))")
 
-  if [[ $DB_TYPE != postgres ]]; then
-    wait_n8n 90 || warn "n8n did not come back after the backup (n8nctl logs)."
-  fi
   say "Backup written: ${out} ($(du -h "$out" | awk '{print $1}'))"
-  say "Restore: stop n8n, extract into ${N8N_DIR}, then n8nctl restart"
+  say "Restore: n8nctl restore ${out}"
+)
+
+extract_backup() {
+  python3 - "$1" "$2" <<'PY'
+import gzip
+import re
+import shutil
+import sqlite3
+import sys
+import tarfile
+from contextlib import closing
+from pathlib import Path, PurePosixPath
+
+archive, directory = sys.argv[1:]
+destination = Path(directory)
+root_files = {".env", "docker-compose.yml", "postgres.sql"}
+root_dirs = {"data", "files"}
+
+try:
+    with gzip.open(archive, "rb") as compressed, tarfile.open(fileobj=compressed, mode="r|") as backup:
+        seen = set()
+        for member in backup:
+            name = PurePosixPath(member.name)
+            if (not name.parts or name.is_absolute() or ".." in name.parts or "\\" in member.name
+                    or name in seen or not (member.isfile() or member.isdir())):
+                raise ValueError("archive contains an unsafe or duplicate entry")
+            if name.parts[0] not in root_dirs and (str(name) not in root_files or not member.isfile()):
+                raise ValueError("archive contains an unexpected entry")
+            seen.add(name)
+            target = destination.joinpath(*name.parts)
+            if member.isdir():
+                target.mkdir(parents=True, exist_ok=True)
+            else:
+                target.parent.mkdir(parents=True, exist_ok=True)
+                with backup.extractfile(member) as source, target.open("xb") as output:
+                    shutil.copyfileobj(source, output)
+                target.chmod(0o600 | (member.mode & 0o100))
+        # tar ends at its zero blocks; finish reading to verify the gzip footer.
+        while compressed.read(1024 * 1024):
+            pass
+
+    if not all((destination / name).is_dir() for name in root_dirs):
+        raise ValueError("archive is missing data/ or files/")
+    if not all((destination / name).is_file() for name in (".env", "docker-compose.yml")):
+        raise ValueError("archive is missing .env or docker-compose.yml")
+    env = (destination / ".env").read_text(encoding="utf-8")
+    keys = re.findall(r"^N8N_ENCRYPTION_KEY=([^\r\n]+)$", env, re.M)
+    db = re.findall(r"^N8N_SETUP_DB=(sqlite|postgres)$", env, re.M)
+    if len(keys) != 1 or len(db) != 1:
+        raise ValueError("archive has an invalid database type or encryption key")
+    key = keys[0]
+    if key.startswith("'") and key.endswith("'"):
+        key = key[1:-1]
+    if not key or any(character in key for character in "'\\\x00"):
+        raise ValueError("archive contains an unsupported encryption key")
+    (destination / "restore-key").write_text(key, encoding="utf-8")
+    dump = destination / "postgres.sql"
+    if db[0] == "postgres":
+        if not dump.is_file():
+            raise ValueError("archive is missing the PostgreSQL dump")
+        with dump.open("rb") as sql:
+            if b"-- PostgreSQL database dump" not in sql.read(4096):
+                raise ValueError("archive does not contain a plain PostgreSQL dump")
+            sql.seek(max(0, dump.stat().st_size - 4096))
+            if b"-- PostgreSQL database dump complete" not in sql.read():
+                raise ValueError("the PostgreSQL dump is incomplete")
+    else:
+        if dump.exists():
+            raise ValueError("SQLite archive unexpectedly contains a PostgreSQL dump")
+        sqlite = destination / "data" / "database.sqlite"
+        with closing(sqlite3.connect(sqlite.resolve().as_uri() + "?mode=ro", uri=True)) as connection:
+            if connection.execute("PRAGMA quick_check").fetchall() != [("ok",)]:
+                raise ValueError("SQLite integrity check failed")
+    print(db[0])
+except (OSError, ValueError, EOFError, sqlite3.Error, tarfile.TarError) as error:
+    sys.exit(f"Invalid n8n backup: {error}")
+PY
 }
+
+rollback_restore() {
+  local stage=$1 postgres_created=$2 item
+  shift 2
+  compose down --remove-orphans || return 1
+  if ((postgres_created)) && [[ ! -e ${stage}/previous/postgres && -e ${N8N_DIR}/postgres ]]; then
+    mv -T -- "${N8N_DIR}/postgres" "${stage}/rejected/postgres" || return 1
+  fi
+  for item in .env data files postgres; do
+    [[ -e ${stage}/previous/${item} ]] || continue
+    if [[ -e ${N8N_DIR}/${item} ]]; then
+      mv -T -- "${N8N_DIR}/${item}" "${stage}/rejected/${item}" || return 1
+    fi
+    mv -T -- "${stage}/previous/${item}" "${N8N_DIR}/${item}" || return 1
+  done
+  if (($#)); then
+    compose up -d "$@" || return 1
+  fi
+}
+
+restore_cleanup() {
+  local code=$? stage=$1 changing=$2 postgres_created=$3
+  shift 3
+  if ((changing)); then
+    warn "Restore interrupted or failed. Putting the previous installation back ..."
+    if ! rollback_restore "$stage" "$postgres_created" "$@"; then
+      warn "Automatic rollback failed. Recovery files are in ${stage}."
+      return 1
+    fi
+    warn "Previous files and container state restored. Check n8nctl status."
+  fi
+  rm -rf -- "$stage"
+  return "$code"
+}
+
+cmd_restore() (
+  local archive="" check=0 yes=0 tag="" stage backup_db key answer running item attempt
+  local changing=0 postgres_created=0 services=() items=(.env data files)
+  while (($#)); do
+    case "$1" in
+      --check) check=1 ;;
+      --yes) yes=1 ;;
+      --tag)
+        [[ ${2-} =~ ^[A-Za-z0-9_][A-Za-z0-9_.-]{0,127}$ ]] || die "Give --tag a valid image tag."
+        tag=$2
+        shift ;;
+      -*) die "Unknown restore option: $1" ;;
+      *) [[ -z $archive ]] || die "Pass one backup archive."; archive=$1 ;;
+    esac
+    shift
+  done
+  if ((check)) && { ((yes)) || [[ -n $tag ]]; }; then
+    die "Use --check on its own."
+  fi
+  [[ -f $archive && -r $archive ]] || die "Usage: n8nctl restore <archive> [--check | --yes] [--tag <tag>]"
+  umask 077
+  if ((check)); then
+    stage=$(mktemp -d)
+  else
+    lock_n8n
+    [[ -f $ENV_FILE && -f $COMPOSE_FILE ]] || die "Set up n8n on the destination before restoring."
+    stage=$(mktemp -d "${N8N_DIR}/.restore.XXXXXX")
+  fi
+  trap 'restore_cleanup "$stage" "$changing" "$postgres_created" "${services[@]}"' EXIT
+  trap 'exit 130' INT
+  trap 'exit 143' TERM
+  mkdir -- "${stage}/incoming" "${stage}/previous" "${stage}/rejected"
+  backup_db=$(extract_backup "$archive" "${stage}/incoming") || die "Could not validate the backup."
+  say "Backup validated (${backup_db})."
+  ((check == 0)) || return 0
+
+  load_installed
+  [[ $backup_db == "$DB_TYPE" ]] || die "Destination uses ${DB_TYPE}; set it up with ${backup_db} before restoring."
+  if [[ $DB_TYPE == postgres && ( -e ${N8N_DIR}/postgres || -L ${N8N_DIR}/postgres ) ]]; then
+    items+=(postgres)
+  fi
+  for item in "${items[@]}"; do
+    [[ -e ${N8N_DIR}/${item} && ! -L ${N8N_DIR}/${item} ]] || die "Expected an existing ${N8N_DIR}/${item}."
+  done
+  say "Restore replaces n8n data, files and encryption key at $(base_url)."
+  say "Active workflows in the backup can run again when n8n starts."
+  if ((yes == 0)); then
+    [[ -t 0 ]] || die "For a non-interactive restore, pass --yes."
+    read -r -p 'Type yes to restore: ' answer || true
+    [[ $answer == yes ]] || die "Aborted."
+  fi
+
+  key=$(< "${stage}/incoming/restore-key")
+  if [[ -n $tag ]]; then
+    awk '!/^(N8N_ENCRYPTION_KEY|N8N_TAG|N8N_SETUP_TAG)=/' "$ENV_FILE" > "${stage}/env"
+    printf '\nN8N_TAG=%s\nN8N_SETUP_TAG=%s\n' "$tag" "$tag" >> "${stage}/env"
+  else
+    awk '!/^N8N_ENCRYPTION_KEY=/' "$ENV_FILE" > "${stage}/env"
+  fi
+  # A quoted value preserves literal dollar signs for both Bash and Compose.
+  printf "\nN8N_ENCRYPTION_KEY='%s'\n" "$key" >> "${stage}/env"
+  chown -R 1000:1000 "${stage}/incoming/data" "${stage}/incoming/files"
+  start_docker
+  if [[ -n $tag ]] && ! docker image inspect "${IMAGE_REF}:${tag}" > /dev/null 2>&1; then
+    docker pull "${IMAGE_REF}:${tag}" || die "Could not fetch the requested n8n image."
+  fi
+  running=$(compose ps --services --filter status=running) || die "Could not check which containers are running."
+  if [[ -n $running ]]; then
+    mapfile -t services <<< "$running"
+  fi
+
+  changing=1
+  compose down --remove-orphans || die "Could not stop n8n."
+  for item in "${items[@]}"; do
+    mv -T -- "${N8N_DIR}/${item}" "${stage}/previous/${item}"
+  done
+  mv -T -- "${stage}/env" "$ENV_FILE"
+  mv -T -- "${stage}/incoming/data" "${N8N_DIR}/data"
+  mv -T -- "${stage}/incoming/files" "${N8N_DIR}/files"
+
+  if [[ $DB_TYPE == postgres ]]; then
+    postgres_created=1
+    compose up -d postgres || die "Could not start a clean PostgreSQL instance."
+    for ((attempt = 0; attempt < 60; attempt++)); do
+      compose exec -T postgres pg_isready -h 127.0.0.1 -U n8n -d n8n > /dev/null 2>&1 && break
+      sleep 2
+    done
+    ((attempt < 60)) || die "PostgreSQL did not become ready."
+    compose exec -T postgres psql -X -w -U n8n -d n8n --single-transaction \
+      --set ON_ERROR_STOP=1 --file - < "${stage}/incoming/postgres.sql" \
+      || die "Could not import the PostgreSQL dump."
+  fi
+
+  compose up -d --remove-orphans || die "Could not start the restored n8n."
+  wait_n8n 90 || die "The restored n8n did not become healthy."
+  changing=0
+  say "Restore complete. n8n is healthy at $(base_url)"
+  if ((LOCAL == 0)); then
+    verify_https || warn "Local health passed; HTTPS still needs attention (n8nctl status)."
+  fi
+)
 
 cmd_update() {
   local new_tag=${1-} before
   if [[ -n $new_tag && ! $new_tag =~ ^[A-Za-z0-9_.-]+$ ]]; then
     die "Invalid tag '${new_tag}'."
   fi
-  cmd_backup # also loads the install
+  load_installed
+  cmd_backup
   before=$(n8n_version)
   if [[ -n $new_tag ]]; then
     IMAGE_TAG=$new_tag
@@ -1710,6 +1938,11 @@ cmd_uninstall() {
   fi
 }
 
+lock_n8n() {
+  exec 9> "${NS_LOCK_FILE:-/run/lock/n8n-setup.lock}"
+  flock -n 9 || die "Another n8n setup or maintenance command is running."
+}
+
 main() {
   case "${1-}" in
     -h | --help)
@@ -1720,7 +1953,11 @@ main() {
   require_root "$@"
   local cmd=${1-}
   case "$cmd" in
-    status | info | logs | restart | update | backup | renew | nginx | uninstall)
+    status | info | logs | restore) ;;
+    *) lock_n8n ;;
+  esac
+  case "$cmd" in
+    status | info | logs | restart | update | backup | restore | renew | nginx | uninstall)
       shift
       "cmd_${cmd}" "$@"
       ;;
@@ -1732,6 +1969,6 @@ main() {
 
 if [[ ${BASH_SOURCE[0]} == "$0" ]]; then
   # untouched defaults, used to rebuild n8nctl after a piped run
-  PRISTINE_VARS=$(declare -p SCRIPT_VERSION N8N_DIR ENV_FILE COMPOSE_FILE LOG_FILE     BACKUP_DIR BACKUP_KEEP NGINX_CONF ACME_ROOT RENEW_HOOK TLS_DIR DS_STREAM_CONF     SNI_ROUTES_DIR SNI_MAP COMPOSE_PROJECT DEFAULT_IMAGE HUB_IMAGE POSTGRES_IMAGE     DOMAIN EMAIL IMAGE_TAG IMAGE_REF TIMEZONE LOCAL_PORT TLS_PORT MAX_BODY     REGISTRY_MIRROR OWNER_EMAIL OWNER_PASS DB_TYPE LOCAL SKIP_DNS OPEN_FIREWALL SWAP     STAGING WANT_POSTGRES ENCRYPTION_KEY POSTGRES_PASSWORD PUBLIC_IPV4 COMPOSE_BIN     NGINX_RESTART OS_ID OS_CODENAME CERT_FULLCHAIN CERT_PRIVKEY)
+  PRISTINE_VARS=$(declare -p SCRIPT_VERSION N8N_DIR ENV_FILE COMPOSE_FILE LOG_FILE     BACKUP_DIR BACKUP_KEEP NGINX_CONF ACME_ROOT RENEW_HOOK TLS_DIR DS_STREAM_CONF     SNI_ROUTES_DIR SNI_MAP COMPOSE_PROJECT DEFAULT_IMAGE HUB_IMAGE POSTGRES_IMAGE     DOMAIN EMAIL IMAGE_TAG IMAGE_REF TIMEZONE LOCAL_PORT TLS_PORT MAX_BODY     REGISTRY_MIRROR REGISTRY_FALLBACKS OWNER_EMAIL OWNER_PASS DB_TYPE LOCAL SKIP_DNS OPEN_FIREWALL SWAP     STAGING WANT_POSTGRES ENCRYPTION_KEY POSTGRES_PASSWORD PUBLIC_IPV4 COMPOSE_BIN     NGINX_RESTART OS_ID OS_CODENAME CERT_FULLCHAIN CERT_PRIVKEY)
   main "$@"
 fi

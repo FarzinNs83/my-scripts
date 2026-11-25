@@ -49,6 +49,8 @@ TLS_DIR="${FD_TLS_DIR:-/etc/letsencrypt/live}"
 DS_STREAM_CONF="/etc/nginx/stream.d/dns-setup-relay.conf"     # dns-setup.sh owns :443
 SNI_ROUTES_DIR="${FD_SNI_ROUTES_DIR:-/etc/nginx/sni-routes.d}" # included by its SNI map
 FRONT_MOUNT_DIR="${FD_MOUNT_DIR:-/etc/nginx/front-deploy.d}"   # back-deploy.sh paths (/api)
+BD_APPS_DIR="${FD_BD_APPS_DIR:-/etc/back-deploy/apps}"         # --backend: apps of back-deploy.sh
+BD_STATE_ROOT="${BD_STATE_ROOT:-/var/lib/back-deploy}"         # their data (uploads in <id>/media)
 LOCK_DIR="${FD_LOCK_DIR:-/run/lock}"
 
 DEFAULT_NODE=24
@@ -60,7 +62,8 @@ NPM_REGISTRY_FALLBACKS=(https://registry.npmmirror.com https://mirror-npm.runfla
 # Everything front-deploy.sh stores per site in ${SITES_DIR}/<domain>.conf
 SITE_VARS=(SITE_DOMAIN SITE_WWW SITE_SOURCE SITE_REPO SITE_BRANCH SITE_KEY
   SITE_APP_DIR SITE_INSTALL_CMD SITE_BUILD_CMD SITE_BUILD_DIR SITE_NODE
-  SITE_NPM_REGISTRY SITE_EMAIL SITE_STAGING SITE_TLS_PORT SITE_KEEP SITE_CREATED)
+  SITE_NPM_REGISTRY SITE_EMAIL SITE_STAGING SITE_TLS_PORT SITE_KEEP SITE_CREATED
+  SITE_WITH_REPO SITE_WITH_BRANCH SITE_WITH_KEY SITE_WITH_DIR SITE_BACKEND SITE_NOINDEX)
 
 # ---------------------------------------------------------------------------
 # Options
@@ -111,6 +114,9 @@ Update options:
       --dist <path>       publish a ready build instead of building: a folder,
                           .zip or .tar.gz with index.html at the top
   -h, --help              show this help
+
+A site set up with front-deploy.sh --with-repo also pulls that second
+repository before each build; with --backend its /api/ is a back-deploy.sh app.
 
 Build-time variables (VITE_*, REACT_APP_*) go in /var/www/<site>/shared/.env;
 it is copied to .env.production.local before each build. After editing it,
@@ -373,8 +379,9 @@ builder_env() {
     BENV+=(npm_config_registry="$REGISTRY" COREPACK_NPM_REGISTRY="$REGISTRY"
       YARN_REGISTRY="$REGISTRY" YARN_NPM_REGISTRY_SERVER="$REGISTRY")
   fi
-  if [[ -n $SITE_KEY ]]; then
-    BENV+=(GIT_SSH_COMMAND="ssh -i ${SITE_KEY} -o IdentitiesOnly=yes -o BatchMode=yes -o ConnectTimeout=15 -o StrictHostKeyChecking=accept-new -o UserKnownHostsFile=${FD_HOME}/.ssh/known_hosts")
+  local key=${GIT_KEY-$SITE_KEY} # sync_checkout points GIT_KEY at the key of the checkout it syncs
+  if [[ -n $key ]]; then
+    BENV+=(GIT_SSH_COMMAND="ssh -i ${key} -o IdentitiesOnly=yes -o BatchMode=yes -o ConnectTimeout=15 -o StrictHostKeyChecking=accept-new -o UserKnownHostsFile=${FD_HOME}/.ssh/known_hosts")
   fi
   for v in http_proxy https_proxy no_proxy HTTP_PROXY HTTPS_PROXY NO_PROXY; do
     if [[ -n ${!v:-} ]]; then
@@ -487,31 +494,45 @@ pick_registry() {
 # ---------------------------------------------------------------------------
 # Repository
 # ---------------------------------------------------------------------------
-git_sync() {
-  local br=$SITE_BRANCH
-  if [[ -d ${REPO_DIR}/.git ]]; then
-    if [[ $(stat -c %U "$REPO_DIR") != "$BUILD_USER" ]]; then
-      chown -R "${BUILD_USER}:${BUILD_USER}" "$REPO_DIR"
+sync_checkout() { # dir url branch key
+  local dir=$1 url=$2 br=$3
+  GIT_KEY=$4
+  if [[ -d ${dir}/.git ]]; then
+    if [[ $(stat -c %U "$dir") != "$BUILD_USER" ]]; then
+      chown -R "${BUILD_USER}:${BUILD_USER}" "$dir"
     fi
-    say "Fetching ${br} from $(mask_url "$SITE_REPO") ..."
-    as_builder git -C "$REPO_DIR" remote set-url origin "$SITE_REPO"
-    as_builder timeout 600 git -C "$REPO_DIR" fetch -q --depth 1 origin "$br" \
+    say "Fetching ${br} from $(mask_url "$url") ..."
+    as_builder git -C "$dir" remote set-url origin "$url"
+    as_builder timeout 600 git -C "$dir" fetch -q --depth 1 origin "$br" \
       || die "git fetch failed (deploy key removed? branch '${br}' deleted? network?)."
-    as_builder git -C "$REPO_DIR" checkout -q -f -B "$br" FETCH_HEAD
-    as_builder git -C "$REPO_DIR" clean -fdq
+    as_builder git -C "$dir" checkout -q -f -B "$br" FETCH_HEAD
+    as_builder git -C "$dir" clean -fdq
   else
-    rm -rf "$REPO_DIR"
-    install -d -m 750 -o "$BUILD_USER" -g "$BUILD_USER" "$REPO_DIR"
-    say "Cloning $(mask_url "$SITE_REPO") (${br}) ..."
-    as_builder timeout 900 git clone -q --depth 1 --single-branch --branch "$br" -- "$SITE_REPO" "$REPO_DIR" \
+    rm -rf "$dir"
+    install -d -m 750 -o "$BUILD_USER" -g "$BUILD_USER" "$dir"
+    say "Cloning $(mask_url "$url") (${br}) ..."
+    as_builder timeout 900 git clone -q --depth 1 --single-branch --branch "$br" -- "$url" "$dir" \
       || die "git clone failed (repository access? branch '${br}'? network?)."
   fi
+  unset GIT_KEY
+}
+
+git_sync() {
+  local with
+  sync_checkout "$REPO_DIR" "$SITE_REPO" "$SITE_BRANCH" "$SITE_KEY"
   if [[ -f ${REPO_DIR}/.gitmodules ]]; then
     as_builder timeout 600 git -C "$REPO_DIR" submodule update -q --init --recursive --depth 1 \
       || warn "Updating the git submodules failed; building without them."
   fi
   COMMIT=$(as_builder git -C "$REPO_DIR" rev-parse --short=10 HEAD)
   COMMIT_MSG=$(as_builder git -C "$REPO_DIR" log -1 --format=%s | cut -c1-70)
+  # --with-repo: a second repository the build reads from <site root>/<dir> (e.g. a panel that imports the
+  # site's source from ../site); its commit is part of the release name, so a push there rebuilds too
+  if [[ -n $SITE_WITH_REPO ]]; then
+    sync_checkout "${SITE_ROOT}/${SITE_WITH_DIR}" "$SITE_WITH_REPO" "$SITE_WITH_BRANCH" "$SITE_WITH_KEY"
+    with=$(as_builder git -C "${SITE_ROOT}/${SITE_WITH_DIR}" rev-parse --short=7 HEAD)
+    COMMIT="${COMMIT}-${SITE_WITH_DIR}-${with}"
+  fi
 }
 
 # The folder with the frontend's package.json: the repository root, or the
@@ -1150,6 +1171,11 @@ site_body() {
     add_header X-Content-Type-Options "nosniff" always;
     add_header Referrer-Policy "strict-origin-when-cross-origin" always;
     add_header X-Frame-Options "SAMEORIGIN" always;
+EOF
+  if [[ $SITE_NOINDEX == 1 ]]; then
+    printf '    add_header X-Robots-Tag "noindex, nofollow" always;\n'
+  fi
+  cat << EOF
 
     # dotfiles (.env, .git, ...) are never served
     location ~ /\.(?!well-known/) {
@@ -1181,9 +1207,55 @@ site_body() {
 
     # backends of back-deploy.sh under a path of this site (e.g. /api)
     include ${MOUNT_DIR}/*.conf;
+EOF
+  backend_locations
+  cat << EOF
 
     location / {
         try_files \$uri \$uri/ /index.html;
+    }
+EOF
+}
+
+# --backend <app>: this site's /api/ goes to a back-deploy.sh app that already has its own domain (one
+# process, one database), e.g. a panel subdomain that talks to the site's API. /media/ serves this
+# build's own files first and the app's uploads otherwise.
+backend_locations() {
+  [[ -n $SITE_BACKEND ]] || return 0
+  local id=${SITE_BACKEND//./-}
+  if [[ ! -r ${BD_APPS_DIR}/${SITE_BACKEND}.conf ]]; then
+    warn "--backend ${SITE_BACKEND}: no such back-deploy.sh app; /api/ is not served on ${SITE_DOMAIN}."
+    return 0
+  fi
+  id=${id//+/-} # the app's id and upstream, derived the way back-update.sh does (site_id)
+  if ((${#id} > 26)); then
+    id="${id:0:19}-$(printf '%s' "$SITE_BACKEND" | sha256sum | cut -c1-6)"
+  fi
+  cat << EOF
+
+    # /api/ of the back-deploy.sh app ${SITE_BACKEND}
+    location ^~ /api/ {
+        proxy_pass http://bd_${id//-/_};
+        proxy_http_version 1.1;
+        proxy_set_header Connection "";
+        proxy_set_header Host \$host;
+        proxy_set_header X-Real-IP \$remote_addr;
+        proxy_set_header X-Forwarded-For \$proxy_add_x_forwarded_for;
+        proxy_set_header X-Forwarded-Proto \$scheme;
+        proxy_set_header X-Forwarded-Host \$host;
+        client_max_body_size 64m;
+        proxy_connect_timeout 10s;
+        proxy_read_timeout 300s;
+        proxy_send_timeout 300s;
+    }
+    location ^~ /media/ {
+        expires 7d;
+        try_files \$uri @backend_media;
+    }
+    location @backend_media {
+        root ${BD_STATE_ROOT}/${id};
+        add_header X-Content-Type-Options nosniff always;
+        add_header Content-Security-Policy "sandbox; default-src 'none'; img-src 'self'; media-src 'self'; style-src 'unsafe-inline'" always;
     }
 EOF
 }
@@ -1328,6 +1400,10 @@ cmd_remove() {
   if [[ -n $SITE_KEY ]]; then
     rm -f "$SITE_KEY" "${SITE_KEY}.pub"
     say "Also delete the deploy key from the repository settings."
+  fi
+  if [[ -n $SITE_WITH_KEY ]]; then
+    rm -f "$SITE_WITH_KEY" "${SITE_WITH_KEY}.pub"
+    say "Also delete the deploy key of $(mask_url "$SITE_WITH_REPO") from its settings."
   fi
   rm -rf "${WWW_ROOT:?}/${SITE_DOMAIN:?}"
   rm -f "${SITES_DIR}/${SITE_DOMAIN}.conf" "${LOCK_DIR}/front-deploy-${SITE_DOMAIN}.lock"

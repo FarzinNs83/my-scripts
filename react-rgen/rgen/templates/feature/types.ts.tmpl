@@ -1,0 +1,12 @@
+import { z } from 'zod'
+
+/** One {{ n.title.lower() }} as the API returns it. */
+export const {{ n.camel }}Schema = z.object({
+  id: z.union([z.string(), z.number()]),
+  {{ schema_body }}
+})
+export type {{ n.pascal }} = z.infer<typeof {{ n.camel }}Schema>
+
+/** What create and update send (and what the form edits). */
+export const {{ n.camel }}InputSchema = {{ n.camel }}Schema.omit({ id: true })
+export type {{ n.pascal }}Input = z.infer<typeof {{ n.camel }}InputSchema>

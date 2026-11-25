@@ -1,0 +1,28 @@
+import { create } from 'zustand'
+import { persist } from 'zustand/middleware'
+
+export type AuthUser = { id: string | number; name?: string; email?: string; [key: string]: unknown }
+
+type AuthState = {
+  accessToken: string | null
+  refreshToken: string | null
+  user: AuthUser | null
+  setTokens: (accessToken: string, refreshToken?: string | null) => void
+  setUser: (user: AuthUser | null) => void
+  logout: () => void
+}
+
+/** Tokens and the signed-in user, kept in localStorage. Read outside React with useAuthStore.getState(). */
+export const useAuthStore = create<AuthState>()(
+  persist(
+    (set) => ({
+      accessToken: null,
+      refreshToken: null,
+      user: null,
+      setTokens: (accessToken, refreshToken = null) => set({ accessToken, refreshToken }),
+      setUser: (user) => set({ user }),
+      logout: () => set({ accessToken: null, refreshToken: null, user: null }),
+    }),
+    { name: 'auth' },
+  ),
+)

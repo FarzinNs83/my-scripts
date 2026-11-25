@@ -1,0 +1,39 @@
+import { ArrowLeft } from 'lucide-react'
+import { Link, useParams } from 'react-router'
+import { paths } from '@/app/paths'
+import { ErrorState } from '@/components/common/error-state'
+import { PageLoader } from '@/components/common/page-loader'
+import { Button } from '@/components/ui/button'
+import { Card, CardContent, CardHeader, CardTitle } from '@/components/ui/card'
+import { use{{ n.pascal }} } from '../hooks'
+
+export default function {{ n.pascal }}DetailPage() {
+  const { id } = useParams()
+  const { data, isPending, isError, error, refetch } = use{{ n.pascal }}(id)
+
+  return (
+    <div className="space-y-4">
+      <Button variant="ghost" size="sm" asChild>
+        <Link to={paths.{{ p.camel }}}>
+          <ArrowLeft className="rtl:rotate-180" /> {{ p.title }}
+        </Link>
+      </Button>
+      {isPending ? (
+        <PageLoader />
+      ) : isError ? (
+        <ErrorState error={error} onRetry={() => refetch()} />
+      ) : (
+        <Card>
+          <CardHeader>
+            <CardTitle>{{ heading }}</CardTitle>
+          </CardHeader>
+          <CardContent>
+            <dl className="grid gap-x-6 gap-y-3 sm:grid-cols-[max-content_1fr]">
+              {{ rows }}
+            </dl>
+          </CardContent>
+        </Card>
+      )}
+    </div>
+  )
+}

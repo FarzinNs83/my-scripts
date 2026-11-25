@@ -1,6 +1,24 @@
 # my-scripts
 
-Standalone scripts for setting up Linux VPS servers. Run them as root.
+Personal scripts for deploying apps and running services on a Linux VPS,
+plus local generators for Flutter and React projects. Run the server setup
+scripts as root. Use the generators from your development environment.
+
+| Task | Setup | Day-to-day command |
+| --- | --- | --- |
+| Set up a 3x-ui panel and proxy configs | [3xui-setup.sh](#3xui-setupsh) | `x-ui` or re-run the setup script to add configs |
+| Tunnel an Iran server to a kharej server with BackPack | [backpack-setup.sh](#backpack-setupsh) | `backpack tunnel list` / `sudo backpack` |
+| Run AdGuard Home and a DNS relay | [dns-setup.sh](#dns-setupsh) | `dnsctl` |
+| Run n8n on a VPS, Linux desktop or WSL | [n8n-setup.sh](#n8n-setupsh) | `n8nctl` |
+| Deploy a static frontend | [front-deploy.sh](#front-deploysh--front-updatesh) | `front-update` |
+| Deploy a Node.js or Django backend | [back-deploy.sh](#back-deploysh--back-updatesh) | `back-update` |
+| Diagnose a VPS or check download mirrors | [vps-check.sh and mirror-check.sh](#server-and-mirror-checks) | `bash vps-check.sh` / `bash mirror-check.sh` |
+| Scaffold Flutter projects and features | [flutter-fgen](#flutter-fgen) | `fgen` |
+| Scaffold React projects and features | [react-rgen](#react-rgen) | `rgen` |
+| Check app configuration and run pre-push checks | [env-check.py and dev-check.py](#development-checks) | `python env-check.py` / `python dev-check.py` |
+
+See [All three on one VPS](#all-three-on-one-vps) for the DNS, n8n and
+3x-ui port layout.
 
 ## 3xui-setup.sh
 
@@ -18,6 +36,10 @@ Iran / GitHub blocked (ghfast.top mirror):
 ```bash
 bash <(curl -Ls https://ghfast.top/https://raw.githubusercontent.com/FarzinNs83/my-scripts/main/3xui-setup.sh)
 ```
+
+The mirror fetches this script. A fresh install also needs the upstream
+installer and release assets. Set `XUI_INSTALLER_URL` to use a different
+URL for the upstream installer.
 
 Show all options:
 
@@ -229,8 +251,11 @@ bash <(curl -Ls https://raw.githubusercontent.com/FarzinNs83/my-scripts/main/dns
 Iran / GitHub blocked (ghfast.top mirror):
 
 ```bash
-bash <(curl -Ls https://ghfast.top/https://raw.githubusercontent.com/FarzinNs83/my-scripts/main/dns-setup.sh)
+DS_SELF_URL=https://ghfast.top/https://raw.githubusercontent.com/FarzinNs83/my-scripts/main/dns-setup.sh \
+  bash <(curl -fsSL https://ghfast.top/https://raw.githubusercontent.com/FarzinNs83/my-scripts/main/dns-setup.sh)
 ```
+
+`DS_SELF_URL` also sends the download for the installed `dnsctl` through the mirror.
 
 After the install:
 
@@ -356,6 +381,28 @@ n8nctl update 1.2.3    # switch to a specific tag
 n8nctl uninstall       # keeps /opt/n8n; --purge deletes it too
 ```
 
+### Back up and restore n8n
+
+`n8nctl backup` briefly stops n8n so its database and files are copied together.
+The archive includes credentials and the key that decrypts them. Keep it private
+and copy it off the server if you need to recover from a VPS failure.
+
+```bash
+n8nctl restore ./n8n-backup.tar.gz --check   # validate the archive before downtime
+n8nctl restore ./n8n-backup.tar.gz           # prompt, restore and check local health
+n8nctl restore ./n8n-backup.tar.gz --yes --tag 1.2.3  # use the source version's tag
+```
+
+Run the current installer once to refresh an older `n8nctl`. For a move, first set
+up the destination using the same database type as the backup (SQLite by default
+or `--postgres`). Restore replaces the destination's workflows, users, credentials,
+uploaded files and encryption key. It uses the destination's domain, ports and
+image settings, with an optional `--tag` override. Pick the source version when
+recovering from a failed upgrade. Active workflows can resume when n8n starts,
+so stop the old instance before switching over during a move. Use archives you
+made or trust. If the import or local health check fails, the command attempts
+to bring the previous data and containers back.
+
 Show all options:
 
 ```bash
@@ -408,8 +455,11 @@ bash <(curl -Ls https://raw.githubusercontent.com/FarzinNs83/my-scripts/main/fro
 Iran / GitHub blocked (ghfast.top mirror):
 
 ```bash
-bash <(curl -Ls https://ghfast.top/https://raw.githubusercontent.com/FarzinNs83/my-scripts/main/front-deploy.sh)
+FD_UPDATE_URL=https://ghfast.top/https://raw.githubusercontent.com/FarzinNs83/my-scripts/main/front-update.sh \
+  bash <(curl -fsSL https://ghfast.top/https://raw.githubusercontent.com/FarzinNs83/my-scripts/main/front-deploy.sh)
 ```
+
+`FD_UPDATE_URL` sends the `front-update` download through the same mirror.
 
 After the install:
 
@@ -437,6 +487,45 @@ folder, deploy key and Node.js major. `front-update` asks which one to update,
 `--all` updates them one after the other (a failed build does not stop the
 rest), and only one build runs at a time so a small VPS does not run out of
 memory. `front-update list` shows the disk use of each site.
+
+### An admin panel on its own subdomain
+
+For a panel that lives in its own repository but builds against the public
+site's source (it imports `../site/src`) and talks to the same backend:
+
+```bash
+bash front-deploy.sh panel.example.com \
+  --repo https://github.com/me/site-panel \
+  --with-repo https://github.com/me/site --with-dir site \
+  --backend api.example.com \
+  --noindex \
+  --env-file /root/panel.env
+```
+
+- `--with-repo` clones the second repository next to the checkout
+  (`/var/www/<domain>/<dir>`, so `../<dir>` from the build) and pulls it
+  before every build. A push to either repository makes `front-update`
+  rebuild. A private one gets its own read-only deploy key (GitHub takes a
+  key on one repository only); `--with-repo none` drops it.
+- `--backend <app>` serves the panel's `/api/` from a backend already set up
+  with `back-deploy.sh` on its own domain: one process and one database for
+  site and panel. `/media/` serves the panel build's own files first and the
+  backend's uploads otherwise. The backend has to accept the panel's host
+  (Django: `ALLOWED_HOSTS`, `CSRF_TRUSTED_ORIGINS`; for GVB also
+  `PANEL_HOSTS=panel.example.com`, so staff routes answer only there).
+- `--noindex` adds `X-Robots-Tag: noindex, nofollow` (`--index` removes it).
+- The panel's build settings go in its `--env-file`, e.g. for GVB:
+
+  ```
+  VITE_API_URL=/api
+  VITE_SITE_URL=https://example.com
+  PANEL_LOGIN_PATH=/a-long-secret-path
+  ```
+
+  `PANEL_LOGIN_PATH` is the sign-in page's address. Only its hash is in the
+  bundle; every other address, the subdomain's root included, answers with a
+  plain 404 page. Change it in `/var/www/<domain>/shared/.env`, then
+  `front-update --force`.
 
 Show all options:
 
@@ -498,8 +587,11 @@ bash <(curl -Ls https://raw.githubusercontent.com/FarzinNs83/my-scripts/main/bac
 Iran / GitHub blocked (ghfast.top mirror):
 
 ```bash
-bash <(curl -Ls https://ghfast.top/https://raw.githubusercontent.com/FarzinNs83/my-scripts/main/back-deploy.sh)
+BD_UPDATE_URL=https://ghfast.top/https://raw.githubusercontent.com/FarzinNs83/my-scripts/main/back-update.sh \
+  bash <(curl -fsSL https://ghfast.top/https://raw.githubusercontent.com/FarzinNs83/my-scripts/main/back-deploy.sh)
 ```
+
+`BD_UPDATE_URL` sends the `back-update` download through the same mirror.
 
 The app must listen on `process.env.PORT`; behind nginx, Express needs
 `app.set("trust proxy", 1)` for the real client IP.
@@ -575,137 +667,6 @@ binds them on all interfaces, so keep them closed in the firewall, or listen on
 `127.0.0.1`. Next to `dns-setup.sh`, the backends sit behind its relay on
 `127.0.0.1:10445`.
 
-## nfsu2-setup.sh
-
-Installs [nfsu2-web](https://github.com/th0mk/nfsu2-web) (Need for Speed:
-Underground 2 in the browser) on its own VPS. It asks only for the domain:
-
-- installs the packages, wasi-sdk 34, Python (the lifter), Node.js 24 and
-  Rust. Each comes from its own site, or from a mirror when that site is
-  blocked (runflare apt/npm/pypi, npmmirror, rsproxy.cn, GitHub proxies)
-- finds your game folder on the server (`SPEED2.EXE` v1.2 NA, checked by its
-  SHA-256). If the folder isn't there, it shows how to upload it to
-  `/srv/nfsu2/game` and waits. The game is never downloaded: bring your own copy
-- clones the project to `/opt/nfsu2-web` and builds it with its own scripts
-  (`web/gen.sh`, `web/build.sh`, the page and the Rust server). The first
-  build can take an hour, and small VPSes get a 4 GB swap file for it
-- runs the server with the project's systemd unit (`nfsu2-web`) behind nginx,
-  with websockets and a Let's Encrypt certificate that renews automatically
-
-```bash
-bash <(curl -Ls https://raw.githubusercontent.com/FarzinNs83/my-scripts/main/nfsu2-setup.sh)
-```
-
-Iran / GitHub blocked (ghfast.top mirror):
-
-```bash
-bash <(curl -Ls https://ghfast.top/https://raw.githubusercontent.com/FarzinNs83/my-scripts/main/nfsu2-setup.sh)
-```
-
-Run it again to update: it pulls the project, rebuilds what changed and
-restarts the server. Log: `journalctl -u nfsu2-web -f`.
-
-Needs 15 GB of free disk. Ports: TCP 80/443. Anyone who can open the site
-can play and download the game files from it.
-
-## synergy-setup.sh
-
-Synergy (Half-Life 2 co-op) dedicated server on an x86_64 VPS. It asks for
-the server name, password, max players, the start map (a numbered list of
-every chapter of HL2, Episode One and Episode Two, or any map name), the game
-port and your Steam username:
-
-- installs steamcmd and the 32-bit libraries, and creates a `steam` user
-- Steam login: you type your password and Steam Guard code into steamcmd
-  yourself; the login is cached for later runs
-- downloads Synergy (app 17520, free) and Half-Life 2 (app 220, includes both
-  episodes). The account must own Half-Life 2
-- writes `server.cfg` and runs the server as a systemd unit (`synergy`)
-
-```bash
-bash <(curl -Ls https://raw.githubusercontent.com/FarzinNs83/my-scripts/main/synergy-setup.sh)
-```
-
-Iran / GitHub blocked (ghfast.top mirror):
-
-```bash
-bash <(curl -Ls https://ghfast.top/https://raw.githubusercontent.com/FarzinNs83/my-scripts/main/synergy-setup.sh)
-```
-
-The downloads are ~12 GB, so run it inside `screen -S synergy` in case SSH
-drops. If a download stalls, press Ctrl-C and run it again: it resumes,
-usually from a faster CDN server. Run it again later to change the settings
-or update the game.
-
-```bash
-synergyctl start     # start, and start at boot
-synergyctl stop      # stop, and stay off after a reboot
-synergyctl restart
-synergyctl status
-synergyctl log       # follow the server log
-synergyctl save [name]      # save the running game (default name: coop)
-synergyctl load [name]      # load it; players who were in it get their state back
-synergyctl saves            # list the saves
-synergyctl export [file]    # save, then pack all saves into a .tar.gz
-synergyctl import <file>    # unpack an export, e.g. from the old server
-synergyctl cmd changelevel d1_canals_01   # any server console command
-```
-
-Moving to another VPS: `synergyctl export` on the old one, copy the file
-(`scp`), run this script on the new one, then `synergyctl import <file>` and
-`synergyctl load export`. The commands go through rcon on this server only;
-its password is random and the TCP port is not opened in the firewall.
-
-Other game servers can run on the same VPS: the script offers the first free
-port from 27015 and refuses one that another program holds, SourceTV (27020)
-is off, and apt does not restart running services.
-
-Needs 15 GB of free disk. Port: UDP 27015 by default.
-
-## lan-setup.sh
-
-Your own Radmin VPN / Hamachi / ZeroTier on a VPS, for games that have only a
-LAN mode. Players connect with the SoftEther VPN Client and end up on one
-virtual LAN (`10.77.77.0/24`); one of them hosts the game as usual and the
-others find it in the LAN list or join its `10.77.77.x` address. The game
-still runs on the host's PC, but the traffic goes player → VPS → player
-instead of through Radmin's relays abroad, so with a VPS in Iran the ping
-stays low. It asks for the port and the players' password:
-
-- installs SoftEther VPN Server from apt (Ubuntu 22.04+ / Debian 12+)
-- one listener on your port; the default ones (TCP and UDP 443, 992, 1194,
-  5555), SSTP, OpenVPN and VPN Azure are off
-- a hub `LAN` with one shared user `player`, and DHCP without a gateway, so
-  only LAN traffic goes through the VPS, not the players' internet
-
-```bash
-bash <(curl -Ls https://raw.githubusercontent.com/FarzinNs83/my-scripts/main/lan-setup.sh)
-```
-
-Iran / GitHub blocked (ghfast.top mirror):
-
-```bash
-bash <(curl -Ls https://ghfast.top/https://raw.githubusercontent.com/FarzinNs83/my-scripts/main/lan-setup.sh)
-```
-
-At the end it prints what each player enters in the client, and one
-PowerShell line to run once on each PC: it makes the game's LAN list use the
-VPN adapter and lets the host's firewall take players in. Run the script
-again to change the port or the password.
-
-```bash
-lanctl start     # start, and start at boot
-lanctl stop      # stop, and stay off after a reboot
-lanctl restart
-lanctl status
-lanctl who       # the players' 10.77.77.x addresses
-```
-
-Port: TCP 5555 by default (the first free one from there). If ufw or
-firewalld is on, the local UDP port range is opened too: SoftEther's UDP
-acceleration sends the game packets over UDP from a random port, and
-without it they go over TCP.
-
 ## All three on one VPS
 
 `dns-setup.sh`, `n8n-setup.sh` and `3xui-setup.sh` can run on the same
@@ -752,3 +713,62 @@ Simple x Riverpod / Bloc / Cubit / Provider / GetX), sets up a new project
 (`fgen page`), turns JSON into model classes (`fgen model`) and writes asset
 constants (`fgen assets`). See
 [flutter-fgen/README.md](flutter-fgen/README.md).
+
+## react-rgen
+
+Python CLI for React projects: sets up a Vite app with Tailwind, shadcn/ui,
+React Router, TanStack Query, axios, zustand and react-hook-form + zod
+(`rgen init`, with a header or sidebar layout, a fake API for development,
+Vitest and CI), generates CRUD features with table, form, detail page,
+search/pagination, fake API and tests (`rgen feature`), auth pages with
+token refresh (`rgen auth`), pages, forms, models from JSON, Docker files,
+and adds shadcn, React Bits and Magic UI components.
+`AGENTS.md` / `CLAUDE.md` make AI assistants use it instead of writing
+boilerplate. See [react-rgen/README.md](react-rgen/README.md).
+
+## Server and mirror checks
+
+```bash
+sudo bash vps-check.sh                 # run on the VPS
+sudo bash vps-check.sh --cert-days 30  # flag certificates expiring within 30 days
+bash mirror-check.sh                   # check GitHub, npm, PyPI and Docker endpoints
+bash mirror-check.sh npm --timeout 4   # run on the machine that will install packages
+```
+
+`vps-check.sh` reads service and container status, checks managed HTTPS sites
+through local nginx, lists listening ports and reports disk usage and certificate
+expiry. Exit code 1 flags failed checks, a filesystem at least 90% full, or a
+certificate within the warning window. For HTTPS, a response below 500 confirms
+the local route responds, including sites that require login.
+
+`mirror-check.sh` sends small requests with curl and reports the HTTP status and
+elapsed time. `AUTH` means the Docker endpoint returned an authentication
+challenge. The Docker probes check registry reachability. Image downloads can
+also depend on the token server and blob storage. Exit code 1 means a selected
+group had no reachable endpoint.
+
+## Development checks
+
+Run from a project folder or pass its path. Both tools use Python 3.9+ and the
+standard library, and run on Windows, Linux and macOS.
+
+```bash
+python /path/to/my-scripts/env-check.py ./frontend --mode development
+python /path/to/my-scripts/env-check.py ./backend --strict
+python /path/to/my-scripts/env-check.py ./mobile
+python /path/to/my-scripts/dev-check.py ./frontend --build
+python /path/to/my-scripts/dev-check.py ./mobile --dry-run
+```
+
+- `env-check.py` compares `.env` against `.env.example` or a similar template.
+  With `--mode` it merges Vite's four env files in precedence order. For Flutter,
+  it compares `env/dev.json` with the other JSON files in `env/`. Pass
+  `--template` and `--file` to compare specific files. It reports missing,
+  empty, duplicate and undocumented keys without printing values. Exit code 1
+  means a required key is missing or empty, a key is repeated, or `--strict`
+  found an undocumented key. Only file values are checked.
+- `dev-check.py` runs the JavaScript project's `lint`, `typecheck` and `test:run`
+  scripts when present, with `test` as a fallback. It detects the package manager
+  and can also run `build`. For Flutter it checks formatting, runs `flutter analyze`
+  and runs `flutter test` if tests exist. Use `--skip-tests` for a watch-only test
+  script and `--dry-run` to see the commands first.

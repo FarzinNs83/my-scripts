@@ -1,0 +1,19 @@
+import { defineConfig } from 'orval'
+
+// Typed API functions + React Query hooks from the OpenAPI spec. Regenerate with: npm run api
+export default defineConfig({
+  api: {
+    input: '{{ spec }}',
+    output: {
+      mode: 'tags-split',
+      target: 'src/api/generated',
+      schemas: 'src/api/generated/model',
+      client: 'react-query',
+      httpClient: 'axios',
+      clean: true,
+      override: {
+        mutator: { path: 'src/lib/orval-mutator.ts', name: 'customInstance' },
+      },
+    },
+  },
+})

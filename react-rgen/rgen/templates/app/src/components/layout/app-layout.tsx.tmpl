@@ -1,0 +1,164 @@
+import { Suspense } from 'react'
+{% if sidebar %}
+import { List, LogOut } from 'lucide-react'
+import { Direction } from 'radix-ui'
+import { Link, NavLink, Outlet, useLocation } from 'react-router'
+{% else %}
+import { Link, NavLink, Outlet } from 'react-router'
+{% endif %}
+import { navItems } from '@/app/nav'
+import { paths } from '@/app/paths'
+import { PageLoader } from '@/components/common/page-loader'
+{% if i18n %}
+import { LanguageToggle } from '@/components/language-toggle'
+{% endif %}
+import { ModeToggle } from '@/components/mode-toggle'
+{% if not sidebar %}
+import { Button } from '@/components/ui/button'
+{% endif %}
+{% if sidebar %}
+import { Separator } from '@/components/ui/separator'
+import {
+  Sidebar,
+  SidebarContent,
+  SidebarFooter,
+  SidebarGroup,
+  SidebarGroupContent,
+  SidebarHeader,
+  SidebarInset,
+  SidebarMenu,
+  SidebarMenuButton,
+  SidebarMenuItem,
+  SidebarProvider,
+  SidebarTrigger,
+} from '@/components/ui/sidebar'
+{% else %}
+import { cn } from '@/lib/utils'
+{% endif %}
+import { useAuthStore } from '@/stores/auth-store'
+{% if sidebar %}
+
+export function AppLayout() {
+  const signedIn = useAuthStore((s) => !!s.accessToken)
+  const logout = useAuthStore((s) => s.logout)
+  const { pathname } = useLocation()
+  const dir = Direction.useDirection()
+  const isActive = (to: string) => (to === '/' ? pathname === '/' : pathname === to || pathname.startsWith(to + '/'))
+
+  return (
+    <SidebarProvider>
+      <Sidebar collapsible="icon" side={dir === 'rtl' ? 'right' : 'left'}>
+        <SidebarHeader>
+          <SidebarMenu>
+            <SidebarMenuItem>
+              <SidebarMenuButton size="lg" asChild>
+                <Link to={paths.home} className="font-semibold">
+                  <span className="flex size-8 items-center justify-center rounded-md bg-primary text-primary-foreground">
+                    {'{{ title[:1] }}'}
+                  </span>
+                  <span>{{ title }}</span>
+                </Link>
+              </SidebarMenuButton>
+            </SidebarMenuItem>
+          </SidebarMenu>
+        </SidebarHeader>
+        <SidebarContent>
+          <SidebarGroup>
+            <SidebarGroupContent>
+              <SidebarMenu>
+                {navItems.map(({ label, to, icon: Icon = List }) => (
+                  <SidebarMenuItem key={to}>
+                    <SidebarMenuButton asChild isActive={isActive(to)} tooltip={label}>
+                      <NavLink to={to} end={to === '/'}>
+                        <Icon />
+                        <span>{label}</span>
+                      </NavLink>
+                    </SidebarMenuButton>
+                  </SidebarMenuItem>
+                ))}
+              </SidebarMenu>
+            </SidebarGroupContent>
+          </SidebarGroup>
+        </SidebarContent>
+        {signedIn && (
+          <SidebarFooter>
+            <SidebarMenu>
+              <SidebarMenuItem>
+                <SidebarMenuButton onClick={logout} tooltip="Sign out">
+                  <LogOut className="rtl:rotate-180" />
+                  <span>Sign out</span>
+                </SidebarMenuButton>
+              </SidebarMenuItem>
+            </SidebarMenu>
+          </SidebarFooter>
+        )}
+      </Sidebar>
+      <SidebarInset>
+        <header className="sticky top-0 z-30 flex h-14 items-center gap-2 border-b bg-background/80 px-4 backdrop-blur">
+          <SidebarTrigger />
+          <Separator orientation="vertical" className="h-4" />
+          <div className="ms-auto flex items-center gap-2">
+{% if i18n %}
+            <LanguageToggle />
+{% endif %}
+            <ModeToggle />
+          </div>
+        </header>
+        <main className="flex-1 p-4 md:p-6">
+          <Suspense fallback={<PageLoader />}>
+            <Outlet />
+          </Suspense>
+        </main>
+      </SidebarInset>
+    </SidebarProvider>
+  )
+}
+{% else %}
+
+export function AppLayout() {
+  const signedIn = useAuthStore((s) => !!s.accessToken)
+  const logout = useAuthStore((s) => s.logout)
+
+  return (
+    <div className="flex min-h-svh flex-col">
+      <header className="sticky top-0 z-40 border-b bg-background/80 backdrop-blur">
+        <div className="container mx-auto flex h-14 items-center gap-6 px-4">
+          <Link to={paths.home} className="font-semibold">
+            {{ title }}
+          </Link>
+          <nav className="flex items-center gap-4 overflow-x-auto text-sm">
+            {navItems.map((item) => (
+              <NavLink
+                key={item.to}
+                to={item.to}
+                end={item.to === '/'}
+                className={({ isActive }) =>
+                  cn('text-muted-foreground transition-colors hover:text-foreground', isActive && 'text-foreground')
+                }
+              >
+                {item.label}
+              </NavLink>
+            ))}
+          </nav>
+          <div className="ms-auto flex items-center gap-2">
+{% if i18n %}
+            <LanguageToggle />
+{% endif %}
+            <ModeToggle />
+            {signedIn && (
+              <Button variant="ghost" size="sm" onClick={logout}>
+                Sign out
+              </Button>
+            )}
+          </div>
+        </div>
+      </header>
+      <main className="container mx-auto flex-1 px-4 py-6">
+        <Suspense fallback={<PageLoader />}>
+          <Outlet />
+        </Suspense>
+      </main>
+    </div>
+  )
+}
+{% endif %}

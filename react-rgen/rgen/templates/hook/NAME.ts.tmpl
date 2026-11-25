@@ -1,0 +1,8 @@
+import { useState } from 'react'
+
+// Common hooks (useDebounceValue, useLocalStorage, useMediaQuery, useOnClickOutside, ...) are already in
+// 'usehooks-ts': import them from there instead of writing your own.
+export function {{ fn }}<T>(initial: T) {
+  const [value, setValue] = useState<T>(initial)
+  return [value, setValue] as const
+}

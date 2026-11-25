@@ -1,0 +1,15 @@
+import { z } from 'zod'
+import type { AuthUser } from '@/stores/auth-store'
+
+export const loginSchema = z.object({
+  {{ login_body }}
+})
+export type LoginValues = z.infer<typeof loginSchema>
+
+export const registerSchema = z.object({
+  {{ register_body }}
+})
+export type RegisterValues = z.infer<typeof registerSchema>
+
+/** What login and register return. Change it to match your API. */
+export type AuthResponse = { accessToken: string; refreshToken?: string; user?: AuthUser }

@@ -1,0 +1,185 @@
+import { useState } from 'react'
+import { Plus{{ ', Search' if paginated else '' }} } from 'lucide-react'
+{% if paginated %}
+import { useSearchParams } from 'react-router'
+{% endif %}
+import { toast } from 'sonner'
+{% if paginated %}
+import { useDebounceCallback } from 'usehooks-ts'
+{% endif %}
+import { EmptyState } from '@/components/common/empty-state'
+import { ErrorState } from '@/components/common/error-state'
+import { PageLoader } from '@/components/common/page-loader'
+import {
+  AlertDialog,
+  AlertDialogAction,
+  AlertDialogCancel,
+  AlertDialogContent,
+  AlertDialogDescription,
+  AlertDialogFooter,
+  AlertDialogHeader,
+  AlertDialogTitle,
+} from '@/components/ui/alert-dialog'
+import { Button } from '@/components/ui/button'
+import { Dialog, DialogContent, DialogDescription, DialogHeader, DialogTitle } from '@/components/ui/dialog'
+{% if paginated %}
+import { Input } from '@/components/ui/input'
+{% endif %}
+import { {{ n.pascal }}Form } from '../components/{{ n.kebab }}-form'
+import { {{ n.pascal }}Table } from '../components/{{ n.kebab }}-table'
+import { useCreate{{ n.pascal }}, useDelete{{ n.pascal }}, use{{ p.pascal }}, useUpdate{{ n.pascal }} } from '../hooks'
+import type { {{ n.pascal }}, {{ n.pascal }}Input } from '../types'
+{% if paginated %}
+
+const PAGE_SIZE = 10
+{% endif %}
+
+export default function {{ n.pascal }}ListPage() {
+{% if paginated %}
+  // page and search live in the URL, so they survive a reload and can be shared
+  const [searchParams, setSearchParams] = useSearchParams()
+  const page = Math.max(1, Number(searchParams.get('page')) || 1)
+  const q = searchParams.get('q') ?? ''
+  const { data, isPending, isError, error, refetch, isPlaceholderData } = use{{ p.pascal }}({
+    page,
+    pageSize: PAGE_SIZE,
+    q: q || undefined,
+  })
+  const totalPages = data ? Math.max(1, Math.ceil(data.total / data.pageSize)) : 1
+
+  const setParam = (key: string, value: string | null) =>
+    setSearchParams((prev) => {
+      const next = new URLSearchParams(prev)
+      if (value) next.set(key, value)
+      else next.delete(key)
+      if (key !== 'page') next.delete('page')
+      return next
+    })
+  const search = useDebounceCallback((value: string) => setParam('q', value.trim() || null), 300)
+{% else %}
+  const { data, isPending, isError, error, refetch } = use{{ p.pascal }}()
+{% endif %}
+  const create = useCreate{{ n.pascal }}()
+  const update = useUpdate{{ n.pascal }}()
+  const remove = useDelete{{ n.pascal }}()
+  const [formOpen, setFormOpen] = useState(false)
+  const [editing, setEditing] = useState<{{ n.pascal }} | null>(null)
+  const [deleting, setDeleting] = useState<{{ n.pascal }} | null>(null)
+
+  const openForm = (item: {{ n.pascal }} | null) => {
+    setEditing(item)
+    setFormOpen(true)
+  }
+
+  const save = async (values: {{ n.pascal }}Input) => {
+    if (editing) await update.mutateAsync({ id: editing.id, input: values })
+    else await create.mutateAsync(values)
+    toast.success(editing ? '{{ n.title }} updated' : '{{ n.title }} created')
+    setFormOpen(false)
+  }
+
+  const confirmDelete = () => {
+    if (!deleting) return
+    remove.mutate(deleting.id, { onSuccess: () => toast.success('{{ n.title }} deleted') })
+    setDeleting(null)
+  }
+{% if paginated %}
+  const items = data?.items ?? []
+{% else %}
+  const items = data ?? []
+{% endif %}
+
+  return (
+    <div className="space-y-4">
+      <div className="flex flex-wrap items-center justify-between gap-4">
+        <h1 className="text-2xl font-semibold">{{ p.title }}</h1>
+        <Button onClick={() => openForm(null)}>
+          <Plus /> New {{ n.title.lower() }}
+        </Button>
+      </div>
+{% if paginated %}
+
+      <div className="relative max-w-sm">
+        <Search className="pointer-events-none absolute start-2.5 top-1/2 size-4 -translate-y-1/2 text-muted-foreground" />
+        <Input
+          type="search"
+          placeholder="Search {{ p.title.lower() }}…"
+          defaultValue={q}
+          onChange={(e) => search(e.target.value)}
+          className="ps-8"
+          aria-label="Search {{ p.title.lower() }}"
+        />
+      </div>
+{% endif %}
+
+      {isPending ? (
+        <PageLoader />
+      ) : isError ? (
+        <ErrorState error={error} onRetry={() => refetch()} />
+      ) : items.length === 0 ? (
+{% if paginated %}
+        <EmptyState title={q ? 'No results' : 'No {{ p.title.lower() }} yet'} />
+{% else %}
+        <EmptyState title="No {{ p.title.lower() }} yet" />
+{% endif %}
+      ) : (
+{% if paginated %}
+        <div className={isPlaceholderData ? 'opacity-60 transition-opacity' : undefined}>
+          <{{ n.pascal }}Table items={items} onEdit={openForm} onDelete={setDeleting} />
+        </div>
+{% else %}
+        <{{ n.pascal }}Table items={items} onEdit={openForm} onDelete={setDeleting} />
+{% endif %}
+      )}
+{% if paginated %}
+
+      {data && data.total > 0 && (
+        <div className="flex items-center justify-end gap-2">
+          <span className="me-2 text-sm text-muted-foreground">
+            Page {page} of {totalPages} ({data.total})
+          </span>
+          <Button variant="outline" size="sm" disabled={page <= 1} onClick={() => setParam('page', String(page - 1))}>
+            Previous
+          </Button>
+          <Button
+            variant="outline"
+            size="sm"
+            disabled={page >= totalPages}
+            onClick={() => setParam('page', String(page + 1))}
+          >
+            Next
+          </Button>
+        </div>
+      )}
+{% endif %}
+
+      <Dialog open={formOpen} onOpenChange={setFormOpen}>
+        <DialogContent className="max-h-[90svh] overflow-y-auto">
+          <DialogHeader>
+            <DialogTitle>{editing ? 'Edit {{ n.title.lower() }}' : 'New {{ n.title.lower() }}'}</DialogTitle>
+            <DialogDescription>Fill in the details and save.</DialogDescription>
+          </DialogHeader>
+          <{{ n.pascal }}Form
+            key={editing?.id ?? 'new'}
+            defaultValues={editing ?? undefined}
+            onSubmit={save}
+            submitLabel={editing ? 'Save' : 'Create'}
+          />
+        </DialogContent>
+      </Dialog>
+
+      <AlertDialog open={deleting !== null} onOpenChange={(open) => !open && setDeleting(null)}>
+        <AlertDialogContent>
+          <AlertDialogHeader>
+            <AlertDialogTitle>Delete this {{ n.title.lower() }}?</AlertDialogTitle>
+            <AlertDialogDescription>This cannot be undone.</AlertDialogDescription>
+          </AlertDialogHeader>
+          <AlertDialogFooter>
+            <AlertDialogCancel>Cancel</AlertDialogCancel>
+            <AlertDialogAction onClick={confirmDelete}>Delete</AlertDialogAction>
+          </AlertDialogFooter>
+        </AlertDialogContent>
+      </AlertDialog>
+    </div>
+  )
+}
