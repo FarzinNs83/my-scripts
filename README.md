@@ -7,7 +7,7 @@ scripts as root. Use the generators from your development environment.
 | Task | Setup | Day-to-day command |
 | --- | --- | --- |
 | Set up a 3x-ui panel and proxy configs | [3xui-setup.sh](#3xui-setupsh) | `x-ui` or re-run the setup script to add configs |
-| Tunnel an Iran server to a kharej server with BackPack | [backpack-setup.sh](#backpack-setupsh) | `backpack tunnel list` / `sudo backpack` |
+| Tunnel an Iran server to a kharej server with BackPack | [backpack-setup.sh](#backpack-setupsh) | re-run the script for its menu, or `sudo backpack` |
 | Run AdGuard Home and a DNS relay | [dns-setup.sh](#dns-setupsh) | `dnsctl` |
 | Run n8n on a VPS, Linux desktop or WSL | [n8n-setup.sh](#n8n-setupsh) | `n8nctl` |
 | Deploy a static frontend | [front-deploy.sh](#front-deploysh--front-updatesh) | `front-update` |
@@ -127,27 +127,17 @@ none. The panel database is backed up first to `/etc/x-ui/x-ui.db.bak-pro-*`.
 
 Builds a [BackPack](https://github.com/AminMGMT/BackPack) reverse tunnel
 from an Iran server to a kharej server and serves the kharej's 3x-ui
-subscription through Iran. Install the panel with `3xui-setup.sh` on the
-kharej first; its credentials are read from `/root/3xui-info.env`. Run this on the
-**Iran** server. It logs in to the kharej server over SSH as root (it asks for
-the password once, or uses your SSH key) and sets up both servers:
-
-To keep certificate listeners off ports 80/443, first run on the kharej:
-
-```bash
-bash 3xui-setup.sh --no-inbounds --acme-port 18080 panel.example.com
-```
-
-HTTP-01 validation still arrives on public TCP/80; a temporary firewall
-forward sends it to 18080 during issuance/renewal and is removed afterwards.
-The selected listener is saved for later runs. No process binds TCP/80 or
-443 in this mode. Existing HTTP traffic on port 80 is redirected for the
-short validation window.
+subscription through Iran. It is one command, run on the **Iran** server.
+It logs in to the kharej server over SSH as root (it asks for the password
+once, or uses your SSH key) and sets up both servers:
 
 1. Tests the route: Iran -> kharej (ping, TCP/SSH) and kharej -> Iran (TCP,
    UDP, ping), plus GitHub access on both. The reverse tunnel is dialled by
    the kharej, so a failed kharej -> Iran UDP test skips `kcp`/`quic`, and a
-   failed ping skips `xdi`.
+   failed ping skips `xdi`. When 3x-ui is not on the kharej yet, it runs
+   `3xui-setup.sh --no-inbounds --acme-port 18080 <kharej-domain>` there
+   (the panel domain must point to the kharej). The panel login is read
+   from `/root/3xui-info.env` on the kharej.
 2. Installs the latest BackPack release on both servers, checked against its
    `SHA256SUMS`. When Iran cannot reach GitHub, the files are copied from the
    kharej.
@@ -162,17 +152,27 @@ short validation window.
    those tunnels, with automatic fallback between them.
 
 ```bash
-bash <(curl -Ls https://raw.githubusercontent.com/FarzinNs83/my-scripts/main/backpack-setup.sh) <kharej-ip>
+bash <(curl -Ls https://raw.githubusercontent.com/FarzinNs83/my-scripts/main/backpack-setup.sh) --kharej-domain panel.example.com --domain ir.example.com <kharej-ip>
 ```
 
 Iran / GitHub blocked (ghfast.top mirror):
 
 ```bash
-bash <(curl -Ls https://ghfast.top/https://raw.githubusercontent.com/FarzinNs83/my-scripts/main/backpack-setup.sh) <kharej-ip>
+bash <(curl -Ls https://ghfast.top/https://raw.githubusercontent.com/FarzinNs83/my-scripts/main/backpack-setup.sh) --kharej-domain panel.example.com --domain ir.example.com <kharej-ip>
 ```
+
+Anything left out is asked for. Run it again with no arguments for a menu:
+
+| Menu / command | |
+| --- | --- |
+| Install again (`<kharej-ip>`) | Retest every tunnel and refresh the panel Hosts. Ports, tokens and links stay the same |
+| Update (`update`) | Install the newest BackPack on both servers and restart the tunnels |
+| Uninstall (`uninstall`) | Remove the `bpt-*` tunnels on both servers, `bpt-sub`, and the panel's BackPack inbound with its Hosts. BackPack and 3x-ui stay installed |
 
 | Option | |
 | --- | --- |
+| `--domain <name>` | Iran domain for the configs and the subscription, instead of the IP. Its A record must point to the Iran server (grey cloud on Cloudflare) |
+| `--kharej-domain <name>` | Panel domain for the kharej. Only used when 3x-ui is not there yet |
 | `--ssh-port <n>` | SSH port of the kharej server (default 22) |
 | `--ssh-host <ip>` | SSH management address through a relay; the kharej IP stays unchanged |
 | `--iran-ip <ip>` | Iran IP for the configs (default: the address the kharej sees) |
@@ -201,7 +201,9 @@ directly and keeps running without it.
   them in ufw / firewalld. Open them in the Iran provider firewall too.
 - Forwarding uses dedicated ports; BackPack and `bpt-sub` do not bind
   ports 80 or 443. `--acme-port 18080` also keeps the panel's separate
-  certificate listener on a dedicated port during renewal.
+  certificate listener on a dedicated port during renewal: HTTP-01
+  validation still arrives on TCP/80, and a temporary firewall forward
+  sends it to 18080 while the certificate is issued or renewed.
 - Users, traffic limits and expiry are managed in 3x-ui. Every client
   attached to the "BackPack tunnel" inbound gets its tunnel Hosts.
 - Run it again to rebuild. Tunnel tokens and ports are kept in
@@ -210,8 +212,7 @@ directly and keeps running without it.
 - The Iran subscription uses HTTP; its URL contains the client's access
   token, and filtering can block a VPN client's User-Agent. The script also
   prints the panel's HTTPS subscription when available; it contains the
-  same Iran configs. Use HTTPS in front of `bpt-sub` when you have a domain
-  for Iran.
+  same Iran configs.
 - The tunnels use BackPack's own unit names (`backpack-bpt-*.service`), so
   `sudo backpack` shows and manages them.
 - The `udp` transport is left out because it carries UDP only. The

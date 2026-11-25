@@ -2,10 +2,11 @@
 # =============================================================================
 #  BackPack reverse tunnel, Iran -> kharej, managed from the kharej's 3x-ui
 #
-#  Needs 3x-ui on the kharej, installed by 3xui-setup.sh (it reads the panel
-#  login from /root/3xui-info.env there). Run THIS script on the IRAN server.
-#  It reaches the kharej over SSH (root password asked once, or your SSH key):
+#  One command, run on the IRAN server. It reaches the kharej over SSH (root
+#  password asked once, or your SSH key) and sets up both servers:
 #    1. tests the route both ways (TCP, UDP, ICMP, SSH, GitHub access)
+#       and, when 3x-ui is not on the kharej yet, runs 3xui-setup.sh there
+#       (--kharej-domain); the panel login comes from /root/3xui-info.env
 #    2. installs BackPack (github.com/AminMGMT/BackPack) on both servers;
 #       when Iran cannot reach GitHub, the files come through the kharej
 #    3. adds one VLESS REALITY Vision inbound "BackPack tunnel" on 127.0.0.1
@@ -18,12 +19,14 @@
 #
 #  Users, traffic and expiry stay in 3x-ui: every client attached to the
 #  "BackPack tunnel" inbound gets all the tunnel links in its subscription.
-#  Run it again to rebuild; ports and links are kept
-#  (/root/backpack-tunnel-info.env).
+#  With --domain the links and the subscription use an Iran domain, not the IP.
+#  Run it again for a menu: install again (ports and links are kept in
+#  /root/backpack-tunnel-info.env), update BackPack, or uninstall.
 #
 #  Usage:
-#    bash backpack-setup.sh <kharej-ip>
-#    bash backpack-setup.sh --ssh-port 2222 <kharej-ip>
+#    bash backpack-setup.sh --kharej-domain panel.example.com --domain ir.example.com <kharej-ip>
+#    bash backpack-setup.sh                 (menu)
+#    bash backpack-setup.sh update | uninstall
 #
 #  Based on BackPack by Amin Mohammadi (AminMGMT)
 #  https://github.com/AminMGMT/BackPack
@@ -41,9 +44,14 @@ SUB_PY="/usr/local/lib/bpt-sub.py"
 PREFIX="bpt" # tunnel names: bpt-tcp, bpt-kcp, ...
 ALL_TRANSPORTS=(tcp tcpmux stealth pck kcp quic ws wsmux wss wssmux xdi)
 
+XUI_SETUP_URL="${XUI_SETUP_URL:-https://raw.githubusercontent.com/FarzinNs83/my-scripts/main/3xui-setup.sh}"
+
+ACTION=""
 KH_IP=""
+KH_DOMAIN=""
+IR_DOMAIN=""
 SSH_HOST=""
-SSH_PORT=22
+SSH_PORT=""
 IRAN_IP=""
 SUB_PORT=""
 CTL="/root/.ssh/bpt-%r@%h:%p"
@@ -59,9 +67,18 @@ BackPack reverse tunnel (run on the Iran server), managed from the 3x-ui
 panel that 3xui-setup.sh installed on the kharej.
 
 Usage:
-  bash backpack-setup.sh [options] <kharej-ip>
+  bash backpack-setup.sh                      menu (install / update / uninstall)
+  bash backpack-setup.sh [options] <kharej-ip>  install, or rebuild and retest
+  bash backpack-setup.sh update               newest BackPack on both servers
+  bash backpack-setup.sh uninstall            remove the tunnels, the panel
+                                              inbound and the subscription
 
 Options:
+  --domain <name>  Iran domain for the configs and the subscription (an A
+                   record to this server; grey cloud on Cloudflare)
+  --kharej-domain <name>
+                   Panel domain for the kharej; when 3x-ui is not there yet,
+                   3xui-setup.sh is run on the kharej with it
   --ssh-port <n>   SSH port of the kharej server (default 22, user root)
   --ssh-host <ip>  SSH management address when using a relay (default kharej-ip)
   --iran-ip <ip>   Public IP of this server for the configs (default: the
@@ -135,6 +152,14 @@ pkg_install() { # best effort: apt / dnf / yum
   fi
 }
 
+bp_restart() { # restart the tunnels an earlier run made
+  local f
+  for f in /etc/backpack/bpt-*.toml; do
+    [[ -e $f ]] && systemctl restart "backpack-$(basename "$f" .toml).service"
+  done
+  return 0
+}
+
 bp_arch() {
   case $(uname -m) in
     x86_64 | amd64) echo amd64 ;;
@@ -174,11 +199,13 @@ k_download() { # <arch>...: release files into /root/BackPack
   done
 }
 
-KFUNCS=(bp_install bp_clear bp_apply pkg_install bp_arch k_prep k_probe k_download)
+KFUNCS=(bp_install bp_clear bp_apply bp_restart pkg_install bp_arch k_prep k_probe k_download)
 
 # Runs on the kharej through the 3x-ui API (same login flow as 3xui-setup.sh).
 #   prep              -> the "BackPack tunnel" inbound + client; prints KEY=VALUE
-#   hosts IP t:port.. -> one Host per working transport on that inbound
+#   hosts ADDR t:port.. -> one Host per working transport on that inbound
+#   test SUBID ADDR t:port.. -> real VLESS clients through each Iran port
+#   remove            -> the Hosts and the inbound (uninstall)
 read -r -d '' PANEL_PY << 'PYEOF' || true
 import concurrent.futures, glob, json, os, re, secrets, socket, string, subprocess, sys, tempfile, time
 from urllib.parse import quote
@@ -304,11 +331,15 @@ def prep():
     clients = [c for c in api("/panel/api/clients/list").get("obj") or [] if isinstance(c, dict)]
     c = next((c for c in clients if c.get("comment") == MARK and c.get("subId")), None) or \
         next((c for c in clients if c.get("comment") == "backpack-setup" and c.get("subId")), None)
-    if c:
+    try:
+        attached = {x.get("email") for x in json.loads(ib.get("settings") or "{}").get("clients", [])}
+    except ValueError:
+        attached = set()
+    if c and c["email"] not in attached:  # a re-run finds it attached already
         r = api(f"/panel/api/clients/{quote(c['email'], safe='')}/attach", {"inboundIds": [iid]})
         if not r.get("success"):
             die("could not attach the client:", r.get("msg"))
-    else:
+    elif not c:
         c = {"email": f"backpack-{secrets.token_hex(4)}", "flow": "xtls-rprx-vision",
              "subId": "".join(secrets.choice(string.ascii_lowercase + string.digits) for _ in range(16)),
              "totalGB": 0, "expiryTime": 0, "limitIp": 0, "enable": True, "tgId": 0, "comment": "backpack-setup"}
@@ -342,16 +373,38 @@ def prep():
     for k, v in out.items():
         print(f"{k}={v}")
 
-def hosts(ip, pairs):
-    ib = ours()
-    if not ib:
-        die("the tunnel inbound is gone")
-    old = api(f"/panel/api/hosts/byInbound/{ib['id']}").get("obj") or []
+def drop_hosts(iid):
+    old = api(f"/panel/api/hosts/byInbound/{iid}").get("obj") or []
     for gid in {h.get("groupId") for h in old if isinstance(h, dict) and str(h.get("remark", "")).startswith("🎒 BP ")}:
         if gid:
             r = api(f"/panel/api/hosts/del/{gid}", post=True)
             if not r.get("success"):
                 die("could not remove an old tunnel Host:", r.get("msg"))
+
+def remove():
+    ib = ours()
+    if not ib:
+        print("REMOVED=0")
+        return
+    drop_hosts(ib["id"])
+    try:
+        emails = [x.get("email") for x in json.loads(ib.get("settings") or "{}").get("clients", [])]
+    except ValueError:
+        emails = []
+    for e in emails:  # clients keep their other inbounds
+        if e:
+            api(f"/panel/api/clients/{quote(e, safe='')}/detach", {"inboundIds": [ib["id"]]})
+    r = api(f"/panel/api/inbounds/del/{ib['id']}", post=True)
+    if not r.get("success"):
+        die("could not delete the tunnel inbound:", r.get("msg"))
+    api("/panel/api/server/restartXrayService", post=True)
+    print("REMOVED=1")
+
+def hosts(ip, pairs):
+    ib = ours()
+    if not ib:
+        die("the tunnel inbound is gone")
+    drop_hosts(ib["id"])
     n = 0
     for i, pair in enumerate(pairs):
         t, _, pt = pair.partition(":")
@@ -423,6 +476,8 @@ elif sys.argv[1] == "hosts":
     hosts(sys.argv[2], sys.argv[3:])
 elif sys.argv[1] == "test":
     test_clients(sys.argv[2], sys.argv[3], sys.argv[4:])
+elif sys.argv[1] == "remove":
+    remove()
 PYEOF
 
 # Iran: serves the panel's subscription, fetched through any working tunnel.
@@ -506,19 +561,29 @@ parse_args() {
       --ssh-host) SSH_HOST=${2:?}; shift 2 ;;
       --iran-ip) IRAN_IP=${2:?}; shift 2 ;;
       --sub-port) SUB_PORT=${2:?}; shift 2 ;;
+      --domain) IR_DOMAIN=${2:?}; shift 2 ;;
+      --kharej-domain) KH_DOMAIN=${2:?}; shift 2 ;;
       -h | --help) usage; exit 0 ;;
+      install | update | uninstall) ACTION=$1; shift ;;
       -*) die "Unknown option: $1 (see --help)" ;;
-      *) KH_IP=$1; shift ;;
+      *) KH_IP=$1; ACTION=${ACTION:-install}; shift ;;
     esac
   done
-  if [[ -z $KH_IP ]]; then
-    [[ -r /dev/tty ]] || die "Give the kharej IP: bash backpack-setup.sh <kharej-ip>"
-    read -rp "Kharej server IP: " KH_IP < /dev/tty
-  fi
-  [[ $KH_IP =~ ^[0-9]{1,3}(\.[0-9]{1,3}){3}$ ]] || die "Not an IPv4 address: $KH_IP"
+  [[ -z $KH_IP || $KH_IP =~ ^[0-9]{1,3}(\.[0-9]{1,3}){3}$ ]] || die "Not an IPv4 address: $KH_IP"
+  is_domain "$IR_DOMAIN" || die "Not a domain: $IR_DOMAIN"
+  is_domain "$KH_DOMAIN" || die "Not a domain: $KH_DOMAIN"
   [[ -z $SSH_HOST || $SSH_HOST =~ ^[0-9]{1,3}(\.[0-9]{1,3}){3}$ ]] || die "Not an IPv4 SSH address: $SSH_HOST"
-  [[ $SSH_PORT =~ ^[0-9]{1,5}$ && $((10#$SSH_PORT)) -ge 1 && $((10#$SSH_PORT)) -le 65535 ]] || die "Invalid SSH port"
+  [[ -z $IRAN_IP || $IRAN_IP =~ ^[0-9]{1,3}(\.[0-9]{1,3}){3}$ ]] || die "Not an IPv4 address: $IRAN_IP"
+  FIXED_IRAN_IP=$IRAN_IP # only a given one is saved; otherwise it is re-detected each run
+  [[ -z $SSH_PORT || ( $SSH_PORT =~ ^[0-9]{1,5}$ && $((10#$SSH_PORT)) -ge 1 && $((10#$SSH_PORT)) -le 65535 ) ]] || die "Invalid SSH port"
   [[ -z $SUB_PORT || ( $SUB_PORT =~ ^[0-9]{1,5}$ && $((10#$SUB_PORT)) -ge 1 && $((10#$SUB_PORT)) -le 65535 ) ]] || die "Invalid subscription port"
+}
+
+is_domain() { [[ -z $1 || $1 =~ ^([A-Za-z0-9]([A-Za-z0-9-]*[A-Za-z0-9])?\.)+[A-Za-z]{2,}$ ]]; } # empty is fine
+
+ask() { # <var> <prompt>: read from the terminal; empty when there is none
+  [[ -r /dev/tty ]] || return 0
+  read -rp "$2" "$1" < /dev/tty || true
 }
 
 port_busy() { ss -Htuln 2> /dev/null | awk '{print $5}' | grep -qE "[:.]$1\$"; }
@@ -593,7 +658,7 @@ run_tests() {
   IR_ARCH=$(bp_arch)
   [[ $KH_ARCH != unsupported-* && $IR_ARCH != unsupported-* ]] || die "BackPack ships amd64 and arm64 only (Iran: $IR_ARCH, kharej: $KH_ARCH)"
   [[ $(kv GH "$out") == 1 ]] || die "The kharej server cannot reach GitHub, so nothing can be downloaded."
-  [[ $(kv XUI "$out") == 1 ]] || die "No 3x-ui from 3xui-setup.sh on the kharej (/root/3xui-info.env). Run 3xui-setup.sh there first."
+  XUI=$(kv XUI "$out")
 
   # The reverse tunnel is dialled by the kharej, so this direction decides.
   free_port probe 4100
@@ -613,7 +678,8 @@ run_tests() {
   printf '  %-34s %s\n' "kharej -> Iran UDP :$probe" "$(mark "$K2I_UDP")"
   printf '  %-34s %s\n' "kharej -> Iran ping (ICMP)" "$(mark "$K2I_ICMP")"
   printf '  %-34s %s\n' "Iran -> GitHub" "$(mark "$IR_GH")"
-  printf '  %-34s %s\n\n' "kharej -> GitHub, 3x-ui found" ok
+  printf '  %-34s %s\n' "kharej -> GitHub" ok
+  printf '  %-34s %s\n\n' "3x-ui on the kharej" "$([[ $XUI == 1 ]] && echo found || echo "not yet (3xui-setup.sh runs next)")"
   [[ $K2I_TCP == 1 ]] || die "The kharej cannot open TCP to this server; the subscription and every TCP transport need it. Check the Iran provider firewall."
   [[ $K2I_UDP == 1 ]] || warn "UDP to Iran failed (also check the provider firewall): kcp and quic are skipped."
   [[ $K2I_ICMP == 1 ]] || warn "Ping to Iran failed: xdi is skipped."
@@ -627,6 +693,25 @@ run_tests() {
     esac
   done
   return 0
+}
+
+install_xui() { # the direct-method script, run on the kharej over the same SSH
+  [[ -n $KH_DOMAIN ]] || ask KH_DOMAIN "3x-ui is not on the kharej. Its panel domain (A record -> $KH_IP): "
+  [[ -n $KH_DOMAIN ]] || die "3x-ui is not on the kharej; pass --kharej-domain <panel domain>"
+  is_domain "$KH_DOMAIN" || die "Not a domain: $KH_DOMAIN"
+  # the tunnel flow from the README: no direct configs, certificates off 80/443
+  say "Installing 3x-ui on the kharej: 3xui-setup.sh --no-inbounds --acme-port 18080 $KH_DOMAIN"
+  kh "curl -fsSL -m 60 $(printf '%q' "$XUI_SETUP_URL") -o /root/3xui-setup.sh && bash /root/3xui-setup.sh --no-inbounds --acme-port 18080 $(printf '%q' "$KH_DOMAIN")" < /dev/null ||
+    die "3xui-setup.sh failed on the kharej (its log: /var/log/3xui-setup.log there)"
+  [[ $(kv XUI "$(kfn k_prep)") == 1 ]] || die "3xui-setup.sh finished, but /root/3xui-info.env is missing on the kharej"
+}
+
+check_domain() { # the configs only work when the Iran domain points here
+  [[ -n $IR_DOMAIN ]] || return 0
+  local ip
+  ip=$(getent ahostsv4 "$IR_DOMAIN" 2> /dev/null | awk 'NR == 1 {print $1}' || true)
+  [[ $ip == "$IRAN_IP" ]] ||
+    die "$IR_DOMAIN points to ${ip:-nothing}, not this server ($IRAN_IP). Set an A record (grey cloud on Cloudflare) and re-run."
 }
 
 install_backpack() {
@@ -653,16 +738,20 @@ install_backpack() {
 
 load_saved() {
   [[ -f $INFO_FILE ]] || return 0
-  local saved_kh cli_ip=$IRAN_IP cli_sub=$SUB_PORT
+  local saved_kh cli_ip=$IRAN_IP cli_sub=$SUB_PORT cli_dom=$IR_DOMAIN cli_sp=$SSH_PORT cli_sh=$SSH_HOST
   saved_kh=$(sed -n 's/^KH_IP=//p' "$INFO_FILE")
-  if [[ $saved_kh != "$KH_IP" ]]; then
+  if [[ -n $KH_IP && $saved_kh != "$KH_IP" ]]; then
     warn "Saved settings are for kharej $saved_kh; starting fresh for $KH_IP."
     return 0
   fi
   # shellcheck disable=SC1090
   . "$INFO_FILE"
-  IRAN_IP=$cli_ip # always the address the kharej sees now, unless given
+  IRAN_IP=${cli_ip:-${FIXED_IRAN_IP:-}} # the address the kharej sees now, unless one was given
+  FIXED_IRAN_IP=$IRAN_IP
   [[ -n $cli_sub ]] && SUB_PORT=$cli_sub
+  [[ -n $cli_dom ]] && IR_DOMAIN=$cli_dom
+  [[ -n $cli_sp ]] && SSH_PORT=$cli_sp
+  [[ -n $cli_sh ]] && SSH_HOST=$cli_sh
   TAKEN+=" $(grep -E '^(TUN|PUB|SFW)_' "$INFO_FILE" | cut -d= -f2 | tr '\n' ' ')"
   say "Reusing the tunnel ports and subscription port from $INFO_FILE"
 }
@@ -783,11 +872,11 @@ setup_hosts_and_sub() {
     ups+="${ups:+,}${!sfw_var}"
   done
   local out
-  out=$(kpanel hosts "$IRAN_IP" "${pairs[@]}")
+  out=$(kpanel hosts "$ADDR" "${pairs[@]}")
   [[ $(kv HOSTS "$out") == "${#WORKING[@]}" ]] || die "Not all tunnel Hosts were added"
   say "Panel Hosts: ${#WORKING[@]} added"
   say "Testing authenticated VLESS clients through the Iran ports to the internet"
-  out=$(kpanel test "$SUB_ID" "$IRAN_IP" "${pairs[@]}")
+  out=$(kpanel test "$SUB_ID" "$ADDR" "${pairs[@]}")
   local passed=()
   pairs=() ups=""
   for t in "${WORKING[@]}"; do
@@ -800,7 +889,7 @@ setup_hosts_and_sub() {
   done
   WORKING=("${passed[@]}")
   [[ ${#WORKING[@]} -gt 0 ]] || die "No authenticated VLESS client passed the internet test"
-  out=$(kpanel hosts "$IRAN_IP" "${pairs[@]}")
+  out=$(kpanel hosts "$ADDR" "${pairs[@]}")
   [[ $(kv HOSTS "$out") == "${#WORKING[@]}" ]] || die "Could not refresh tested tunnel Hosts"
 
   [[ -n ${SUB_PORT:-} ]] || free_port SUB_PORT 2095
@@ -823,16 +912,18 @@ UNIT
   systemctl enable bpt-sub.service > /dev/null 2>&1
   systemctl restart bpt-sub.service
   open_port "$SUB_PORT" tcp
-  SUB_URL="http://$IRAN_IP:$SUB_PORT$KSUB_PATH$SUB_ID"
+  SUB_URL="http://$ADDR:$SUB_PORT$KSUB_PATH$SUB_ID"
 
   # the subscription must come back through the tunnel with the Iran links in it
-  local body="" i
+  local raw body="" i
   for i in 1 2 3 4 5; do
     sleep 2
-    body=$(curl -fs -m 15 "http://127.0.0.1:$SUB_PORT$KSUB_PATH$SUB_ID" 2> /dev/null | base64 -d 2> /dev/null || true)
+    raw=$(curl -fs -m 15 "http://127.0.0.1:$SUB_PORT$KSUB_PATH$SUB_ID" 2> /dev/null || true)
+    body=$(base64 -d <<< "$raw" 2> /dev/null || true)
+    [[ $body == *"://"* ]] || body=$raw # the panel can serve it without base64
     [[ -n $body ]] && break
   done
-  SUB_LINKS=$(grep -c "@$IRAN_IP:" <<< "$body" || true)
+  SUB_LINKS=$(grep -c "@$ADDR:" <<< "$body" || true)
   [[ $SUB_LINKS -ge ${#WORKING[@]} ]] || die "The subscription is missing tunnel links (journalctl -u bpt-sub)"
 }
 
@@ -841,6 +932,7 @@ write_info() {
   install -m 0600 /dev/null "$INFO_FILE"
   {
     printf 'KH_IP=%s\nTOKEN_BASE=%s\nSUB_PORT=%s\n' "$KH_IP" "$TOKEN_BASE" "${SUB_PORT:-}"
+    printf 'SSH_PORT=%s\nSSH_HOST=%s\nIR_DOMAIN=%s\nFIXED_IRAN_IP=%s\n' "$SSH_PORT" "$SSH_HOST" "$IR_DOMAIN" "$FIXED_IRAN_IP"
     printf 'SUB_URL=%q\nPANEL_SUB_URL=%q\n' "${SUB_URL:-}" "${PANEL_SUB_URL:-}"
     for t in "${ALL_TRANSPORTS[@]}"; do
       a="TUN_$t" b="PUB_$t" c="SFW_$t"
@@ -874,7 +966,7 @@ print_summary() {
     if [[ $KSUB_TLS == 1 ]]; then
       printf ' HTTPS subscription (same Iran configs, useful when HTTP is filtered):\n   %s\n' "$PANEL_SUB_URL"
     fi
-    printf ' For any other client: http://%s:%s%s<its subId>\n' "$IRAN_IP" "$SUB_PORT" "$KSUB_PATH"
+    printf ' For any other client: http://%s:%s%s<its subId>\n' "$ADDR" "$SUB_PORT" "$KSUB_PATH"
   else
     warn "No tunnel passed the end-to-end test. Logs: journalctl -u backpack-$PREFIX-tcp -n 50 (on both servers)"
   fi
@@ -885,27 +977,19 @@ print_summary() {
   printf '==============================================================\n'
 }
 
-main() {
-  parse_args "$@"
-  [[ $EUID -eq 0 ]] || die "Run as root (sudo -i first)."
-  touch "$LOG_FILE" && chmod 600 "$LOG_FILE"
-  exec > >(tee -a "$LOG_FILE") 2>&1
-  trap '_on_err $LINENO' ERR
-  trap cleanup EXIT
-  say "$(date -Is) backpack-setup.sh -> kharej $KH_IP"
-
-  local need=() c
-  for c in curl ssh python3 openssl iptables; do command -v "$c" > /dev/null 2>&1 || need+=("$c"); done
-  if [[ ${#need[@]} -gt 0 ]]; then
-    say "Installing: ${need[*]}"
-    pkg_install curl openssh-client python3 openssl iptables
+do_install() {
+  [[ -n $KH_IP ]] || ask KH_IP "Kharej server IP: "
+  [[ $KH_IP =~ ^[0-9]{1,3}(\.[0-9]{1,3}){3}$ ]] || die "Give the kharej IP: bash backpack-setup.sh <kharej-ip>"
+  if [[ ! -f $INFO_FILE && -z $IR_DOMAIN ]]; then
+    ask IR_DOMAIN "Iran domain for the configs (A record -> this server; Enter = use the IP): "
+    is_domain "$IR_DOMAIN" || die "Not a domain: $IR_DOMAIN"
   fi
-  for c in curl ssh python3 openssl; do command -v "$c" > /dev/null 2>&1 || die "$c is missing and could not be installed"; done
-
-  TAKEN=""
-  load_saved
+  say "$(date -Is) install -> kharej $KH_IP"
   [[ -n ${TOKEN_BASE:-} ]] || TOKEN_BASE=$(openssl rand -hex 16)
   run_tests
+  check_domain
+  ADDR=${IR_DOMAIN:-$IRAN_IP}
+  [[ $XUI == 1 ]] || install_xui
   install_backpack
   setup_panel
   setup_tunnels
@@ -917,4 +1001,82 @@ main() {
   [[ ${#WORKING[@]} -gt 0 ]] || die "No working tunnel"
 }
 
-if [[ ${BASH_SOURCE[0]} == "$0" ]]; then main "$@"; fi
+do_update() {
+  [[ -n $KH_IP ]] || die "Nothing is installed yet ($INFO_FILE is missing); run the install first."
+  say "$(date -Is) update -> kharej $KH_IP"
+  ssh_connect
+  KH_ARCH=$(kv ARCH "$(kfn k_prep)")
+  IR_ARCH=$(bp_arch)
+  IR_GH=0
+  curl -fsSI -m 15 https://github.com > /dev/null 2>&1 && IR_GH=1
+  install_backpack
+  bp_restart
+  kfn bp_restart
+  say "Tunnels restarted on both servers. Run the install again to retest them and refresh the panel Hosts."
+}
+
+do_uninstall() {
+  [[ -n $KH_IP ]] || die "Nothing to uninstall ($INFO_FILE is missing)."
+  local a=""
+  ask a "Remove the bpt tunnels on both servers, the subscription service and the panel's BackPack inbound? [y/N] "
+  [[ $a == [yY]* ]] || die "Cancelled."
+  say "$(date -Is) uninstall -> kharej $KH_IP"
+  bp_clear
+  systemctl disable --now bpt-sub.service > /dev/null 2>&1 || true
+  rm -f /etc/systemd/system/bpt-sub.service "$SUB_PY"
+  systemctl daemon-reload
+  ssh_connect
+  if [[ $(kv XUI "$(kfn k_prep)") == 1 && $(kv REMOVED "$(kpanel remove)") == 1 ]]; then
+    say "Panel: the BackPack inbound and its Hosts are removed (clients keep their other inbounds)"
+  fi
+  kfn bp_clear
+  rm -f "$INFO_FILE" # last, so a failed run can be repeated
+  say "Done. BackPack and 3x-ui stay installed (sudo backpack -> Uninstall removes BackPack)."
+}
+
+choose_action() {
+  if [[ ! -f $INFO_FILE ]]; then
+    ACTION=install
+    return 0
+  fi
+  printf '\n BackPack tunnels (kharej %s)\n  1) Install again: retest and refresh the configs\n  2) Update BackPack on both servers\n  3) Uninstall\n' "$KH_IP"
+  local c=""
+  ask c "Choose [1-3]: "
+  case $c in
+    1) ACTION=install ;;
+    2) ACTION=update ;;
+    3) ACTION=uninstall ;;
+    *) die "Nothing chosen." ;;
+  esac
+}
+
+main() {
+  parse_args "$@"
+  [[ $EUID -eq 0 ]] || die "Run as root (sudo -i first)."
+  touch "$LOG_FILE" && chmod 600 "$LOG_FILE"
+  exec > >(tee -a "$LOG_FILE") 2>&1
+  trap '_on_err $LINENO' ERR
+  trap cleanup EXIT
+
+  local need=() c
+  for c in curl ssh python3 openssl iptables; do command -v "$c" > /dev/null 2>&1 || need+=("$c"); done
+  if [[ ${#need[@]} -gt 0 ]]; then
+    say "Installing: ${need[*]}"
+    pkg_install curl openssh-client python3 openssl iptables
+  fi
+  for c in curl ssh python3 openssl; do command -v "$c" > /dev/null 2>&1 || die "$c is missing and could not be installed"; done
+
+  TAKEN=""
+  load_saved
+  : "${SSH_PORT:=22}"
+  # through a relay the kharej sees the relay's address, not this server's
+  [[ -z $SSH_HOST || -n $IRAN_IP ]] || die "--ssh-host needs --iran-ip as well"
+  [[ -n $ACTION ]] || choose_action
+  case $ACTION in
+    install) do_install ;;
+    update) do_update ;;
+    uninstall) do_uninstall ;;
+  esac
+}
+
+if [[ ${BASH_SOURCE[0]:-$0} == "$0" ]]; then main "$@"; fi # also when piped to bash
