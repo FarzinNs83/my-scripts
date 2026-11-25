@@ -9,8 +9,8 @@
 #       (--kharej-domain); the panel login comes from /root/3xui-info.env
 #    2. installs BackPack (github.com/AminMGMT/BackPack) on both servers;
 #       when Iran cannot reach GitHub, the files come through the kharej
-#    3. adds one VLESS REALITY Vision inbound "BackPack tunnel" on 127.0.0.1
-#       to the panel and attaches the 3xui-setup client to it
+#    3. adds three VLESS Encryption inbounds on 127.0.0.1 to the panel, over
+#       TCP, WS and XHTTP (no TLS, no SNI), and attaches the client to them
 #    4. makes one tunnel per BackPack transport whose route passed step 1:
 #       tcp tcpmux stealth pck kcp quic ws wsmux wss wssmux xdi
 #    5. tests every tunnel end to end, adds one panel Host per working
@@ -18,10 +18,11 @@
 #       subscription from the Iran IP (it travels through the tunnels too)
 #
 #  Users, traffic and expiry stay in 3x-ui: every client attached to the
-#  "BackPack tunnel" inbound gets all the tunnel links in its subscription.
+#  "BackPack TCP / WS / XHTTP" inbounds gets the tunnel links in its subscription.
 #  With --domain the links and the subscription use an Iran domain, not the IP.
-#  Run it again for a menu: install again (ports and links are kept in
-#  /root/backpack-tunnel-info.env), update BackPack, or uninstall.
+#  Run it again for a menu: update (newest BackPack, configs added since,
+#  everything retested; ports and links are kept in
+#  /root/backpack-tunnel-info.env) or uninstall.
 #
 #  Usage:
 #    bash backpack-setup.sh --kharej-domain panel.example.com --domain ir.example.com <kharej-ip>
@@ -67,9 +68,10 @@ BackPack reverse tunnel (run on the Iran server), managed from the 3x-ui
 panel that 3xui-setup.sh installed on the kharej.
 
 Usage:
-  bash backpack-setup.sh                      menu (install / update / uninstall)
-  bash backpack-setup.sh [options] <kharej-ip>  install, or rebuild and retest
-  bash backpack-setup.sh update               newest BackPack on both servers
+  bash backpack-setup.sh                      menu (update / uninstall)
+  bash backpack-setup.sh [options] <kharej-ip>  install
+  bash backpack-setup.sh update               newest BackPack, configs added
+                                              since, everything retested
   bash backpack-setup.sh uninstall            remove the tunnels, the panel
                                               inbound and the subscription
 
@@ -152,14 +154,6 @@ pkg_install() { # best effort: apt / dnf / yum
   fi
 }
 
-bp_restart() { # restart the tunnels an earlier run made
-  local f
-  for f in /etc/backpack/bpt-*.toml; do
-    [[ -e $f ]] && systemctl restart "backpack-$(basename "$f" .toml).service"
-  done
-  return 0
-}
-
 bp_arch() {
   case $(uname -m) in
     x86_64 | amd64) echo amd64 ;;
@@ -199,17 +193,16 @@ k_download() { # <arch>...: release files into /root/BackPack
   done
 }
 
-KFUNCS=(bp_install bp_clear bp_apply bp_restart pkg_install bp_arch k_prep k_probe k_download)
+KFUNCS=(bp_install bp_clear bp_apply pkg_install bp_arch k_prep k_probe k_download)
 
 # Runs on the kharej through the 3x-ui API (same login flow as 3xui-setup.sh).
-#   prep              -> the "BackPack tunnel" inbound + client; prints KEY=VALUE
-#   hosts ADDR t:port.. -> one Host per working transport on that inbound
-#   test SUBID ADDR t:port.. -> real VLESS clients through each Iran port
-#   remove            -> the Hosts and the inbound (uninstall)
+#   prep                          -> TCP / WS / XHTTP inbounds + client; prints KEY=VALUE
+#   hosts ADDR t:kind:port..      -> one Host per working link (transport x inbound)
+#   test SUBID ADDR t:kind:port.. -> real VLESS clients through each Iran port
+#   remove                        -> the Hosts and the inbounds (uninstall)
 read -r -d '' PANEL_PY << 'PYEOF' || true
 import concurrent.futures, glob, json, os, re, secrets, socket, string, subprocess, sys, tempfile, time
 from urllib.parse import quote
-REMARK = "🎒 BackPack tunnel"
 MARK = "3xui-setup"
 def die(*a): print("[x]", *a, file=sys.stderr, flush=True); sys.exit(1)
 def warn(*a): print("[!]", *a, file=sys.stderr, flush=True)
@@ -288,74 +281,105 @@ def field(ib, k):  # panels return these as a JSON string or already parsed
         return (json.loads(v) if isinstance(v, str) and v else v) or {}
     except ValueError:
         return {}
-def stream_of(ib):
-    return field(ib, "streamSettings")
 def emails_of(ib):
     return [x.get("email") for x in field(ib, "settings").get("clients", []) if isinstance(x, dict)]
-def ours():
+LEGACY = "🎒 BackPack tunnel"  # the REALITY inbound of earlier versions; replaced on update
+KINDS = {"tcp": "🎒 BackPack TCP", "ws": "🎒 BackPack WS", "xh": "🎒 BackPack XHTTP"}
+LABEL = {"tcp": "TCP", "ws": "WS", "xh": "XHTTP"}
+XRAY = (glob.glob("/usr/local/x-ui/bin/xray-linux-*") or [""])[0]
+SNIFF = {"enabled": True, "destOverride": ["http", "tls", "quic"], "metadataOnly": False, "routeOnly": True}
+def inbounds():
     r = api("/panel/api/inbounds/list")
     if not r.get("success"):
         die("could not list inbounds:", r.get("msg"))
-    return next((i for i in r.get("obj") or [] if i.get("remark") == REMARK), None)
+    return [i for i in r.get("obj") or [] if isinstance(i, dict)]
+def by_remark():
+    return {i.get("remark"): i for i in inbounds()}
 def listening(pt):
     return "xray" in sh(f"ss -Htlnp 'sport = :{pt}'")
+def vlessenc():
+    out = sh(f"{XRAY} vlessenc").splitlines()
+    for n, l in enumerate(out):
+        if "X25519" in l and n + 2 < len(out):
+            return out[n + 1].split('"')[3], out[n + 2].split('"')[3]
+    die("the panel's Xray has no 'vlessenc'; update Xray-core in the panel")
+def stream(kind):  # no TLS: VLESS Encryption is the security layer, as for ew/ex in 3xui-setup.sh
+    s = {"network": {"tcp": "tcp", "ws": "ws", "xh": "xhttp"}[kind], "security": "none", "externalProxy": []}
+    if kind == "tcp":
+        s["tcpSettings"] = {"acceptProxyProtocol": False, "header": {"type": "none"}}
+    elif kind == "ws":
+        s["wsSettings"] = {"acceptProxyProtocol": False, "path": "/" + secrets.token_hex(5), "host": "",
+                           "headers": {}, "heartbeatPeriod": 30}
+    else:
+        s["xhttpSettings"] = {"path": "/" + secrets.token_hex(5), "host": "", "mode": "auto",
+                              "xPaddingBytes": "100-1000", "noSSEHeader": False,
+                              "scMaxEachPostBytes": "1000000", "scMaxBufferedPosts": 30}
+    return s
+
+def drop_hosts(iid):
+    old = api(f"/panel/api/hosts/byInbound/{iid}").get("obj") or []
+    for gid in {h.get("groupId") for h in old if isinstance(h, dict) and str(h.get("remark", "")).startswith("🎒 BP ")}:
+        if gid:
+            r = api(f"/panel/api/hosts/del/{gid}", post=True)
+            if not r.get("success"):
+                die("could not remove an old tunnel Host:", r.get("msg"))
+
+def drop(ib):  # one of our inbounds with its Hosts; clients keep their other inbounds
+    drop_hosts(ib["id"])
+    for e in emails_of(ib):
+        if e:
+            api(f"/panel/api/clients/{quote(e, safe='')}/detach", {"inboundIds": [ib["id"]]})
+    r = api(f"/panel/api/inbounds/del/{ib['id']}", post=True)
+    if not r.get("success"):
+        die(f"could not delete inbound '{ib.get('remark')}':", r.get("msg"))
 
 def prep():
-    ib = ours()
-    if not ib:
-        xray = (glob.glob("/usr/local/x-ui/bin/xray-linux-*") or [""])[0]
-        kv = {}
-        for l in sh(f"{xray} x25519").splitlines():
-            k, _, v = l.partition(":"); kv[k.strip()] = v.strip()
-        priv = kv.get("PrivateKey") or kv.get("Private key")
-        pub = kv.get("Password (PublicKey)") or kv.get("Password") or kv.get("PublicKey") or kv.get("Public key")
-        if not (priv and pub):
-            die("could not generate a REALITY key pair with", xray or "the panel's xray")
-        pool = ["www.microsoft.com", "dl.google.com", "www.samsung.com", "www.nvidia.com", "www.apple.com"]
-        sni = next((s for s in pool if "TLSv1.3" in (o := sh(f"echo | timeout 6 openssl s_client -connect {s}:443 "
-                    f"-servername {s} -alpn h2 -tls1_3 2>/dev/null", 10)) and "ALPN protocol: h2" in o), pool[0])
-        used = {i.get("port") for i in api("/panel/api/inbounds/list").get("obj") or []}
+    have = by_remark()
+    if LEGACY in have:
+        drop(have.pop(LEGACY))
+        warn("removed the old REALITY tunnel inbound and its Hosts")
+    used = {i.get("port") for i in have.values()}
+    for kind, remark in KINDS.items():
+        if remark in have:
+            continue
         port = next(p for p in range(20443, 60000, 7) if p not in used and not sh(f"ss -Htln 'sport = :{p}'"))
-        stream = {"network": "tcp", "security": "reality", "externalProxy": [],
-                  "tcpSettings": {"acceptProxyProtocol": False, "header": {"type": "none"}},
-                  "realitySettings": {"show": False, "xver": 0, "target": f"{sni}:443", "serverNames": [sni],
-                                      "privateKey": priv, "minClientVer": "", "maxClientVer": "", "maxTimediff": 0,
-                                      "shortIds": [secrets.token_hex(8)],
-                                      "settings": {"publicKey": pub, "fingerprint": "chrome", "serverName": "", "spiderX": "/"}}}
-        r = api("/panel/api/inbounds/add", {"up": 0, "down": 0, "total": 0, "remark": REMARK, "enable": True,
+        used.add(port)
+        dec, enc = vlessenc()
+        r = api("/panel/api/inbounds/add", {"up": 0, "down": 0, "total": 0, "remark": remark, "enable": True,
                                             "expiryTime": 0, "listen": "127.0.0.1", "port": port, "protocol": "vless",
-                                            "settings": {"clients": [], "decryption": "none", "fallbacks": []},
-                                            "streamSettings": stream,
-                                            "sniffing": {"enabled": True, "destOverride": ["http", "tls", "quic"],
-                                                         "metadataOnly": False, "routeOnly": True}})
+                                            "settings": {"clients": [], "decryption": dec, "encryption": enc},
+                                            "streamSettings": stream(kind), "sniffing": SNIFF})
         if not r.get("success"):
-            die("the panel refused the tunnel inbound:", r.get("msg"))
-        ib = ours()
-        if not ib:
-            die("the tunnel inbound was added but is not listed")
-    iid, st = ib["id"], stream_of(ib)
-    rs = st.get("realitySettings") or {}
+            die(f"the panel refused the {LABEL[kind]} tunnel inbound:", r.get("msg"))
+    have = by_remark()
+    mine = {k: have.get(r) for k, r in KINDS.items()}
+    if not all(mine.values()):
+        die("the tunnel inbounds were added but are not listed")
     clients = [c for c in api("/panel/api/clients/list").get("obj") or [] if isinstance(c, dict)]
     c = next((c for c in clients if c.get("comment") == MARK and c.get("subId")), None) or \
         next((c for c in clients if c.get("comment") == "backpack-setup" and c.get("subId")), None)
-    if c and c["email"] not in emails_of(ib):  # a re-run finds it attached already
-        r = api(f"/panel/api/clients/{quote(c['email'], safe='')}/attach", {"inboundIds": [iid]})
-        if not r.get("success"):  # e.g. attached already; the client test catches a real miss
-            warn("attach client:", r.get("msg"))
-    elif not c:
+    ids = [ib["id"] for ib in mine.values()]
+    if c:
+        missing = [ib["id"] for ib in mine.values() if c["email"] not in emails_of(ib)]
+        if missing:
+            r = api(f"/panel/api/clients/{quote(c['email'], safe='')}/attach", {"inboundIds": missing})
+            if not r.get("success"):  # e.g. attached already; the client test catches a real miss
+                warn("attach client:", r.get("msg"))
+    else:
         c = {"email": f"backpack-{secrets.token_hex(4)}", "flow": "xtls-rprx-vision",
              "subId": "".join(secrets.choice(string.ascii_lowercase + string.digits) for _ in range(16)),
              "totalGB": 0, "expiryTime": 0, "limitIp": 0, "enable": True, "tgId": 0, "comment": "backpack-setup"}
-        r = api("/panel/api/clients/add", {"client": c, "inboundIds": [iid]})
+        r = api("/panel/api/clients/add", {"client": c, "inboundIds": ids})
         if not r.get("success"):
             die("could not create a client:", r.get("msg"))
     api("/panel/api/server/restartXrayService", post=True)
     for _ in range(12):
         time.sleep(1.5)
-        if listening(ib["port"]):
+        if all(listening(ib["port"]) for ib in mine.values()):
             break
     else:
-        die(f"Xray is not listening on 127.0.0.1:{ib['port']} after the restart")
+        die("Xray is not listening on the tunnel inbounds after the restart:",
+            ", ".join(str(ib["port"]) for ib in mine.values()))
     r = api("/panel/api/setting/all", post=True)
     if not r.get("success"):
         die("could not read subscription settings:", r.get("msg"))
@@ -369,49 +393,38 @@ def prep():
         api("/panel/api/setting/restartPanel", post=True)
         time.sleep(8)
     norm = lambda p, d: "/" + (p or d).strip("/") + "/"
-    out = {"XRAY_PORT": ib["port"], "SNI": (rs.get("serverNames") or [""])[0], "PBK": (rs.get("settings") or {}).get("publicKey", ""),
-           "SID": (rs.get("shortIds") or [""])[0], "KDOMAIN": DOMAIN, "KSUB_PORT": int(s.get("subPort") or 2096),
-           "KSUB_TLS": int(bool(s.get("subCertFile") and s.get("subKeyFile"))), "KSUB_PATH": norm(s.get("subPath"), "/sub/"),
-           "SUB_ID": c["subId"], "CLIENT": c["email"]}
+    out = {f"XP_{k}": ib["port"] for k, ib in mine.items()}
+    out.update({"KDOMAIN": DOMAIN, "KSUB_PORT": int(s.get("subPort") or 2096),
+                "KSUB_TLS": int(bool(s.get("subCertFile") and s.get("subKeyFile"))),
+                "KSUB_PATH": norm(s.get("subPath"), "/sub/"), "SUB_ID": c["subId"], "CLIENT": c["email"]})
     for k, v in out.items():
         print(f"{k}={v}")
 
-def drop_hosts(iid):
-    old = api(f"/panel/api/hosts/byInbound/{iid}").get("obj") or []
-    for gid in {h.get("groupId") for h in old if isinstance(h, dict) and str(h.get("remark", "")).startswith("🎒 BP ")}:
-        if gid:
-            r = api(f"/panel/api/hosts/del/{gid}", post=True)
-            if not r.get("success"):
-                die("could not remove an old tunnel Host:", r.get("msg"))
-
 def remove():
-    ib = ours()
-    if not ib:
-        print("REMOVED=0")
-        return
-    drop_hosts(ib["id"])
-    for e in emails_of(ib):  # clients keep their other inbounds
-        if e:
-            api(f"/panel/api/clients/{quote(e, safe='')}/detach", {"inboundIds": [ib["id"]]})
-    r = api(f"/panel/api/inbounds/del/{ib['id']}", post=True)
-    if not r.get("success"):
-        die("could not delete the tunnel inbound:", r.get("msg"))
-    api("/panel/api/server/restartXrayService", post=True)
-    print("REMOVED=1")
+    have, n = by_remark(), 0
+    for remark in [LEGACY, *KINDS.values()]:
+        if remark in have:
+            drop(have[remark])
+            n += 1
+    if n:
+        api("/panel/api/server/restartXrayService", post=True)
+    print(f"REMOVED={n}")
 
-def hosts(ip, pairs):
-    ib = ours()
-    if not ib:
-        die("the tunnel inbound is gone")
-    drop_hosts(ib["id"])
+def hosts(ip, pairs):  # pairs: transport:kind:port
+    have = by_remark()
+    mine = {k: have.get(r) for k, r in KINDS.items()}
+    if not all(mine.values()):
+        die("a tunnel inbound is gone; run the update again")
+    for ib in mine.values():
+        drop_hosts(ib["id"])
     n = 0
     for i, pair in enumerate(pairs):
-        t, _, pt = pair.partition(":")
-        r = api("/panel/api/hosts/add", {"inboundIds": [ib["id"]], "remark": f"🎒 BP {t}", "hosts": [ip],
-                                         "port": int(pt), "security": "same", "sortOrder": i})
+        t, k, pt = pair.split(":")
+        r = api("/panel/api/hosts/add", {"inboundIds": [mine[k]["id"]], "remark": f"🎒 BP {t} · {LABEL[k]}",
+                                         "hosts": [ip], "port": int(pt), "security": "same", "sortOrder": i})
         n += bool(r.get("success"))
         if not r.get("success"):
-            die(f"host {t}: {r.get('msg')}")
+            die(f"host {t} {LABEL[k]}: {r.get('msg')}")
     print(f"HOSTS={n}")
 
 def test_clients(subid, ip, pairs):
@@ -424,7 +437,7 @@ def test_clients(subid, ip, pairs):
                                    f"{scheme}://{DOMAIN}:{port}{path}{subid}"]))
     except ValueError:
         die("could not read the JSON subscription for the client test")
-    wanted = {int(p.split(":")[1]): p.split(":")[0] for p in pairs}
+    wanted = {int(p.split(":")[2]): "_".join(p.split(":")[:2]) for p in pairs}  # port -> transport_kind
     ins, outs, rules, meta, sockets = [], [], [], [], []
     proc = None
     try:
@@ -751,27 +764,32 @@ load_saved() {
   [[ -n $cli_dom ]] && IR_DOMAIN=$cli_dom
   [[ -n $cli_sp ]] && SSH_PORT=$cli_sp
   [[ -n $cli_sh ]] && SSH_HOST=$cli_sh
-  TAKEN+=" $(grep -E '^(TUN|PUB|SFW)_' "$INFO_FILE" | cut -d= -f2 | tr '\n' ' ')"
+  # old REALITY ports (PUB_<transport>) are free again once the tunnels are rebuilt
+  TAKEN+=" $(grep -E '^(TUN_|SFW_|PUB_(tcp|ws|xh)_)' "$INFO_FILE" | cut -d= -f2 | tr '\n' ' ')"
   say "Reusing the tunnel ports and subscription port from $INFO_FILE"
 }
 
+KINDS=(tcp ws xh) # panel inbounds every tunnel forwards to: VLESS Encryption over TCP, WS, XHTTP
+
+kind_label() { case $1 in tcp) echo TCP ;; ws) echo WS ;; xh) echo XHTTP ;; esac; }
+
 setup_panel() {
-  say "Step 3: \"BackPack tunnel\" inbound in the kharej's 3x-ui"
+  say "Step 3: TCP, WS and XHTTP tunnel inbounds in the kharej's 3x-ui"
   local out k
   out=$(kpanel prep)
-  for k in XRAY_PORT SNI PBK SID KDOMAIN KSUB_PORT KSUB_TLS KSUB_PATH SUB_ID CLIENT; do
+  for k in XP_tcp XP_ws XP_xh KDOMAIN KSUB_PORT KSUB_TLS KSUB_PATH SUB_ID CLIENT; do
     printf -v "$k" '%s' "$(kv "$k" "$out")"
     [[ -n ${!k} ]] || die "The panel step returned no $k"
   done
   local scheme=http
   [[ $KSUB_TLS == 1 ]] && scheme=https
   PANEL_SUB_URL="$scheme://$KDOMAIN:$KSUB_PORT$KSUB_PATH$SUB_ID"
-  say "Inbound on kharej 127.0.0.1:$XRAY_PORT (REALITY, cover $SNI), client $CLIENT"
+  say "Inbounds on kharej 127.0.0.1 (VLESS Encryption): TCP $XP_tcp, WS $XP_ws, XHTTP $XP_xh; client $CLIENT"
 }
 
 # Tuning: the values BackPack's own "turbo" preset writes.
 render() { # <server|client> <transport>
-  local role=$1 t=$2 tun_var="TUN_$2" pub_var="PUB_$2" sfw_var="SFW_$2"
+  local role=$1 t=$2 tun_var="TUN_$2" sfw_var="SFW_$2" k v x
   printf '# Generated by backpack-setup.sh (bpt)\n# name = "%s-%s"\n\n' "$PREFIX" "$t"
   if [[ $role == server ]]; then
     printf '[server]\nbind_addr = "0.0.0.0:%s"\n' "${!tun_var}"
@@ -802,9 +820,15 @@ render() { # <server|client> <transport>
       ;;
   esac
   printf 'sniffer = false\n'
-  # users -> Xray inbound; loopback -> the panel's subscription (for bpt-sub)
-  [[ $role == server ]] && printf 'ports = [\n    "%s=127.0.0.1:%s",\n    "127.0.0.1:%s=127.0.0.1:%s",\n]\n' \
-    "${!pub_var}" "$XRAY_PORT" "${!sfw_var}" "$KSUB_PORT"
+  if [[ $role == server ]]; then
+    # users -> the TCP / WS / XHTTP inbounds; loopback -> the panel's subscription (for bpt-sub)
+    printf 'ports = [\n'
+    for k in "${KINDS[@]}"; do
+      v="PUB_${k}_$t" x="XP_$k"
+      printf '    "%s=127.0.0.1:%s",\n' "${!v}" "${!x}"
+    done
+    printf '    "127.0.0.1:%s=127.0.0.1:%s",\n]\n' "${!sfw_var}" "$KSUB_PORT"
+  fi
   return 0
 }
 
@@ -813,83 +837,82 @@ setup_tunnels() {
   command -v iptables > /dev/null 2>&1 || warn "iptables is missing on Iran: pck will be unreliable."
   bp_clear
   kfn bp_clear
-  local t tun_var pub_var sfw_var
+  local t k v tun_var sfw_var
   for t in "${TRANSPORTS[@]}"; do
-    tun_var="TUN_$t" pub_var="PUB_$t" sfw_var="SFW_$t"
+    tun_var="TUN_$t" sfw_var="SFW_$t"
     [[ -n ${!tun_var:-} ]] || free_port "$tun_var" 4101
-    [[ -n ${!pub_var:-} ]] || free_port "$pub_var" 2101
     [[ -n ${!sfw_var:-} ]] || free_port "$sfw_var" 4201
+    for k in "${KINDS[@]}"; do
+      v="PUB_${k}_$t"
+      [[ -n ${!v:-} ]] || free_port "$v" 2101
+      open_port "${!v}" tcp
+    done
     case $t in
       kcp | quic) open_port "${!tun_var}" udp ;;
       xdi) ;;
       *) open_port "${!tun_var}" tcp ;;
     esac
-    open_port "${!pub_var}" tcp
     bp_apply "$PREFIX-$t" "$(render server "$t")"
     kfn bp_apply "$PREFIX-$t" "$(render client "$t")"
   done
 }
 
-# REALITY sends a client without the key to the real cover site, so a TLS
-# request for the cover site through the Iran port only succeeds when the
-# whole path (BackPack server -> tunnel -> kharej -> Xray) works.
-e2e_ok() { # <public port>
-  local code
-  code=$(curl -so /dev/null -m 8 -w '%{http_code}' --connect-to "$SNI:443:127.0.0.1:$1" "https://$SNI/" 2> /dev/null || true)
+# The panel's subscription server answers through each tunnel's loopback
+# forward, so any HTTP answer there means Iran -> tunnel -> kharej works.
+tunnel_up() { # <loopback forward port>
+  local code scheme=http
+  [[ $KSUB_TLS == 1 ]] && scheme=https
+  code=$(curl -sk -o /dev/null -m 8 -w '%{http_code}' "$scheme://127.0.0.1:$1/" 2> /dev/null || true)
   [[ -n $code && $code != 000 ]]
 }
 
 test_tunnels() {
-  say "Step 5: end-to-end test (up to 90 s)"
-  WORKING=()
-  local pending=("${TRANSPORTS[@]}") left t pub_var deadline=$((SECONDS + 90))
-  declare -gA RESULT=()
+  say "Step 5: waiting for the tunnels to connect (up to 90 s)"
+  UP=() WORKING=()
+  local pending=("${TRANSPORTS[@]}") left t sfw_var deadline=$((SECONDS + 90))
+  declare -gA RESULT=() LINK=()
   while [[ ${#pending[@]} -gt 0 && $SECONDS -lt $deadline ]]; do
     sleep 5
     left=()
     for t in "${pending[@]}"; do
-      pub_var="PUB_$t"
-      if e2e_ok "${!pub_var}"; then RESULT[$t]=ok; else left+=("$t"); fi
+      sfw_var="SFW_$t"
+      if tunnel_up "${!sfw_var}"; then RESULT[$t]=up; else left+=("$t"); fi
     done
     pending=("${left[@]}")
   done
   for t in "${TRANSPORTS[@]}"; do
-    [[ ${RESULT[$t]:-} == ok ]] && WORKING+=("$t")
+    [[ ${RESULT[$t]:-} == up ]] && UP+=("$t")
   done
   return 0
 }
 
 setup_hosts_and_sub() {
-  local t pub_var sfw_var pairs=() ups=""
-  if [[ ${#WORKING[@]} -eq 0 ]]; then
-    warn "No tunnel works, so the panel Hosts and the subscription are left as they were."
+  local t k v p pairs=() ups="" out
+  if [[ ${#UP[@]} -eq 0 ]]; then
+    warn "No tunnel connected, so the panel Hosts and the subscription are left as they were."
     return 0
   fi
-  for t in "${WORKING[@]}"; do
-    pub_var="PUB_$t" sfw_var="SFW_$t"
-    pairs+=("$t:${!pub_var}")
-    ups+="${ups:+,}${!sfw_var}"
+  for t in "${UP[@]}"; do
+    v="SFW_$t"
+    ups+="${ups:+,}${!v}"
+    for k in "${KINDS[@]}"; do
+      v="PUB_${k}_$t"
+      pairs+=("$t:$k:${!v}")
+    done
   done
-  local out
   out=$(kpanel hosts "$ADDR" "${pairs[@]}")
-  [[ $(kv HOSTS "$out") == "${#WORKING[@]}" ]] || die "Not all tunnel Hosts were added"
-  say "Panel Hosts: ${#WORKING[@]} added"
-  say "Testing authenticated VLESS clients through the Iran ports to the internet"
+  [[ $(kv HOSTS "$out") == "${#pairs[@]}" ]] || die "Not all tunnel Hosts were added"
+  say "Testing ${#pairs[@]} links with real VLESS clients through the Iran ports to the internet"
   out=$(kpanel test "$SUB_ID" "$ADDR" "${pairs[@]}")
-  local passed=()
-  pairs=() ups=""
-  for t in "${WORKING[@]}"; do
-    RESULT[$t]=$(kv "E2E_$t" "$out")
-    [[ ${RESULT[$t]} == ok ]] || continue
-    passed+=("$t")
-    pub_var="PUB_$t" sfw_var="SFW_$t"
-    pairs+=("$t:${!pub_var}")
-    ups+="${ups:+,}${!sfw_var}"
+  for p in "${pairs[@]}"; do
+    IFS=: read -r t k _ <<< "$p"
+    LINK[${t}_$k]=$(kv "E2E_${t}_$k" "$out")
+    [[ ${LINK[${t}_$k]} == ok ]] && WORKING+=("$p")
   done
-  WORKING=("${passed[@]}")
-  [[ ${#WORKING[@]} -gt 0 ]] || die "No authenticated VLESS client passed the internet test"
-  out=$(kpanel hosts "$ADDR" "${pairs[@]}")
-  [[ $(kv HOSTS "$out") == "${#WORKING[@]}" ]] || die "Could not refresh tested tunnel Hosts"
+  [[ ${#WORKING[@]} -gt 0 ]] || die "No VLESS client passed the internet test"
+  out=$(kpanel hosts "$ADDR" "${WORKING[@]}")
+  [[ $(kv HOSTS "$out") == "${#WORKING[@]}" ]] || die "Could not refresh the tested tunnel Hosts"
+  say "Panel Hosts: ${#WORKING[@]} working links"
 
   [[ -n ${SUB_PORT:-} ]] || free_port SUB_PORT 2095
   mkdir -p "$(dirname "$SUB_PY")"
@@ -927,37 +950,45 @@ UNIT
 }
 
 write_info() {
-  local t a b c
+  local t k v
   install -m 0600 /dev/null "$INFO_FILE"
   {
     printf 'KH_IP=%s\nTOKEN_BASE=%s\nSUB_PORT=%s\n' "$KH_IP" "$TOKEN_BASE" "${SUB_PORT:-}"
     printf 'SSH_PORT=%s\nSSH_HOST=%s\nIR_DOMAIN=%s\nFIXED_IRAN_IP=%s\n' "$SSH_PORT" "$SSH_HOST" "$IR_DOMAIN" "$FIXED_IRAN_IP"
     printf 'SUB_URL=%q\nPANEL_SUB_URL=%q\n' "${SUB_URL:-}" "${PANEL_SUB_URL:-}"
     for t in "${ALL_TRANSPORTS[@]}"; do
-      a="TUN_$t" b="PUB_$t" c="SFW_$t"
-      [[ -n ${!a:-} ]] && printf '%s=%s\n%s=%s\n%s=%s\n' "$a" "${!a}" "$b" "${!b}" "$c" "${!c}"
+      for v in "TUN_$t" "SFW_$t" "PUB_tcp_$t" "PUB_ws_$t" "PUB_xh_$t"; do
+        [[ -n ${!v:-} ]] && printf '%s=%s\n' "$v" "${!v}"
+      done
     done
   } > "$INFO_FILE"
   return 0
 }
 
 print_summary() {
-  local t pub_var tun_var
+  local t k v tun_var cells
   printf '\n==============================================================\n'
   printf ' BackPack tunnels  (Iran %s  <-  kharej %s)\n' "$IRAN_IP" "$KH_IP"
   printf '==============================================================\n'
-  printf ' %-9s %-12s %-12s %s\n' transport "user port" "tunnel port" result
+  printf ' %-9s %-7s %-11s %-11s %s\n' transport tunnel TCP WS XHTTP
   for t in "${ALL_TRANSPORTS[@]}"; do
-    pub_var="PUB_$t" tun_var="TUN_$t"
+    tun_var="TUN_$t"
     if [[ " ${TRANSPORTS[*]} " != *" $t "* ]]; then
-      printf ' %-9s %-12s %-12s %s\n' "$t" - - "skipped (route test)"
+      printf ' %-9s skipped (route test)\n' "$t"
+    elif [[ ${RESULT[$t]:-} != up ]]; then
+      printf ' %-9s %-7s did not connect\n' "$t" "${!tun_var}"
     else
-      printf ' %-9s %-12s %-12s %s\n' "$t" "${!pub_var}/tcp" "${!tun_var}" "${RESULT[$t]:-FAIL}"
+      cells=()
+      for k in "${KINDS[@]}"; do
+        v="PUB_${k}_$t"
+        cells+=("${!v} ${LINK[${t}_$k]:-FAIL}")
+      done
+      printf ' %-9s %-7s %-11s %-11s %s\n' "$t" "${!tun_var}" "${cells[@]}"
     fi
   done
   if [[ ${#WORKING[@]} -gt 0 ]]; then
-    printf '\n 3x-ui: inbound "🎒 BackPack tunnel" with %s Hosts (one per working transport).\n' "${#WORKING[@]}"
-    printf ' Every client attached to that inbound gets these links; client %s is.\n' "$CLIENT"
+    printf '\n 3x-ui: inbounds "🎒 BackPack TCP / WS / XHTTP" with %s Hosts (one per working link).\n' "${#WORKING[@]}"
+    printf ' Every client attached to these inbounds gets the links; client %s is.\n' "$CLIENT"
     printf ' Tunnel links in the subscription: %s\n' "${SUB_LINKS:-0}"
     command -v qrencode > /dev/null 2>&1 || pkg_install qrencode
     command -v qrencode > /dev/null 2>&1 && qrencode -t UTF8 -m 2 -l M "$SUB_URL"
@@ -967,23 +998,23 @@ print_summary() {
     fi
     printf ' For any other client: http://%s:%s%s<its subId>\n' "$ADDR" "$SUB_PORT" "$KSUB_PATH"
   else
-    warn "No tunnel passed the end-to-end test. Logs: journalctl -u backpack-$PREFIX-tcp -n 50 (on both servers)"
+    warn "No link passed the end-to-end test. Logs: journalctl -u backpack-$PREFIX-tcp -n 50 (on both servers)"
   fi
   printf '\n Settings: %s   Manage tunnels: backpack tunnel list, sudo backpack\n' "$INFO_FILE"
   printf ' Open the user ports (TCP) and tunnel ports (TCP, UDP for kcp/quic)\n'
-  printf ' in the Iran provider firewall too. A FAIL tunnel may still come up;\n'
-  printf ' re-run to retest and refresh the panel Hosts.\n'
+  printf ' in the Iran provider firewall too. A FAIL link may still come up;\n'
+  printf ' run the update to retest and refresh the panel Hosts.\n'
   printf '==============================================================\n'
 }
 
-do_install() {
+do_install() { # install, or update: newest BackPack, configs added since, everything retested
   [[ -n $KH_IP ]] || ask KH_IP "Kharej server IP: "
   [[ $KH_IP =~ ^[0-9]{1,3}(\.[0-9]{1,3}){3}$ ]] || die "Give the kharej IP: bash backpack-setup.sh <kharej-ip>"
   if [[ ! -f $INFO_FILE && -z $IR_DOMAIN ]]; then
     ask IR_DOMAIN "Iran domain for the configs (A record -> this server; Enter = use the IP): "
     is_domain "$IR_DOMAIN" || die "Not a domain: $IR_DOMAIN"
   fi
-  say "$(date -Is) install -> kharej $KH_IP"
+  say "$(date -Is) $ACTION -> kharej $KH_IP"
   [[ -n ${TOKEN_BASE:-} ]] || TOKEN_BASE=$(openssl rand -hex 16)
   run_tests
   check_domain
@@ -997,27 +1028,13 @@ do_install() {
   setup_hosts_and_sub
   write_info
   print_summary
-  [[ ${#WORKING[@]} -gt 0 ]] || die "No working tunnel"
-}
-
-do_update() {
-  [[ -n $KH_IP ]] || die "Nothing is installed yet ($INFO_FILE is missing); run the install first."
-  say "$(date -Is) update -> kharej $KH_IP"
-  ssh_connect
-  KH_ARCH=$(kv ARCH "$(kfn k_prep)")
-  IR_ARCH=$(bp_arch)
-  IR_GH=0
-  curl -fsSI -m 15 https://github.com > /dev/null 2>&1 && IR_GH=1
-  install_backpack
-  bp_restart
-  kfn bp_restart
-  say "Tunnels restarted on both servers. Run the install again to retest them and refresh the panel Hosts."
+  [[ ${#WORKING[@]} -gt 0 ]] || die "No working link"
 }
 
 do_uninstall() {
   [[ -n $KH_IP ]] || die "Nothing to uninstall ($INFO_FILE is missing)."
   local a=""
-  ask a "Remove the bpt tunnels on both servers, the subscription service and the panel's BackPack inbound? [y/N] "
+  ask a "Remove the bpt tunnels on both servers, the subscription service and the panel's BackPack inbounds? [y/N] "
   [[ $a == [yY]* ]] || die "Cancelled."
   say "$(date -Is) uninstall -> kharej $KH_IP"
   bp_clear
@@ -1025,8 +1042,8 @@ do_uninstall() {
   rm -f /etc/systemd/system/bpt-sub.service "$SUB_PY"
   systemctl daemon-reload
   ssh_connect
-  if [[ $(kv XUI "$(kfn k_prep)") == 1 && $(kv REMOVED "$(kpanel remove)") == 1 ]]; then
-    say "Panel: the BackPack inbound and its Hosts are removed (clients keep their other inbounds)"
+  if [[ $(kv XUI "$(kfn k_prep)") == 1 ]]; then
+    say "Panel: $(kv REMOVED "$(kpanel remove)") BackPack inbound(s) and their Hosts removed (clients keep their other inbounds)"
   fi
   kfn bp_clear
   rm -f "$INFO_FILE" # last, so a failed run can be repeated
@@ -1038,13 +1055,13 @@ choose_action() {
     ACTION=install
     return 0
   fi
-  printf '\n BackPack tunnels (kharej %s)\n  1) Install again: retest and refresh the configs\n  2) Update BackPack on both servers\n  3) Uninstall\n' "$KH_IP"
+  printf '\n BackPack tunnels (kharej %s)\n' "$KH_IP"
+  printf '  1) Update: newest BackPack, new configs, retest everything\n  2) Uninstall\n'
   local c=""
-  ask c "Choose [1-3]: "
+  ask c "Choose [1-2]: "
   case $c in
-    1) ACTION=install ;;
-    2) ACTION=update ;;
-    3) ACTION=uninstall ;;
+    1) ACTION=update ;;
+    2) ACTION=uninstall ;;
     *) die "Nothing chosen." ;;
   esac
 }
@@ -1072,8 +1089,7 @@ main() {
   [[ -z $SSH_HOST || -n $IRAN_IP ]] || die "--ssh-host needs --iran-ip as well"
   [[ -n $ACTION ]] || choose_action
   case $ACTION in
-    install) do_install ;;
-    update) do_update ;;
+    install | update) do_install ;;
     uninstall) do_uninstall ;;
   esac
 }

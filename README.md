@@ -9,6 +9,7 @@ scripts as root. Use the generators from your development environment.
 | Set up a 3x-ui panel and proxy configs | [3xui-setup.sh](#3xui-setupsh) | `x-ui` or re-run the setup script to add configs |
 | Tunnel an Iran server to a kharej server with BackPack | [backpack-setup.sh](#backpack-setupsh) | re-run the script for its menu, or `sudo backpack` |
 | Run AdGuard Home and a DNS relay | [dns-setup.sh](#dns-setupsh) | `dnsctl` |
+| Run an AmneziaWG server for gaming | [game-setup.sh](#game-setupsh) | `gamectl` |
 | Run n8n on a VPS, Linux desktop or WSL | [n8n-setup.sh](#n8n-setupsh) | `n8nctl` |
 | Deploy a static frontend | [front-deploy.sh](#front-deploysh--front-updatesh) | `front-update` |
 | Deploy a Node.js or Django backend | [back-deploy.sh](#back-deploysh--back-updatesh) | `back-update` |
@@ -144,15 +145,19 @@ once, or uses your SSH key) and sets up both servers:
 2. Installs the latest BackPack release on both servers, checked against its
    `SHA256SUMS`. When Iran cannot reach GitHub, the files are copied from the
    kharej.
-3. Adds one VLESS REALITY Vision inbound on `127.0.0.1` to the kharej's
-   3x-ui and attaches its existing `3xui-setup` client (or creates one).
+3. Adds three inbounds on `127.0.0.1` to the kharej's 3x-ui: VLESS
+   Encryption over TCP, WS and XHTTP (no TLS and no SNI, like `ew`/`ex` in
+   `3xui-setup.sh`). It attaches the existing `3xui-setup` client to them,
+   or creates one.
 4. Makes one tunnel per BackPack transport, named `bpt-<transport>`, using
    BackPack's `turbo` preset: `tcp tcpmux stealth pck kcp quic ws wsmux wss
-   wssmux xdi`.
-5. Tests TLS forwarding, then real authenticated VLESS internet requests
-   through the Iran ports. Each passing transport gets a 3x-ui Host. The
-   panel's subscription is served from Iran (service `bpt-sub`) through
-   those tunnels, with automatic fallback between them.
+   wssmux xdi`. Each tunnel forwards three Iran ports, one per inbound, so
+   there are up to 33 links (11 transports x TCP / WS / XHTTP).
+5. Waits for each tunnel to connect, then tests every link with a real VLESS
+   client through its Iran port to the internet. Each passing link gets a
+   3x-ui Host, named like `🎒 BP kcp · WS`. The panel's subscription is
+   served from Iran (service `bpt-sub`) through those tunnels, with
+   automatic fallback between them.
 
 ```bash
 bash <(curl -Ls https://raw.githubusercontent.com/FarzinNs83/my-scripts/main/backpack-setup.sh) --kharej-domain panel.example.com --domain ir.example.com <kharej-ip>
@@ -168,9 +173,12 @@ Anything left out is asked for. Run it again with no arguments for a menu:
 
 | Menu / command | |
 | --- | --- |
-| Install again (`<kharej-ip>`) | Retest every tunnel and refresh the panel Hosts. Ports, tokens and links stay the same |
-| Update (`update`) | Install the newest BackPack on both servers and restart the tunnels |
-| Uninstall (`uninstall`) | Remove the `bpt-*` tunnels on both servers, `bpt-sub`, and the panel's BackPack inbound with its Hosts. BackPack and 3x-ui stay installed |
+| Update (`update`) | Install the newest BackPack on both servers, add configs that are new since the last run, and retest every link. Ports, tokens and the subscription link stay the same |
+| Uninstall (`uninstall`) | Remove the `bpt-*` tunnels on both servers, `bpt-sub`, and the panel's BackPack inbounds with their Hosts. BackPack and 3x-ui stay installed |
+
+The first version used one REALITY inbound ("🎒 BackPack tunnel"). The
+update removes it with its Hosts and adds the TCP / WS / XHTTP inbounds in
+its place, so clients only refresh the subscription.
 
 | Option | |
 | --- | --- |
@@ -199,7 +207,7 @@ bash backpack-setup.sh --ssh-host 127.0.0.1 --ssh-port 22222 \
 Close the management relay afterwards. BackPack connects the two VPSs
 directly and keeps running without it.
 
-- User ports start at 2101 (TCP). Tunnel ports start at 4101 (TCP, or UDP
+- User ports start at 2101 (TCP, three per transport). Tunnel ports start at 4101 (TCP, or UDP
   for `kcp`/`quic`). A busy port moves to the next free one. The script opens
   them in ufw / firewalld. Open them in the Iran provider firewall too.
 - Forwarding uses dedicated ports; BackPack and `bpt-sub` do not bind
@@ -208,10 +216,12 @@ directly and keeps running without it.
   validation still arrives on TCP/80, and a temporary firewall forward
   sends it to 18080 while the certificate is issued or renewed.
 - Users, traffic limits and expiry are managed in 3x-ui. Every client
-  attached to the "BackPack tunnel" inbound gets its tunnel Hosts.
-- Run it again to rebuild. Tunnel tokens and ports are kept in
-  `/root/backpack-tunnel-info.env`; client IDs and REALITY keys stay in
-  the panel. A tunnel that failed the test may pass on the next run.
+  attached to the "🎒 BackPack TCP / WS / XHTTP" inbounds gets their tunnel
+  Hosts. VLESS Encryption needs a client on a recent Xray-core (a recent
+  v2rayNG / v2rayN); an old client shows the links but cannot connect.
+- Tunnel tokens and ports are kept in `/root/backpack-tunnel-info.env`;
+  client IDs and VLESS Encryption keys stay in the panel. A link that failed
+  the test may pass on the next update.
 - The Iran subscription uses HTTP; its URL contains the client's access
   token, and filtering can block a VPN client's User-Agent. The script also
   prints the panel's HTTPS subscription when available; it contains the
@@ -224,6 +234,84 @@ directly and keeps running without it.
 
 Based on BackPack by Amin Mohammadi (AminMGMT)
 https://github.com/AminMGMT/BackPack
+
+## game-setup.sh
+
+An [AmneziaWG](https://github.com/amnezia-vpn/amneziawg-linux-kernel-module)
+server for games, run on the **kharej** server. Games send most of their
+traffic over UDP, which the DNS relay cannot carry and the BackPack tunnels
+are not built for. Players connect straight to this server over UDP.
+AmneziaWG is WireGuard with junk packets and random header values in the
+handshake, which makes it harder for DPI to detect. Data packets stay
+the same as WireGuard, so ping does not change.
+
+```bash
+bash <(curl -Ls https://raw.githubusercontent.com/FarzinNs83/my-scripts/main/game-setup.sh)
+gamectl add ali       # new player: prints the .conf and a QR code
+gamectl list          # players, IPs, last handshake
+gamectl show ali | remove ali | status | uninstall
+```
+
+- Installs `amneziawg` from the Amnezia PPA (Ubuntu, or Debian through the
+  `focal` suite) and builds the kernel module with DKMS. It needs a KVM or
+  dedicated VPS with the distribution kernel and its headers (not
+  OpenVZ/LXC).
+- It does not share anything with BackPack, 3x-ui, nginx or AdGuard Home.
+  It uses its own interface (`awg-game`), subnet (`10.66.66.0/24`,
+  `--subnet`) and unit (`awg-quick@awg-game`), plus its own NAT rules,
+  tagged `game-setup`. The UDP port is a random free port from 20000-60000
+  unless you pass `--port`, and a port in use is refused.
+- Opens the UDP port in ufw/firewalld when active. Open it in your
+  provider's firewall too.
+- Players use AmneziaVPN or AmneziaWG: import
+  `/etc/game-setup/clients/<name>.conf` or scan the QR code. Client MTU is
+  1280, all IPv4 traffic goes through the tunnel, and DNS is
+  `1.1.1.1, 8.8.8.8` (`--dns`).
+- `--endpoint game.example.com` puts a domain in the player configs
+  instead of the detected public IPv4.
+
+### Through the Iran server
+
+Players connect to an AmneziaWG server on the **Iran** server. Their
+traffic goes through a separate AmneziaWG tunnel, `awg-link`, to the
+kharej, which sends it out to the internet:
+
+```text
+players -> Iran (awg-game) -> awg-link -> kharej -> internet
+```
+
+The player-to-Iran leg stays domestic, and the international hop uses the
+Iran datacenter's link, which is usually more stable than a home ISP's.
+Each leg is encrypted once.
+
+```bash
+# 1. on the kharej: the link's server end; prints a one-line token
+bash game-setup.sh link
+# 2. on the Iran server (copy the script over if Iran cannot reach GitHub)
+bash game-setup.sh bridge --token <token>
+# 3. players are managed on Iran from now on
+gamectl add ali
+```
+
+- The token carries the kharej address and port, both link keys and the
+  AmneziaWG parameters, so no SSH is needed between the servers. It
+  contains Iran's private key, so keep it private. `gamectl link` on the
+  kharej prints it again.
+- Separate from the direct layout and from BackPack: the link uses
+  `10.67.67.0/30` and unit `awg-quick@awg-link`, and players on Iran use
+  `10.68.68.0/24` (`--subnet` on `link`). Both ports are random free ports
+  (`--port`).
+- On Iran, policy routing (table and rule priority `6767`) sends only the
+  players' subnet into the link. The Iran server's own traffic and
+  BackPack keep the normal route. Iran does no NAT: if the link is down,
+  players get no internet rather than leaking out of Iran.
+- `bridge` waits for the link handshake and warns if it does not come
+  (UDP blocked on the way, or the kharej firewall). `gamectl status` shows
+  both tunnels.
+- Iran needs the amneziawg package as well. When Launchpad is filtered
+  there, set an apt/https proxy for the install step.
+- Compare the ping with the direct layout, because the Iran route is not
+  faster on every ISP. `gamectl uninstall` on each server removes its side.
 
 ## dns-setup.sh
 
