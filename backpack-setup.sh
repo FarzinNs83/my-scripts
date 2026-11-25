@@ -282,9 +282,16 @@ for need in ("/panel/api/clients/list", "/panel/api/hosts/list"):
     if not api(need).get("success"):
         die("this 3x-ui is too old (no Clients/Hosts); run 3xui-setup.sh --force-install on the kharej")
 
+def field(ib, k):  # panels return these as a JSON string or already parsed
+    v = ib.get(k)
+    try:
+        return (json.loads(v) if isinstance(v, str) and v else v) or {}
+    except ValueError:
+        return {}
 def stream_of(ib):
-    st = ib.get("streamSettings")
-    return json.loads(st) if isinstance(st, str) and st else (st or {})
+    return field(ib, "streamSettings")
+def emails_of(ib):
+    return [x.get("email") for x in field(ib, "settings").get("clients", []) if isinstance(x, dict)]
 def ours():
     r = api("/panel/api/inbounds/list")
     if not r.get("success"):
@@ -331,14 +338,10 @@ def prep():
     clients = [c for c in api("/panel/api/clients/list").get("obj") or [] if isinstance(c, dict)]
     c = next((c for c in clients if c.get("comment") == MARK and c.get("subId")), None) or \
         next((c for c in clients if c.get("comment") == "backpack-setup" and c.get("subId")), None)
-    try:
-        attached = {x.get("email") for x in json.loads(ib.get("settings") or "{}").get("clients", [])}
-    except ValueError:
-        attached = set()
-    if c and c["email"] not in attached:  # a re-run finds it attached already
+    if c and c["email"] not in emails_of(ib):  # a re-run finds it attached already
         r = api(f"/panel/api/clients/{quote(c['email'], safe='')}/attach", {"inboundIds": [iid]})
-        if not r.get("success"):
-            die("could not attach the client:", r.get("msg"))
+        if not r.get("success"):  # e.g. attached already; the client test catches a real miss
+            warn("attach client:", r.get("msg"))
     elif not c:
         c = {"email": f"backpack-{secrets.token_hex(4)}", "flow": "xtls-rprx-vision",
              "subId": "".join(secrets.choice(string.ascii_lowercase + string.digits) for _ in range(16)),
@@ -387,11 +390,7 @@ def remove():
         print("REMOVED=0")
         return
     drop_hosts(ib["id"])
-    try:
-        emails = [x.get("email") for x in json.loads(ib.get("settings") or "{}").get("clients", [])]
-    except ValueError:
-        emails = []
-    for e in emails:  # clients keep their other inbounds
+    for e in emails_of(ib):  # clients keep their other inbounds
         if e:
             api(f"/panel/api/clients/{quote(e, safe='')}/detach", {"inboundIds": [ib["id"]]})
     r = api(f"/panel/api/inbounds/del/{ib['id']}", post=True)
