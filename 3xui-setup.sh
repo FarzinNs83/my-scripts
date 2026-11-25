@@ -135,15 +135,15 @@ Certificate:
                     subdomain of its own, not the DNS or n8n one
 
 Configs (added through the panel API at the end, one client for all):
-  rv  REALITY Vision          TCP 443     main config
-  rx  REALITY XHTTP           TCP 8443
-  ro  REALITY XHTTP obfs      TCP 2443    XHTTP extra: obfuscated padding
-  rp  REALITY XHTTP packet-up TCP 3443
+  rv  REALITY Vision          TCP 2443    main config
+  rx  REALITY XHTTP           TCP 3443
+  ro  REALITY XHTTP obfs      TCP 5443    XHTTP extra: obfuscated padding
+  rp  REALITY XHTTP packet-up TCP 6443
   rg  REALITY gRPC            TCP 4443
   tv  TLS Vision              TCP 9443    + Fragment and IPv6 links
   tx  TLS XHTTP               TCP 2087    + Fragment link, CDN link with --cdn
-  hy  Hysteria2 (Salamander)  UDP 443
-  th  TLS XHTTP over HTTP/3   UDP 8443
+  hy  Hysteria2 (Salamander)  UDP 7443
+  th  TLS XHTTP over HTTP/3   UDP 11443
   pq  VLESS Encryption+Sudoku TCP 10443   post-quantum
   ew  VLESS Encryption+WS     TCP 8880    no TLS; + Cloudflare HTTP link with --cdn
   ex  VLESS Encryption+XHTTP  TCP 2052    no TLS; + Cloudflare HTTP link with --cdn
@@ -152,8 +152,9 @@ Configs (added through the panel API at the end, one client for all):
   ss  Shadowsocks-2022        TCP+UDP 8080
   ws  CDN WebSocket           TCP 2053    only with --cdn, + clean IPs
   hu  CDN HTTPUpgrade         TCP 2083    only with --cdn
-  cg  CDN gRPC                TCP 2096    only with --cdn (gRPC on in Cloudflare)
-  kc  VLESS Encryption+mKCP   UDP 9443    not in "all"; ask with --configs
+  cg  CDN gRPC                TCP 8443    only with --cdn (gRPC on in Cloudflare)
+  kc  VLESS Encryption+mKCP   UDP 12443   not in "all"; ask with --configs
+No config uses port 80 or 443, and no two configs share a port (TCP or UDP).
 A busy port moves the config to the next free one. Configs Xray rejects, and
 ro/rp/cg/th/ew/ex/tt/tr/kc when they fail the end-to-end test, are removed
 again. The subscription links (with a QR code) are printed at the end.
@@ -1274,23 +1275,23 @@ for k in ("subPort", "webPort"):
         owner_tcp.setdefault(int(settings[k]), "3x-ui panel/subscription")
 owner_tcp.setdefault(int(PPORT), "3x-ui panel")
 
-CF_HTTPS = [443, 2053, 2083, 2087, 2096, 8443]
-PREF = {"rv": [443, 2443, 3443, 6443, 7443], "rx": [8443, 2443, 3443, 5443, 6443], "ro": [2443, 3443, 5443, 6443, 7443],
-        "rp": [3443, 5443, 6443, 7443, 9445], "rg": [4443, 5443, 7443, 9444],
-        "tv": [9443, 9444, 10444, 11444], "tx": [2087, 2053, 2083, 2096, 8443], "ws": [2053, 2083, 2087, 2096, 8443],
-        "hu": [2083, 2053, 2087, 2096, 8443], "cg": [2096, 8443, 2087, 2053, 2083, 443],
-        "hy": [443, 8443, 4443, 2053, 10443], "th": [8443, 4443, 2087, 10443], "pq": [10443, 11443, 12443, 13443],
-        "ew": [8880, 2052, 2082, 2086, 2095], "ex": [2052, 2082, 2086, 2095, 8880],
-        "tt": [14443, 15443, 16443], "tr": [14444, 15444, 16444],
-        "kc": [9443, 10443, 11443], "ss": [8080, 8388, 18080, 28080]}
-CF_HTTP = [80, 8080, 8880, 2052, 2082, 2086, 2095]     # Cloudflare ports without TLS
+# No config uses 80 or 443, and every config has a port of its own (a TCP and
+# a UDP config never share a number either). First choices are all different.
+CF_HTTPS = [2053, 2083, 2087, 2096, 8443]
+PREF = {"rv": [2443, 2444], "rx": [3443, 3444], "ro": [5443, 5444], "rp": [6443, 6444], "rg": [4443, 4444],
+        "tv": [9443, 9444], "tx": [2087, 2053, 2083, 8443, 2096], "ws": [2053, 2083, 2087, 8443, 2096],
+        "hu": [2083, 2053, 2087, 8443, 2096], "cg": [8443, 2087, 2053, 2083, 2096],
+        "hy": [7443, 7444], "th": [11443, 11444], "pq": [10443, 10444],
+        "ew": [8880, 2082, 2086, 2095], "ex": [2052, 2082, 2086, 2095],
+        "tt": [14443, 15443], "tr": [14444, 15444], "kc": [12443, 12444], "ss": [8080, 8388]}
+CF_HTTP = [8080, 8880, 2052, 2082, 2086, 2095]     # Cloudflare ports without TLS
 UDP_ONLY = {"hy", "kc", "th"}
 BOTH = {"ss"}
 
 def busy(pt, key):
-    t = pt in owner_tcp if key not in UDP_ONLY else False
-    u = pt in owner_udp if (key in UDP_ONLY or key in BOTH) else False
-    return (owner_tcp.get(pt) if t else None) or (owner_udp.get(pt) if u else None)
+    if pt in (80, 443):
+        return "reserved (no config on 80/443)"
+    return owner_tcp.get(pt) or owner_udp.get(pt)
 def claim(pt, key):
     if key not in UDP_ONLY: owner_tcp[pt] = "new config"
     if key in UDP_ONLY or key in BOTH: owner_udp[pt] = "new config"

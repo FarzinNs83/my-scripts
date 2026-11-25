@@ -60,15 +60,15 @@ REALITY, TLS or VLESS Encryption (Shadowsocks-2022 encrypts by itself).
 
 | Key | Config | Default port |
 | --- | --- | --- |
-| `rv` | REALITY Vision (main) | TCP 443 |
-| `rx` | REALITY XHTTP | TCP 8443 |
-| `ro` | REALITY XHTTP with extra (obfuscated padding) | TCP 2443 |
-| `rp` | REALITY XHTTP packet-up | TCP 3443 |
+| `rv` | REALITY Vision (main) | TCP 2443 |
+| `rx` | REALITY XHTTP | TCP 3443 |
+| `ro` | REALITY XHTTP with extra (obfuscated padding) | TCP 5443 |
+| `rp` | REALITY XHTTP packet-up | TCP 6443 |
 | `rg` | REALITY gRPC | TCP 4443 |
 | `tv` | TLS Vision, plus Fragment and IPv6 links | TCP 9443 |
 | `tx` | TLS XHTTP, plus Fragment and IPv6 links (and a CDN link with `--cdn`) | TCP 2087 |
-| `hy` | Hysteria2 with Salamander | UDP 443 |
-| `th` | TLS XHTTP over HTTP/3 (QUIC) | UDP 8443 |
+| `hy` | Hysteria2 with Salamander | UDP 7443 |
+| `th` | TLS XHTTP over HTTP/3 (QUIC) | UDP 11443 |
 | `pq` | VLESS Encryption (post-quantum) with Sudoku | TCP 10443 |
 | `ew` | VLESS Encryption over WebSocket, no TLS (plus a Cloudflare HTTP link with `--cdn`) | TCP 8880 |
 | `ex` | VLESS Encryption over XHTTP, no TLS (plus a Cloudflare HTTP link with `--cdn`) | TCP 2052 |
@@ -77,9 +77,12 @@ REALITY, TLS or VLESS Encryption (Shadowsocks-2022 encrypts by itself).
 | `ss` | Shadowsocks-2022 | TCP+UDP 8080 |
 | `ws` | Cloudflare CDN WebSocket, plus clean IPs | TCP 2053, only with `--cdn` |
 | `hu` | Cloudflare CDN HTTPUpgrade | TCP 2083, only with `--cdn` |
-| `cg` | Cloudflare CDN gRPC (turn gRPC on in Cloudflare > Network) | TCP 2096, only with `--cdn` |
-| `kc` | VLESS Encryption over mKCP. Not part of `all`, because most networks block mKCP now; ask for it with `--configs` | UDP 9443 |
+| `cg` | Cloudflare CDN gRPC (turn gRPC on in Cloudflare > Network) | TCP 8443, only with `--cdn` |
+| `kc` | VLESS Encryption over mKCP. Not part of `all`, because most networks block mKCP now; ask for it with `--configs` | UDP 12443 |
 
+- No config uses port 80 or 443, and no two configs share a port, TCP or
+  UDP. Configs that an earlier version put on 443 keep their port on a
+  re-run; delete them in the panel and re-run to move them.
 - A busy port moves the config to the next free one. The final summary lists
   the ports that were really used; open them in the provider firewall
   (IPv4 and IPv6, UDP for Hysteria2 and HTTP/3).
@@ -684,7 +687,7 @@ already uses. The smoothest order is dns-setup, then n8n, then 3x-ui.
 | TCP+UDP 853 | DoT / DoQ (AdGuard Home) |
 | random TCP 20000-40000 | 3x-ui panel |
 | TCP 2096 | 3x-ui subscription |
-| see the [config table](#configs) | 3x-ui configs. Ports that are taken (TCP 443 by nginx, for example) are skipped, so REALITY Vision lands on TCP 2443 here; the script prints the final list |
+| see the [config table](#configs) | 3x-ui configs, never on 80 or 443. Ports that are taken are skipped (TCP 10443 by n8n, for example, moves `pq` to 10444); the script prints the final list |
 | loopback only | 3000 and 18443 (AdGuard), 5678 and 10443 (n8n) |
 
 How the overlaps are handled:
