@@ -59,6 +59,7 @@ LE_LIVE="/etc/letsencrypt/live"
 LE_HOOK="/etc/letsencrypt/renewal-hooks/deploy/3xui-setup-restart.sh"
 ACME_HOOK="/usr/local/sbin/3xui-acme-hook"
 ACME_MODE="standalone" # standalone: acme.sh on TCP/80, nginx: certbot through nginx
+ACME_PORT=""
 
 DOMAIN=""
 SKIP_DNS=0
@@ -114,6 +115,8 @@ Options:
       --skip-dns-check  Do not verify that the subdomain points to this server
       --force-install   Reinstall/update to the newest release even if installed
       --open-firewall   Open panel, config and subscription ports in ufw/firewalld
+      --acme-port <n>   Standalone certificate listener (default 80); other ports
+                        use temporary TCP/80 forwarding, leaving 80/443 unbound
       --cdn <name>      Subdomain proxied by Cloudflare (orange cloud, SSL/TLS
                         Full) to this server; adds the CDN configs + clean IPs
       --configs <list>  "all" or a comma list of config keys (see below)
@@ -221,6 +224,10 @@ parse_args() {
       --open-firewall)
         OPEN_FIREWALL=1
         shift
+        ;;
+      --acme-port)
+        ACME_PORT=${2:?Option --acme-port needs a value}
+        shift 2
         ;;
       --no-inbounds)
         SKIP_INBOUNDS=1
@@ -430,6 +437,19 @@ EOF
 }
 
 precheck_port80() {
+  if [[ -z $ACME_PORT && -r $INFO_FILE ]]; then
+    ACME_PORT=$(sed -n "s/^XUI_ACME_HTTP_PORT='\([0-9]*\)'$/\1/p" "$INFO_FILE")
+  fi
+  ACME_PORT=${ACME_PORT:-80}
+  [[ $ACME_PORT =~ ^[0-9]{1,5}$ && $((10#$ACME_PORT)) -ge 1 && $((10#$ACME_PORT)) -le 65535 ]] || die "Invalid ACME port"
+  ACME_PORT=$((10#$ACME_PORT))
+  [[ $ACME_PORT != 443 ]] || die "Use an ACME listener other than TCP/443"
+  if [[ $ACME_PORT != 80 ]]; then
+    command -v iptables > /dev/null || die "Install iptables to forward the ACME challenge port"
+    port_in_use "$ACME_PORT" && die "ACME listener TCP/$ACME_PORT is already in use"
+    say "Certificate validation: temporary TCP/80 forwarding to TCP/$ACME_PORT; no listener on 80/443."
+    return 0
+  fi
   if ! port_in_use 80; then
     say "TCP/80 is free."
     return 0
@@ -606,13 +626,14 @@ installed_panel_version() {
 install_panel() {
   local tmp rc
   local env_args=(
+    HOME=/root
     XUI_NONINTERACTIVE=1
     XUI_DB_TYPE=sqlite
     XUI_PANEL_PORT="$PANEL_PORT"
     XUI_WEB_BASE_PATH="$WEB_PATH"
   )
-  if [[ $ACME_MODE == nginx ]]; then
-    # acme.sh standalone cannot bind TCP/80 next to nginx; certbot does it later
+  if [[ $ACME_MODE == nginx || $ACME_PORT != 80 ]]; then
+    # Issue later, after nginx routing or temporary port forwarding is ready.
     env_args+=(XUI_SSL_MODE=none)
   else
     env_args+=(XUI_SSL_MODE=domain XUI_DOMAIN="$DOMAIN" XUI_ACME_HTTP_PORT=80)
@@ -659,13 +680,19 @@ run_ssl_menu() {
   fi
   [[ -n $menu ]] || die "The x-ui management script was not found."
 
-  answers=$(printf '20\n1\n%s\n80\nn\ny\n0\n0\n' "$DOMAIN")
-  say "Requesting a certificate for ${DOMAIN} (ACME HTTP-01, port 80) ..."
+  answers=$(printf '20\n1\n%s\n%s\nn\ny\n0\n0\n' "$DOMAIN" "$ACME_PORT")
+  say "Requesting a certificate for ${DOMAIN} (ACME HTTP-01, listener $ACME_PORT) ..."
+  install_acme_hooks
+  if ! "$ACME_HOOK" pre; then
+    "$ACME_HOOK" post
+    die "Could not forward the ACME challenge port"
+  fi
 
   set +e
-  printf '%s\n' "$answers" | timeout 900 "$menu"
+  printf '%s\n' "$answers" | env HOME=/root timeout 900 "$menu"
   rc=$?
   set -e
+  "$ACME_HOOK" post
   if ((rc == 124)); then
     warn "The SSL menu timed out after 15 minutes."
   elif ((rc != 0)); then
@@ -719,6 +746,7 @@ ensure_ssl() {
     return 0
   fi
 
+  install_acme_hooks
   if cert_valid; then
     say "A valid certificate for ${DOMAIN} is already present."
   elif [[ -s $CERT_FILE && -s $KEY_FILE ]]; then
@@ -742,9 +770,8 @@ ensure_ssl() {
   verify_https
 }
 
-# acme.sh renews in standalone mode on TCP/80. If nginx arrives later
-# (dns-setup.sh / n8n-setup.sh), these hooks stop it for the few seconds the
-# renewal needs and start it again.
+# ACME either forwards TCP/80 to its dedicated listener or briefly frees
+# TCP/80 from nginx in the default standalone mode.
 install_acme_hooks() {
   local f="" dir
   for dir in "/root/.acme.sh/${DOMAIN}_ecc" "/root/.acme.sh/${DOMAIN}"; do
@@ -753,15 +780,33 @@ install_acme_hooks() {
       break
     fi
   done
-  if [[ -z $f ]]; then
-    warn "No acme.sh config for ${DOMAIN}; renewals cannot pause nginx if it is installed later."
-    return 0
-  fi
   cat > "$ACME_HOOK" << 'EOF'
 #!/bin/sh
-# Added by 3xui-setup.sh: acme.sh renews the panel certificate on TCP/80
-# (standalone). Free the port from nginx for the renewal, then bring it back.
+# Added by 3xui-setup.sh: prepare HTTP-01 routing, then restore it.
 flag=/run/3xui-acme-stopped-nginx
+port=__ACME_PORT__
+if [ "$port" != 80 ]; then
+  for tool in iptables ip6tables; do
+    command -v "$tool" >/dev/null 2>&1 || continue
+    case "$1" in
+      pre)
+        "$tool" -t nat -C PREROUTING -p tcp --dport 80 -j REDIRECT --to-ports "$port" 2>/dev/null ||
+          "$tool" -t nat -I PREROUTING -p tcp --dport 80 -j REDIRECT --to-ports "$port" || exit 1
+        "$tool" -t filter -C INPUT -p tcp --dport "$port" -m conntrack --ctorigdstport 80 -j ACCEPT 2>/dev/null ||
+          "$tool" -t filter -I INPUT -p tcp --dport "$port" -m conntrack --ctorigdstport 80 -j ACCEPT || exit 1
+        ;;
+      post)
+        if "$tool" -t nat -C PREROUTING -p tcp --dport 80 -j REDIRECT --to-ports "$port" 2>/dev/null; then
+          "$tool" -t nat -D PREROUTING -p tcp --dport 80 -j REDIRECT --to-ports "$port" || exit 1
+        fi
+        if "$tool" -t filter -C INPUT -p tcp --dport "$port" -m conntrack --ctorigdstport 80 -j ACCEPT 2>/dev/null; then
+          "$tool" -t filter -D INPUT -p tcp --dport "$port" -m conntrack --ctorigdstport 80 -j ACCEPT || exit 1
+        fi
+        ;;
+    esac
+  done
+  exit 0
+fi
 case "$1" in
   pre)
     if systemctl is-active --quiet nginx 2> /dev/null; then
@@ -777,10 +822,13 @@ case "$1" in
 esac
 exit 0
 EOF
+  sed -i "s/__ACME_PORT__/$ACME_PORT/" "$ACME_HOOK"
   chmod 755 "$ACME_HOOK"
+  [[ -n $f ]] || return 0
   # acme.sh reads plain values as well as its base64-wrapped ones
   set_acme_conf "$f" Le_PreHook "${ACME_HOOK} pre"
   set_acme_conf "$f" Le_PostHook "${ACME_HOOK} post"
+  set_acme_conf "$f" Le_HTTPPort "$ACME_PORT"
 }
 
 set_acme_conf() { # file key value
@@ -1753,6 +1801,7 @@ write_info() {
   {
     printf '# 3x-ui panel info, generated %s\n' "$(date -Is)"
     printf "XUI_DOMAIN='%s'\n" "$DOMAIN"
+    printf "XUI_ACME_HTTP_PORT='%s'\n" "$ACME_PORT"
     printf "XUI_PANEL_PORT='%s'\n" "$ACTUAL_PORT"
     printf "XUI_WEB_BASE_PATH='%s'\n" "$ACTUAL_PATH"
     printf "XUI_USERNAME='%s'\n" "$PANEL_USER"
@@ -1793,7 +1842,7 @@ print_summary() {
   if [[ $ACME_MODE == nginx ]]; then
     printf ' Expires     : %s (certbot renews it through nginx)\n' "${expires:-unknown}"
   else
-    printf ' Expires     : %s (acme.sh renews it on TCP/80)\n' "${expires:-unknown}"
+    printf ' Expires     : %s (acme.sh listener TCP/%s)\n' "${expires:-unknown}" "$ACME_PORT"
   fi
   printf ' Info file   : %s\n' "$INFO_FILE"
   printf '%s\n' '--------------------------------------------------------------'

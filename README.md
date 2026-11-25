@@ -101,6 +101,104 @@ names come from Hosts (`remarkTemplate` = `{{HOST}}`), the JSON subscription
 is turned on, and the subscription gets the panel certificate when it has
 none. The panel database is backed up first to `/etc/x-ui/x-ui.db.bak-pro-*`.
 
+## backpack-setup.sh
+
+Builds a [BackPack](https://github.com/AminMGMT/BackPack) reverse tunnel
+from an Iran server to a kharej server and serves the kharej's 3x-ui
+subscription through Iran. Install the panel with `3xui-setup.sh` on the
+kharej first; its credentials are read from `/root/3xui-info.env`. Run this on the
+**Iran** server. It logs in to the kharej server over SSH as root (it asks for
+the password once, or uses your SSH key) and sets up both servers:
+
+To keep certificate listeners off ports 80/443, first run on the kharej:
+
+```bash
+bash 3xui-setup.sh --no-inbounds --acme-port 18080 panel.example.com
+```
+
+HTTP-01 validation still arrives on public TCP/80; a temporary firewall
+forward sends it to 18080 during issuance/renewal and is removed afterwards.
+The selected listener is saved for later runs. No process binds TCP/80 or
+443 in this mode. Existing HTTP traffic on port 80 is redirected for the
+short validation window.
+
+1. Tests the route: Iran -> kharej (ping, TCP/SSH) and kharej -> Iran (TCP,
+   UDP, ping), plus GitHub access on both. The reverse tunnel is dialled by
+   the kharej, so a failed kharej -> Iran UDP test skips `kcp`/`quic`, and a
+   failed ping skips `xdi`.
+2. Installs the latest BackPack release on both servers, checked against its
+   `SHA256SUMS`. When Iran cannot reach GitHub, the files are copied from the
+   kharej.
+3. Adds one VLESS REALITY Vision inbound on `127.0.0.1` to the kharej's
+   3x-ui and attaches its existing `3xui-setup` client (or creates one).
+4. Makes one tunnel per BackPack transport, named `bpt-<transport>`, using
+   BackPack's `turbo` preset: `tcp tcpmux stealth pck kcp quic ws wsmux wss
+   wssmux xdi`.
+5. Tests TLS forwarding, then real authenticated VLESS internet requests
+   through the Iran ports. Each passing transport gets a 3x-ui Host. The
+   panel's subscription is served from Iran (service `bpt-sub`) through
+   those tunnels, with automatic fallback between them.
+
+```bash
+bash <(curl -Ls https://raw.githubusercontent.com/FarzinNs83/my-scripts/main/backpack-setup.sh) <kharej-ip>
+```
+
+Iran / GitHub blocked (ghfast.top mirror):
+
+```bash
+bash <(curl -Ls https://ghfast.top/https://raw.githubusercontent.com/FarzinNs83/my-scripts/main/backpack-setup.sh) <kharej-ip>
+```
+
+| Option | |
+| --- | --- |
+| `--ssh-port <n>` | SSH port of the kharej server (default 22) |
+| `--ssh-host <ip>` | SSH management address through a relay; the kharej IP stays unchanged |
+| `--iran-ip <ip>` | Iran IP for the configs (default: the address the kharej sees) |
+| `--sub-port <n>` | Subscription port on Iran (default 2095) |
+
+If Iran cannot reach the kharej's SSH port, start a temporary management
+relay on the **kharej** (leave it running until setup finishes):
+
+```bash
+ssh -N -o ExitOnForwardFailure=yes -o ServerAliveInterval=15 \
+  -R 127.0.0.1:22222:127.0.0.1:22 root@<iran-ip>
+```
+
+Then run on **Iran**:
+
+```bash
+bash backpack-setup.sh --ssh-host 127.0.0.1 --ssh-port 22222 \
+  --iran-ip <iran-ip> <kharej-ip>
+```
+
+Close the management relay afterwards. BackPack connects the two VPSs
+directly and keeps running without it.
+
+- User ports start at 2101 (TCP). Tunnel ports start at 4101 (TCP, or UDP
+  for `kcp`/`quic`). A busy port moves to the next free one. The script opens
+  them in ufw / firewalld. Open them in the Iran provider firewall too.
+- Forwarding uses dedicated ports; BackPack and `bpt-sub` do not bind
+  ports 80 or 443. `--acme-port 18080` also keeps the panel's separate
+  certificate listener on a dedicated port during renewal.
+- Users, traffic limits and expiry are managed in 3x-ui. Every client
+  attached to the "BackPack tunnel" inbound gets its tunnel Hosts.
+- Run it again to rebuild. Tunnel tokens and ports are kept in
+  `/root/backpack-tunnel-info.env`; client IDs and REALITY keys stay in
+  the panel. A tunnel that failed the test may pass on the next run.
+- The Iran subscription uses HTTP; its URL contains the client's access
+  token, and filtering can block a VPN client's User-Agent. The script also
+  prints the panel's HTTPS subscription when available; it contains the
+  same Iran configs. Use HTTPS in front of `bpt-sub` when you have a domain
+  for Iran.
+- The tunnels use BackPack's own unit names (`backpack-bpt-*.service`), so
+  `sudo backpack` shows and manages them.
+- The `udp` transport is left out because it carries UDP only. The
+  experimental Naive / XHTTP / REALITY helpers are left out because they need
+  a source build.
+
+Based on BackPack by Amin Mohammadi (AminMGMT)
+https://github.com/AminMGMT/BackPack
+
 ## dns-setup.sh
 
 Self-hosted anti-sanction DNS. Installs AdGuard Home (panel, DoH, DoT, DoQ,
