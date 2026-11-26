@@ -259,9 +259,15 @@ try:
             csrf = ""
         return curl(bc + ["-H", f"X-CSRF-Token: {csrf}", "-H", "Content-Type: application/json", "-X", "POST",
                           "--data-binary", "@-", PANEL + path], json.dumps(body), 20)
-    if '"success":true' not in re.sub(r"\s", "", bpost("/login", {"username": env.get("XUI_USERNAME", ""),
-                                                                  "password": env.get("XUI_PASSWORD", "")})):
-        die("3x-ui login failed with the credentials in /root/3xui-info.env")
+    out = bpost("/login", {"username": env.get("XUI_USERNAME", ""), "password": env.get("XUI_PASSWORD", "")})
+    if '"success":true' not in re.sub(r"\s", "", out):
+        try:
+            why = json.loads(out).get("msg") or "no message"
+        except ValueError:
+            why = out.strip()[:150] or "no answer"
+        die(f"3x-ui login as '{env.get('XUI_USERNAME', '')}' failed (panel says: {why}). If the panel login was "
+            "changed after 3xui-setup.sh, put the current one in XUI_USERNAME / XUI_PASSWORD in "
+            "/root/3xui-info.env on the kharej. Two-factor sign-in has to be off for this script.")
     try:
         o = json.loads(bpost("/panel/api/setting/apiTokens/create", {"name": f"backpack-setup-{int(time.time())}"}))["obj"]
         TOKEN, TOKEN_ID = o["token"], o["id"]

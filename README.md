@@ -603,10 +603,10 @@ bash front-deploy.sh panel.example.com \
   with `back-deploy.sh` on its own domain: one process and one database for
   site and panel. `/media/` serves the panel build's own files first and the
   backend's uploads otherwise. The backend has to accept the panel's host
-  (Django: `ALLOWED_HOSTS`, `CSRF_TRUSTED_ORIGINS`; for GVB also
+  (Django: `ALLOWED_HOSTS`, `CSRF_TRUSTED_ORIGINS`;
   `PANEL_HOSTS=panel.example.com`, so staff routes answer only there).
 - `--noindex` adds `X-Robots-Tag: noindex, nofollow` (`--index` removes it).
-- The panel's build settings go in its `--env-file`, e.g. for GVB:
+- The panel's build settings go in its `--env-file`, e.g. :
 
   ```
   VITE_API_URL=/api

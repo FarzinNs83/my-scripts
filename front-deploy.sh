@@ -139,7 +139,7 @@ Options:
                             ("none" drops it)
       --with-branch <name>  its branch (default: its default branch)
       --with-dir <name>     its folder name, as the build imports it (default:
-                            the repository name, e.g. ../gvb)
+                            the repository name)
       --backend <app>       serve /api/ (and uploads under /media/) from this
                             back-deploy.sh app, e.g. api.example.com ("none"
                             drops it); the app keeps its own domain too
