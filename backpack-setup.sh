@@ -934,7 +934,8 @@ render() { # <server|client> <transport>
 # kharej's outbound registers the tunnel at Iran's REALITY inbound; Iran's
 # dokodemo ports are routed into it and the kharej sends them to 127.0.0.1 only.
 # Freedom blocks every target of reverse traffic by default (it holds the
-# connection 30-90 s), so the kharej's freedom needs an explicit "firewall" allow.
+# connection 30-90 s), so the kharej's freedom needs an explicit allow rule.
+# "finalRules": Xray 26.10 knows only this key; newer ones read it as the old name of "firewall".
 render_xray() { # <server|client>
   local h id sid k v x pubs="" locals=""
   h=$(token_for xray-id)
@@ -946,7 +947,7 @@ render_xray() { # <server|client>
 {"log": {"loglevel": "warning"},
  "outbounds": [
   {"tag": "block", "protocol": "blackhole"},
-  {"tag": "bpt-local", "protocol": "freedom", "settings": {"firewall": [
+  {"tag": "bpt-local", "protocol": "freedom", "settings": {"finalRules": [
    {"action": "allow", "network": "tcp", "ip": ["127.0.0.1/32"], "port": "$locals$KSUB_PORT"}]}},
   {"tag": "bpt-tunnel", "protocol": "vless",
    "settings": {"address": "$IRAN_IP", "port": $TUN_xray, "id": "$id", "flow": "xtls-rprx-vision",
