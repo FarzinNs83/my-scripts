@@ -58,6 +58,13 @@ DOWNLOAD_ENV="${GS_DIR}/download.env"
 DOWNLOAD_SCRIPT="${GS_DIR}/download.py"
 DOWNLOAD_UNIT="game-download.service"
 DOWNLOAD_UNIT_FILE="${GS_UNIT_DIR:-/etc/systemd/system}/${DOWNLOAD_UNIT}"
+ROUTE_SCRIPT="${GS_DIR}/routing.py"
+TARGETS_FILE="${GS_DIR}/targets.txt"
+DNS_CONF="${GS_DIR}/dnsmasq.conf"
+IPSET_FILE="${GS_DIR}/routes.ipset"
+DNS_CACHE_FILE="${GS_DIR}/dns-cache.ipset"
+DNS_UNIT="game-dns.service"
+DNS_UNIT_FILE="${GS_UNIT_DIR:-/etc/systemd/system}/${DNS_UNIT}"
 SYSCTL_FILE="/etc/sysctl.d/99-game-setup.conf"
 LOG_FILE="/var/log/game-setup.log"
 # --faketcp: the link's UDP rides in fake TCP (phantun), for routes that block or throttle UDP
@@ -77,6 +84,7 @@ KEYRING="/etc/apt/keyrings/amnezia-ppa.gpg"
 
 CMD=""
 NAME=""
+ROUTE_ARGS=()
 PORT=""
 NET="10.66.66" # players' /24, first three octets
 BRIDGE_NET="10.68.68" # players' /24 in the Iran layout, so it never clashes with a direct server
@@ -88,6 +96,11 @@ TOKEN_IN=""
 BRIDGE=0
 FAKETCP=0
 DNS="1.1.1.1, 8.8.8.8"
+UPSTREAM_DNS="1.1.1.1, 8.8.8.8"
+DNS_PORT=""
+SPLIT=0
+ROUTE_WAN=""
+WAN_RPF=""
 MTU=1280 # fits Iranian mobile networks; games send small packets anyway
 YES=0
 
@@ -119,7 +132,8 @@ Options:
                           80/443 or stops existing services
       --subnet <a.b.c>    players' /24, first three octets
                           (default: 10.66.66 direct, 10.68.68 through Iran)
-      --dns "<ip>, <ip>"  DNS for players (default: 1.1.1.1, 8.8.8.8)
+      --dns "<ip>, <ip>"  upstream DNS (default: 1.1.1.1, 8.8.8.8);
+                          bridge clients use the VPN's private DNS address
       --token <t>         for `bridge`: the token `link` printed on the kharej
       --faketcp           for `link`: Iran starts on fake TCP (phantun) instead
                           of UDP. The kharej always takes both on the same port
@@ -131,10 +145,14 @@ Commands (same as gamectl):
   add <name>          new player: config file + QR code
   remove <name>       delete a player
   show <name>         print a player's config and QR code again
+  qr <name>           compact config QR for scanning inside AmneziaWG
   list                players, their IPs and last handshake
   status              link and player server state (awg show)
   repair              update routing/firewall and client configs, keeping keys
   download <name>     issue a fresh 24-hour link (replaces the previous link)
+  route add <target>...    Iran: send domains, IPv4 addresses or CIDRs abroad
+  route import <file>...   bulk-add targets from text files
+  route list              show the targets (domains include subdomains)
   mode [udp|faketcp]  on Iran: show or switch the link's route to the kharej;
                       players stay connected
   link                on the kharej: print the token again
@@ -170,7 +188,11 @@ parse_args() {
       --yes) YES=1; shift ;;
       -h | --help) CMD=help; shift ;;
       -*) die "Unknown option: $1 (see --help)" ;;
-      *) if [[ -z $CMD ]]; then CMD=$1; else NAME=$1; fi; shift ;;
+      *)
+        if [[ -z $CMD ]]; then CMD=$1
+        elif [[ $CMD == route ]]; then ROUTE_ARGS+=("$1")
+        else NAME=$1; fi
+        shift ;;
     esac
   done
   [[ -z $PORT ]] || valid_service_port "$PORT" || die "Invalid port: $PORT (80 and 443 are reserved for other services)"
@@ -263,6 +285,34 @@ post_rules() { # [<players-net> <wan>]: PostUp/PostDown that let %i forward, plu
     local nat="POSTROUTING -s $1.0/24 -o $2 $c -j MASQUERADE"
     up+="; iptables -t nat -A $nat"
     down+="; iptables -t nat -D $nat"
+  elif [[ $SPLIT == 1 ]]; then
+    local wan mark=$((LINK_TABLE + 1)) rule guard proto
+    wan=$(wan_iface)
+    [[ -n $wan ]] || die "No default IPv4 route found."
+    # Loose reverse-path checks allow replies from both exits despite the source-based link rule.
+    up="ipset -exist restore < ${IPSET_FILE}; if test -s ${DNS_CACHE_FILE}; then ipset -exist restore < ${DNS_CACHE_FILE}; fi; sysctl -qw net.ipv4.conf.${wan}.rp_filter=2; $up"
+    down+="; sysctl -qw net.ipv4.conf.${wan}.rp_filter=${WAN_RPF}"
+    rule="FORWARD -i %i ! -o $LINK_IFACE ! -d $NET.0/24"
+    for guard in game-ips game-dns; do
+      up+="; iptables -I $rule -m set --match-set $guard dst $c -j REJECT"
+      down+="; iptables -D $rule -m set --match-set $guard dst $c -j REJECT"
+    done
+    rule="PREROUTING -i %i -m set ! --match-set game-ips dst -m set ! --match-set game-dns dst $c -j MARK --set-xmark $mark/0xffffffff"
+    up+="; iptables -t mangle -I $rule"
+    down+="; iptables -t mangle -D $rule"
+    up+="; ip rule add from $NET.0/24 fwmark $mark lookup main priority $((LINK_TABLE - 2))"
+    down+="; ip rule del from $NET.0/24 fwmark $mark lookup main priority $((LINK_TABLE - 2))"
+    rule="POSTROUTING -s $NET.0/24 -o $wan $c -j MASQUERADE"
+    up+="; iptables -t nat -A $rule"
+    down+="; iptables -t nat -D $rule"
+    for proto in udp tcp; do
+      rule="PREROUTING -i %i -p $proto --dport 53 $c -j REDIRECT --to-ports $DNS_PORT"
+      up+="; iptables -t nat -I $rule"
+      down+="; iptables -t nat -D $rule"
+      rule="INPUT -i %i -s $NET.0/24 -p $proto --dport $DNS_PORT $c -j ACCEPT"
+      up+="; iptables -I $rule"
+      down+="; iptables -D $rule"
+    done
   else
     # A missing/overridden policy route must not send players out with Iran's IP.
     local guard="FORWARD -i %i ! -o $LINK_IFACE ! -d $NET.0/24 $c -j REJECT"
@@ -437,6 +487,191 @@ start_phantun() {
   systemctl restart "$FT_UNIT" || die "${FT_UNIT} did not start: journalctl -u ${FT_UNIT}"
 }
 
+routing_python() {
+  cat <<'PYROUTING'
+import ipaddress
+from pathlib import Path
+import re
+import sys
+import tempfile
+
+
+# Core services plus the game launchers; a domain includes all its subdomains.
+DEFAULTS = """
+claude.ai claude.com anthropic.com claudeusercontent.com
+chatgpt.com openai.com oaistatic.com oaiusercontent.com oaistatsig.com
+openaimerge.com ct.sendgrid.net intercom.io intercomcdn.com
+cdn.workos.com forwarder.workos.com frontend-apps-multi-region.workos.com
+setup.workos.com images.workoscdn.com workos.imgix.net
+challenges.cloudflare.com js.stripe.com humb.apple.com
+o207216.ingest.sentry.io o33249.ingest.sentry.io rum.browser-intake-datadoghq.com
+discord.com discord.gg discord.media discordapp.com discordapp.net discordcdn.com
+epicgames.com epicgames.dev epicgames.net unrealengine.com unrealenginecdn.com
+epicgames-download1.akamaized.net epicgames-download2.akamaized.net
+steamcommunity.com steampowered.com steamstatic.com steamcontent.com
+ea.com origin.com battle.net blizzard.com riotgames.com riotcdn.net
+""".split()
+
+
+def normalize(value):
+    value = value.strip().lower().rstrip(".")
+    try:
+        network = ipaddress.ip_network(value, strict=False)
+    except ValueError:
+        domain = value[2:] if value.startswith("*.") else value
+        labels = domain.split(".")
+        if (len(domain) > 253 or len(labels) < 2 or not re.fullmatch(r"[a-z]{2,63}", labels[-1])
+                or any(not re.fullmatch(r"[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?", label) for label in labels)):
+            raise ValueError("Invalid domain or IPv4/CIDR: " + value)
+        return domain
+    if network.version != 4 or str(network) == "0.0.0.0/32":
+        raise ValueError("Only IPv4 addresses/CIDRs are supported: " + value)
+    return str(network)
+
+
+def parse(text):
+    return {normalize(token) for line in text.splitlines()
+            for token in line.split("#", 1)[0].replace(",", " ").split()}
+
+
+def write(path, text):
+    temporary = None
+    try:
+        with tempfile.NamedTemporaryFile(mode="w", encoding="utf-8", dir=path.parent, delete=False) as stream:
+            temporary = Path(stream.name)
+            stream.write(text)
+        temporary.replace(path)
+    finally:
+        if temporary is not None:
+            temporary.unlink(missing_ok=True)
+
+
+def targets(root):
+    path = root / "targets.txt"
+    return parse(path.read_text(encoding="utf-8-sig")) if path.exists() else set(DEFAULTS)
+
+
+def update(root, action, values):
+    current = targets(root)
+    if action == "list":
+        print("\n".join(sorted(current)))
+        return
+    if action == "init" and not values:
+        added = set()
+    elif action == "add" and values:
+        added = parse("\n".join(values))
+    elif action == "import" and values:
+        # Validate every file before replacing anything: a bad line cannot partially import a list.
+        added = set().union(*(parse(Path(path).read_text(encoding="utf-8-sig")) for path in values))
+    else:
+        raise ValueError("Usage: gamectl route add <domain|IPv4|CIDR>... | import <file>... | list")
+    write(root / "targets.txt", "\n".join(sorted(current | added)) + "\n")
+    if action != "init":
+        print("Added %s target(s); %s total." % (len(added - current), len(current | added)))
+
+
+def render(root, network, port, upstream):
+    source = str(ipaddress.IPv4Address(network + ".1"))
+    port = int(port)
+    if not 1024 < port <= 65535:
+        raise ValueError("DNS needs a free high port")
+    servers = [str(ipaddress.IPv4Address(value.strip())) for value in upstream.split(",")]
+    config = ["port=" + str(port), "listen-address=" + source, "bind-interfaces", "no-resolv", "no-hosts",
+              "user=root", "group=root", "pid-file=", "cache-size=1000", "domain-needed"]
+    config += ["server=" + server for server in servers]
+    restore = ["create game-ips hash:net family inet", "create game-dns hash:ip family inet",
+               "create game-ips-next hash:net family inet", "flush game-ips-next"]
+    for target in sorted(targets(root)):
+        if "/" in target:
+            address = ipaddress.IPv4Network(target)
+            # hash:net cannot store /0; its two /1 halves are equivalent.
+            blocks = address.subnets(new_prefix=1) if address.prefixlen == 0 else [address]
+            restore += ["add game-ips-next " + str(block) for block in blocks]
+        else:
+            config += ["ipset=/" + target + "/game-dns"]
+            config += ["server=/" + target + "/" + server + "@" + source for server in servers]
+    restore += ["swap game-ips-next game-ips", "destroy game-ips-next"]
+    write(root / "dnsmasq.conf", "\n".join(config) + "\n")
+    write(root / "routes.ipset", "\n".join(restore) + "\n")
+
+
+if __name__ == "__main__":
+    try:
+        root, action = Path(sys.argv[1]), sys.argv[2]
+        if action == "render":
+            render(root, *sys.argv[3:])
+        else:
+            update(root, action, sys.argv[3:])
+    except (OSError, ValueError) as error:
+        sys.exit(str(error))
+PYROUTING
+}
+
+prepare_routing() {
+  local player_port=$PORT PORT="" wan
+  if ! command -v dnsmasq > /dev/null || ! command -v ipset > /dev/null || ! command -v python3 > /dev/null; then
+    apt-get -o DPkg::Lock::Timeout=120 install -y -qq dnsmasq-base ipset python3 > /dev/null
+  fi
+  [[ -n $DNS_PORT ]] || { pick_port; while [[ $PORT == "$player_port" ]]; do PORT=""; pick_port; done; DNS_PORT=$PORT; }
+  valid_service_port "$DNS_PORT" && ((10#$DNS_PORT > 1024)) || die "Invalid private DNS port: $DNS_PORT"
+  [[ $DNS == "${NET}.1" ]] || UPSTREAM_DNS=$DNS
+  wan=$(wan_iface)
+  [[ -n $wan ]] || die "No default IPv4 route found."
+  if [[ $ROUTE_WAN != "$wan" || -z $WAN_RPF ]]; then
+    ROUTE_WAN=$wan
+    WAN_RPF=$(sysctl -n "net.ipv4.conf.${wan}.rp_filter")
+  fi
+  umask 077
+  install -d -m 700 "$GS_DIR"
+  routing_python > "$ROUTE_SCRIPT"
+  python3 "$ROUTE_SCRIPT" "$GS_DIR" init
+  python3 "$ROUTE_SCRIPT" "$GS_DIR" render "$NET" "$DNS_PORT" "$UPSTREAM_DNS"
+  dnsmasq --test --conf-file="$DNS_CONF"
+  ipset -exist restore < "$IPSET_FILE"
+  # shortcut: learned IPs are saved on clean shutdown; refresh client DNS after a server crash.
+  touch "$DNS_CACHE_FILE"
+  DNS="${NET}.1" SPLIT=1
+  cat > "$DNS_UNIT_FILE" <<UNIT
+[Unit]
+Description=DNS for game domain routing
+After=${UNIT}
+Requires=${UNIT}
+PartOf=${UNIT}
+
+[Service]
+ExecStart=/usr/sbin/dnsmasq --keep-in-foreground --conf-file=${DNS_CONF}
+ExecStopPost=/bin/sh -c '/usr/sbin/ipset save game-dns > ${DNS_CACHE_FILE}'
+Restart=on-failure
+NoNewPrivileges=yes
+PrivateTmp=yes
+ProtectSystem=strict
+ProtectHome=yes
+ReadWritePaths=${DNS_CACHE_FILE}
+
+[Install]
+WantedBy=multi-user.target ${UNIT}
+UNIT
+}
+
+start_dns() {
+  systemctl daemon-reload
+  systemctl enable "$DNS_UNIT" > /dev/null 2>&1
+  systemctl restart "$DNS_UNIT"
+}
+
+cmd_route() {
+  load_state
+  [[ $BRIDGE == 1 && $SPLIT == 1 && -f $ROUTE_SCRIPT ]] || die "Domain routing needs the Iran bridge. Apply the new version first: bash game-setup.sh repair"
+  ((${#ROUTE_ARGS[@]} > 0)) || die "Usage: gamectl route add <target>... | import <file>... | list"
+  python3 "$ROUTE_SCRIPT" "$GS_DIR" "${ROUTE_ARGS[@]}"
+  [[ ${ROUTE_ARGS[0]:-} != list ]] || return 0
+  python3 "$ROUTE_SCRIPT" "$GS_DIR" render "$NET" "$DNS_PORT" "$UPSTREAM_DNS"
+  dnsmasq --test --conf-file="$DNS_CONF"
+  ipset -exist restore < "$IPSET_FILE"
+  systemctl restart "$DNS_UNIT"
+  say "Targets applied. Use the VPN DNS; reconnect apps with cached DNS."
+}
+
 download_python() {
   cat <<'PYDOWNLOAD'
 import hashlib
@@ -598,11 +833,15 @@ cmd_download() {
   systemctl is-active --quiet "$DOWNLOAD_UNIT" || die "Downloads are down: systemctl restart ${DOWNLOAD_UNIT}"
   path=$(python3 "$DOWNLOAD_SCRIPT" "$GS_DIR" issue "$NAME")
   say "Download for ${NAME} (expires in 24 hours; previous link revoked):"
-  printf 'https://%s:%s/%s\n' "$DOWNLOAD_DOMAIN" "$DOWNLOAD_PORT" "$path"
+  local url="https://${DOWNLOAD_DOMAIN}:${DOWNLOAD_PORT}/${path}"
+  printf '%s\n' "$url"
+  say "Small QR: scan with the phone camera to download, then import the file. Direct config QR: gamectl qr ${NAME}"
+  qrencode -t ANSIUTF8 -l L -m 4 "$url" || true
 }
 
 save_state() {
-  printf 'PORT=%q\nNET=%q\nENDPOINT=%q\nDNS=%q\nMTU=%q\nBRIDGE=%q\n' "$PORT" "$NET" "$ENDPOINT" "$DNS" "$MTU" "$BRIDGE" > "$STATE_FILE"
+  printf 'PORT=%q\nNET=%q\nENDPOINT=%q\nDNS=%q\nMTU=%q\nBRIDGE=%q\nSPLIT=%q\nDNS_PORT=%q\nUPSTREAM_DNS=%q\nROUTE_WAN=%q\nWAN_RPF=%q\n' \
+    "$PORT" "$NET" "$ENDPOINT" "$DNS" "$MTU" "$BRIDGE" "$SPLIT" "$DNS_PORT" "$UPSTREAM_DNS" "$ROUTE_WAN" "$WAN_RPF" > "$STATE_FILE"
 }
 
 cmd_repair() {
@@ -630,6 +869,7 @@ cmd_repair() {
       load_state
       [[ -z $endpoint ]] || ENDPOINT=$endpoint
       if [[ $BRIDGE == 1 ]]; then
+        prepare_routing
         rules=$(post_rules)
       else
         rules=$(post_rules "$NET" "$wan")
@@ -654,10 +894,11 @@ cmd_repair() {
   done
   if [[ -f $SERVER_CONF ]]; then
     [[ $BRIDGE != 1 ]] || systemctl restart "$LINK_UNIT"
+    [[ $SPLIT != 1 ]] || start_dns
     save_state
     for f in "$CLIENTS_DIR"/*.conf; do
       [[ -f $f ]] || continue
-      sed -i "s|^AllowedIPs = .*|AllowedIPs = 0.0.0.0/0, ::/0|; s|^Endpoint = .*|Endpoint = ${ENDPOINT}:${PORT}|" "$f"
+      sed -i "s|^AllowedIPs = .*|AllowedIPs = 0.0.0.0/0, ::/0|; s|^Endpoint = .*|Endpoint = ${ENDPOINT}:${PORT}|; s|^DNS = .*|DNS = ${DNS}|" "$f"
     done
     if [[ $DOWNLOAD == 1 || -f $DOWNLOAD_ENV ]]; then setup_downloads; fi
   fi
@@ -708,6 +949,13 @@ cmd_remove() {
   say "Removed player ${NAME}"
 }
 
+cmd_qr() {
+  [[ -n $NAME && -f ${CLIENTS_DIR}/${NAME}.conf ]] || die "Usage: gamectl qr <existing player>"
+  # Strip presentation whitespace, keeping every config value and the QR quiet zone.
+  sed -E '/^[[:space:]]*(#|$)/d; s/[[:space:]]*=[[:space:]]*/=/; s/, +/,/g' "${CLIENTS_DIR}/${NAME}.conf" |
+    qrencode -t ANSIUTF8 -l L -m 4 || true
+}
+
 cmd_show() {
   [[ -n $NAME ]] || die "Usage: gamectl show <name>"
   local f="${CLIENTS_DIR}/${NAME}.conf"
@@ -715,9 +963,8 @@ cmd_show() {
   printf '\n----- %s -----\n' "$f"
   cat "$f"
   printf -- '-----\n\n'
-  qrencode -t ansiutf8 < "$f" || true
   say "Import ${f} into AmneziaVPN / AmneziaWG, or scan the QR code."
-  [[ ! -f $DOWNLOAD_ENV ]] || DOWNLOAD=0 cmd_download
+  if [[ -f $DOWNLOAD_ENV ]]; then DOWNLOAD=0 cmd_download; else cmd_qr; fi
 }
 
 cmd_list() {
@@ -750,9 +997,14 @@ cmd_status() {
     systemctl --no-pager status "$UNIT" | head -n 3 || true
     awg show "$IFACE" || warn "Interface ${IFACE} is down: systemctl restart ${UNIT}"
     load_state
-    say "Player route (must use ${LINK_IFACE} on Iran):"
+    say "Selected destinations use ${LINK_IFACE} on Iran (unmarked route):"
     ip -4 route get 1.1.1.1 from "${NET}.2" iif "$IFACE" || true
-    say "Internet exit from the player subnet (ip / country):"
+    if [[ $SPLIT == 1 ]]; then
+      say "Other destinations use Iran (direct mark):"
+      ip -4 route get 1.1.1.1 from "${NET}.2" iif "$IFACE" mark "$((LINK_TABLE + 1))" || true
+      systemctl --no-pager status "$DNS_UNIT" | head -n 3 || true
+    fi
+    say "Link internet exit from the player subnet (ip / country):"
     curl -4 -fsS --max-time 10 --interface "${NET}.1" https://1.1.1.1/cdn-cgi/trace |
       awk -F= '$1 == "ip" || $1 == "loc" {print}' || warn "Player-subnet internet check failed; a handshake alone is not enough."
   fi
@@ -922,7 +1174,7 @@ cmd_bridge() { # Iran: client end of the link + the players' server; only the pl
         warn "If UDP is blocked: gamectl uninstall on both servers, then on the kharej: bash game-setup.sh link --faketcp"
       fi
     fi
-    warn "Players can connect, but get no internet until it works. Check: gamectl status"
+    warn "Players can connect, but the kharej route will not work until the link is up. Check: gamectl status"
   fi
 
   BRIDGE=1
@@ -941,6 +1193,7 @@ cmd_uninstall() {
   [[ -f $LINK_ENV ]] && . "$LINK_ENV"
   [[ -f $DOWNLOAD_ENV ]] && . "$DOWNLOAD_ENV"
   # PostDown removes the NAT, forward and routing rules
+  systemctl disable --now "$DNS_UNIT" > /dev/null 2>&1 || true
   systemctl disable --now "$UNIT" > /dev/null 2>&1 || true
   systemctl disable --now "$LINK_UNIT" > /dev/null 2>&1 || true
   systemctl disable --now "$FT_UNIT" > /dev/null 2>&1 || true # ExecStopPost removes its NAT rules
@@ -948,8 +1201,12 @@ cmd_uninstall() {
   [[ -n $PORT ]] && close_port "${PORT}/udp"
   [[ -n $LINK_PORT ]] && close_port "${LINK_PORT}/udp" && close_port "${LINK_PORT}/tcp"
   [[ -n $DOWNLOAD_PORT ]] && close_port "${DOWNLOAD_PORT}/tcp"
+  if command -v ipset > /dev/null 2>&1; then
+    local target_set
+    for target_set in game-ips-next game-ips game-dns; do ipset destroy "$target_set" 2> /dev/null || true; done
+  fi
   rm -rf "$GS_DIR" "$SERVER_CONF" "$LINK_CONF" "$SYSCTL_FILE" /usr/local/bin/gamectl /usr/local/sbin/game-setup
-  rm -f "${SERVER_CONF}.bak" "${LINK_CONF}.bak" "$FT_UNIT_FILE" "$DOWNLOAD_UNIT_FILE" /usr/local/bin/phantun_client /usr/local/bin/phantun_server
+  rm -f "${SERVER_CONF}.bak" "${LINK_CONF}.bak" "$FT_UNIT_FILE" "$DOWNLOAD_UNIT_FILE" "$DNS_UNIT_FILE" /usr/local/bin/phantun_client /usr/local/bin/phantun_server
   systemctl daemon-reload
   say "Removed. The amneziawg packages and the PPA stay installed."
 }
@@ -971,7 +1228,7 @@ install_self() {
   ln -sf /usr/local/sbin/game-setup /usr/local/bin/gamectl
 }
 
-do_install() { # the players' server; BRIDGE=1 (Iran) sends their traffic into the link instead of NAT
+do_install() { # BRIDGE=1 sends selected destinations into the link and NATs the rest out of Iran.
   if [[ -f $SERVER_CONF ]]; then
     if [[ -n $ENDPOINT || $DOWNLOAD == 1 ]]; then cmd_repair; return 0; fi
     say "Already installed. Manage players with: gamectl add|remove|show|list|status"
@@ -988,6 +1245,7 @@ do_install() { # the players' server; BRIDGE=1 (Iran) sends their traffic into t
   say "Writing ${SERVER_CONF} (UDP ${PORT}, players ${NET}.0/24)"
   umask 077
   install -d -m 700 "$AWG_DIR" "$GS_DIR" "$CLIENTS_DIR"
+  [[ $BRIDGE != 1 ]] || prepare_routing
   {
     printf '[Interface]\nPrivateKey = %s\nAddress = %s.1/24\nListenPort = %s\nMTU = %s\n' \
       "$(awg genkey)" "$NET" "$PORT" "$MTU"
@@ -1000,6 +1258,7 @@ do_install() { # the players' server; BRIDGE=1 (Iran) sends their traffic into t
   open_port "${PORT}/udp"
   systemctl enable --now "$UNIT" > /dev/null 2>&1 || die "${UNIT} did not start: journalctl -u ${UNIT}"
   awg show "$IFACE" > /dev/null || die "Interface ${IFACE} is not up: journalctl -u ${UNIT}"
+  [[ $SPLIT != 1 ]] || start_dns
   install_self
   [[ $DOWNLOAD == 0 ]] || setup_downloads
 
@@ -1007,7 +1266,7 @@ do_install() { # the players' server; BRIDGE=1 (Iran) sends their traffic into t
   cmd_add
   printf '\n'
   say "Players connect to ${ENDPOINT}:${PORT}/udp. Open this UDP port in the provider's firewall too."
-  [[ $BRIDGE == 1 ]] && say "Their traffic goes through the link and leaves from the kharej."
+  [[ $BRIDGE == 1 ]] && say "Listed domains/IPs leave from the kharej; other destinations leave from Iran. Manage: gamectl route add|import|list"
   say "More players: gamectl add <name>   (list | show | remove | status)"
 }
 
@@ -1022,7 +1281,7 @@ main() {
       exec > >(tee -a "$LOG_FILE") 2>&1
       if [[ ${CMD:-install} == install ]]; then do_install; else "cmd_${CMD}"; fi
       ;;
-    add | remove | show | list | status | mode | repair | download | uninstall) "cmd_${CMD}" ;;
+    add | remove | show | qr | list | status | mode | repair | download | route | uninstall) "cmd_${CMD}" ;;
     *) die "Unknown command: ${CMD} (see --help)" ;;
   esac
 }

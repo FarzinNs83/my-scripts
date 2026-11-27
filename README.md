@@ -283,8 +283,11 @@ proxy. Remove an incorrect AAAA record. For unattended installs, pass
   provider's firewall too.
 - Players use AmneziaVPN or AmneziaWG: import
   `/etc/game-setup/clients/<name>.conf` or scan the QR code. Client MTU is
-  1280, all IPv4 traffic goes through the tunnel, and DNS is
-  `1.1.1.1, 8.8.8.8` (`--dns`). IPv6 is captured and dropped because this
+  1280. The client sends traffic to the VPN server; in the Iran layout,
+  that server sends only listed destinations abroad and sends the rest
+  directly from Iran. DNS is the VPN's private address (`10.68.68.1` by
+  default) on Iran, and `1.1.1.1, 8.8.8.8` (`--dns`) for a direct server.
+  IPv6 is captured and dropped because this
   server only provides IPv4 egress; clients fall back to IPv4. TCP MSS is
   capped to the player MTU in both directions for HTTPS/downloads.
 - `--domain game.example.com` (`--endpoint` also works) uses that domain in
@@ -294,6 +297,12 @@ proxy. Remove an incorrect AAAA record. For unattended installs, pass
   Links expire after exactly 24 hours; `gamectl download ali` issues a new
   link and revokes the previous one. Removing a player revokes downloads
   too. Expiry affects only the link, not the player's VPN access.
+- The default QR with downloads enabled contains the short download URL:
+  scan it with the phone camera, download, then import the file. For a QR
+  that imports directly inside AmneziaWG, use `gamectl qr ali`. That QR
+  removes presentation whitespace without changing any values. Both keep
+  the four-module quiet zone; the download QR is much smaller because it
+  does not carry all the keys and obfuscation parameters.
 - Downloads run separately in `game-download.service` using Python's
   standard library, on a random free TCP port printed at setup. Open it in
   the provider firewall. Neither downloads nor certbot bind 80 or 443;
@@ -311,12 +320,13 @@ proxy. Remove an incorrect AAAA record. For unattended installs, pass
 
 ### Through the Iran server
 
-Players connect to an AmneziaWG server on the **Iran** server. Their
-traffic goes through a separate AmneziaWG tunnel, `awg-link`, to the
-kharej, which sends it out to the internet:
+Players connect to an AmneziaWG server on the **Iran** server. Listed
+destinations go through a separate AmneziaWG tunnel, `awg-link`, to the
+kharej. Other destinations leave directly from the Iran server:
 
 ```text
-players -> Iran (awg-game) -> awg-link -> kharej -> internet
+players -> Iran (awg-game) -> listed -> awg-link -> kharej -> internet
+                          -> other  -> Iran internet
 ```
 
 The player-to-Iran leg stays domestic, and the international hop uses the
@@ -340,12 +350,11 @@ gamectl add ali
   `10.67.67.0/30` and unit `awg-quick@awg-link`, and players on Iran use
   `10.68.68.0/24` (`--subnet` on `link`). Both ports are random free ports
   (`--port`).
-- On Iran, policy routing (table and rule priority `6767`) sends only the
-  players' subnet into the link. The Iran server's own traffic and
-  BackPack keep the normal route. Iran does no NAT: if the link is down,
-  a forwarding guard blocks traffic that would leave outside `awg-link`
-  (except traffic within the player subnet), even if another routing rule
-  overrides the tunnel. Players get no internet rather than Iran egress.
+- On Iran, policy routing (table/rule `6767`, direct-mark rule `6765`)
+  sends listed destinations into the link. Other player traffic is NATed
+  out of Iran. The Iran server's own traffic and BackPack keep the normal
+  route. A forwarding guard prevents listed destinations from falling
+  back to Iran if the link goes down; ordinary traffic still works.
 - `bridge` waits for the link handshake and warns if it does not come
   (UDP blocked on the way, or the kharej firewall). `gamectl status` shows
   both tunnels.
@@ -375,6 +384,51 @@ gamectl add ali
 - Compare the ping with the direct layout, because the Iran route is not
   faster on every ISP. `gamectl uninstall` on each server removes its side.
 
+### Domains and IPs that should leave from the kharej
+
+The Iran bridge starts with **Claude, ChatGPT/OpenAI, Discord** and their
+main asset/authentication domains, plus Epic, Steam and several game
+launchers. This is a starter list, not a complete database of every
+restricted destination. Review it and extend it on the **Iran server**:
+
+```bash
+gamectl route list
+gamectl route add example.com
+gamectl route add example.net another.example.com 203.0.113.7 198.51.100.0/24
+gamectl route import /root/blocked.txt
+gamectl route import /root/domains.txt /root/ips.txt
+```
+
+Text files accept one or more domains, IPv4 addresses or CIDRs per line;
+commas, whitespace, blank lines and `# comments` are supported, including
+Windows UTF-8 BOM/CRLF files. A bare domain also covers its subdomains;
+`*.example.com` is normalized to the same rule. Entries are normalized and
+deduplicated. All input files are validated before saving, so an invalid
+line cannot leave a half-imported list. URLs and IPv6 routes are rejected.
+
+The persisted list is `/etc/game-setup/targets.txt`. `dnsmasq-base` runs as
+the separate `game-dns.service`, bound only to the VPN's private IPv4 and
+a free high port. DNS requests arriving on `awg-game` (UDP/TCP 53) are
+forwarded to it; system DNS, AdGuard, ports 80/443 and other services keep
+their listeners. Selected domain queries use the kharej for upstream DNS;
+other queries use Iran. Resolved IPs are added to `ipset`, so TCP and UDP
+both follow the selected path. Manual IPv4/CIDR entries need no DNS query.
+The WAN reverse-path filter uses loose mode for this policy routing and
+its original value is restored when the player interface is stopped.
+
+Domain additions apply without re-importing configs after the initial
+upgrade. Clients **must use the VPN DNS**: disable browser Secure DNS/DoH
+and system Private DNS/DoT for domain-based selection, and reconnect apps
+that cached a result before you added the domain. Shared CDN IPs can also
+send another domain on that same IP abroad; these are IP routes, not an
+HTTPS hostname proxy. Learned IPs survive DNS/interface restarts and clean
+server shutdowns; refresh client DNS after a server crash. A single direct
+kharej server retains its full-tunnel behavior; selective Iran egress needs
+the bridge layout.
+
+The initial service domains follow the [OpenAI network guidance](https://help.openai.com/en/articles/9247338-network-recommendations-for-chatgpt-errors-on-web-and-apps)
+and [Anthropic network guidance](https://code.claude.com/docs/en/network-config).
+
 ### Repair an existing installation
 
 Copy the updated `game-setup.sh` to both machines. On the kharej, run
@@ -384,19 +438,22 @@ Copy the updated `game-setup.sh` to both machines. On the kharej, run
 bash game-setup.sh repair --domain game.example.com --download
 gamectl show ali       # re-import the updated config on the client
 gamectl download ali   # a fresh 24-hour download link
+gamectl route list     # on Iran: domains and IPs that leave abroad
 gamectl status
 ```
 
 Repair keeps player/server keys and addresses, backs up the server config
 as `.conf.bak`, replaces its own firewall hooks and restarts the affected
-interfaces (a brief interruption). Clients need the updated config to get
-the domain and IPv6 capture. A failed interface start restores the previous
+interfaces (a brief interruption). Clients need the updated config once to
+get the domain, IPv6 capture and private routing DNS. A failed interface start restores the previous
 server config. The download service and its links are removed on uninstall;
 certbot and certificates remain installed.
 
-`status` prints the route selected for a player address, plus the public IP
-and country reached by HTTPS sourced from the player subnet. On Iran, the
-route should use `awg-link` and the exit country should be outside Iran.
+`status` prints the listed-destination route and the direct-mark route,
+plus the public IP and country of the kharej path reached by HTTPS sourced
+from the player subnet. On Iran, listed traffic should use `awg-link`, the
+direct-mark route should use the WAN, and the link exit country should be
+outside Iran.
 This checks server-side egress; also verify the IP on the connected client
 and disable client app/site exclusions if it still exits locally. A
 handshake alone does not prove internet connectivity or Epic availability.

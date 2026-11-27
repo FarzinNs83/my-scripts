@@ -7,6 +7,14 @@ source game-setup.sh
 parse_args --domain game.example.com --download
 [[ $ENDPOINT == game.example.com && $DOWNLOAD == 1 ]]
 ENDPOINT="" DOWNLOAD=0
+(
+  CMD="" ROUTE_ARGS=()
+  parse_args route add claude.ai chatgpt.com 203.0.113.0/24
+  [[ $CMD == route && ${#ROUTE_ARGS[@]} == 4 && ${ROUTE_ARGS[3]} == 203.0.113.0/24 ]]
+  CMD="" ROUTE_ARGS=()
+  parse_args route import '/root/blocked domains.txt'
+  [[ ${ROUTE_ARGS[1]} == '/root/blocked domains.txt' ]]
+)
 for domain in game.example.com a-b.example.co.uk; do valid_domain "$domain"; done
 for domain in 198.51.100.1 localhost -bad.example.com bad-.example.com x..example.com 'x;y.com' "$(printf 'a%.0s' {1..64}).example.com"; do
   if valid_domain "$domain"; then echo "accepted domain: $domain" >&2; exit 1; fi
@@ -142,6 +150,8 @@ if grep -q REJECT <<< "$rules"; then echo 'Iran guard on the internet exit' >&2;
   SERVER_CONF=$test_dir/awg-game.conf LINK_CONF=$test_dir/awg-link.conf
   LINK_ENV=$test_dir/link.env
   DOWNLOAD_ENV=$test_dir/download.env
+  IPSET_FILE=$test_dir/routes.ipset
+  DNS_CACHE_FILE=$test_dir/dns-cache.ipset
   mkdir "$CLIENTS_DIR"
   NET=10.68.68 PORT=41234 ENDPOINT=198.51.100.8 DOWNLOAD=0
   save_state
@@ -162,6 +172,7 @@ CONF
   sed -i 's|AllowedIPs = .*|AllowedIPs = 0.0.0.0/0|' "$CLIENTS_DIR/ali.conf"
   wan_iface() { echo eth0; }
   enable_forwarding() { :; }
+  prepare_routing() { SPLIT=1 DNS_PORT=53001 DNS="${NET}.1" ROUTE_WAN=eth0 WAN_RPF=1; }
   install_self() { :; }
   systemctl() { printf '%s\n' "$*" >> "$test_dir/systemctl.log"; }
   ENDPOINT=game.example.com
@@ -176,6 +187,12 @@ CONF
   grep -qxF 'PresharedKey = player-psk' "$CLIENTS_DIR/ali.conf"
   grep -qxF 'Endpoint = game.example.com:41234' "$CLIENTS_DIR/ali.conf"
   grep -qxF 'AllowedIPs = 0.0.0.0/0, ::/0' "$CLIENTS_DIR/ali.conf"
+  grep -qxF 'DNS = 10.68.68.1' "$CLIENTS_DIR/ali.conf"
+  grep -qF 'fwmark 6768 lookup main priority 6765' "$SERVER_CONF"
+  grep -qF -- '--match-set game-ips dst' "$SERVER_CONF"
+  grep -qF -- '--match-set game-dns dst' "$SERVER_CONF"
+  grep -qF -- '--dport 53 -m comment --comment game-setup -j REDIRECT --to-ports 53001' "$SERVER_CONF"
+  grep -qxF 'SPLIT=1' "$STATE_FILE"
   grep -qxF 'ENDPOINT=game.example.com' "$STATE_FILE"
   grep -qxF 'Table = off' "$LINK_CONF"
   sed -i 's|^PostUp = |PostUp = echo original-hook; |' "$SERVER_CONF"
