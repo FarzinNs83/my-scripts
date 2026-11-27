@@ -22,6 +22,8 @@
 #                 Players connect to the Iran server (their leg stays
 #                 domestic); only their subnet is routed into the link, and
 #                 the kharej NATs it out to the internet.
+#                 `link --faketcp` carries the link over fake TCP (phantun)
+#                 when UDP between the two servers is blocked or throttled.
 #
 #  Usage:
 #    bash <(curl -Ls https://raw.githubusercontent.com/FarzinNs83/my-scripts/main/game-setup.sh)
@@ -53,6 +55,18 @@ LINK_ENV="${GS_DIR}/link.env"
 CLIENTS_DIR="${GS_DIR}/clients"
 SYSCTL_FILE="/etc/sysctl.d/99-game-setup.conf"
 LOG_FILE="/var/log/game-setup.log"
+# --faketcp: the link's UDP rides in fake TCP (phantun), for routes that block or throttle UDP
+PHANTUN_VER=v0.8.1
+declare -A PHANTUN_SHA=( # sha256 of the release zips (GitHub's asset digests); pinned, so a mirror is safe too
+  [x86_64]=0cf40f0ac48411f8ced94ce0afd617105c6b9a69ad8db137c3b1e4d184d6fcdb
+  [aarch64]=e3f2336b5173df071c8931b5e0e3d44c57453da0456007ed459ed369610c91fa
+)
+FT_UNIT="game-phantun.service"
+FT_UNIT_FILE="${GS_UNIT_DIR:-/etc/systemd/system}/${FT_UNIT}"
+FT_IFACE="ft-link"
+FT_KH="10.67.68" # kharej phantun TUN: .1 kernel, .2 phantun (the DNAT target)
+FT_IR="10.67.69" # Iran phantun TUN
+FT_MTU=1400 # 1500 - IPv4 20 - TCP 20 - WireGuard 32 = 1428, with room for smaller provider MTUs
 PPA_URL="https://ppa.launchpadcontent.net/amnezia/ppa/ubuntu"
 KEYRING="/etc/apt/keyrings/amnezia-ppa.gpg"
 
@@ -65,6 +79,7 @@ SUBNET_SET=0
 ENDPOINT=""
 TOKEN_IN=""
 BRIDGE=0
+FAKETCP=0
 DNS="1.1.1.1, 8.8.8.8"
 MTU=1280 # fits Iranian mobile networks; games send small packets anyway
 YES=0
@@ -92,7 +107,10 @@ Options:
                           (default: 10.66.66 direct, 10.68.68 through Iran)
       --dns "<ip>, <ip>"  DNS for players (default: 1.1.1.1, 8.8.8.8)
       --token <t>         for `bridge`: the token `link` printed on the kharej
-  -h, --help              show this help
+      --faketcp           for `link`: carry the link over fake TCP (phantun) when
+                          UDP between the servers is blocked or throttled; the
+                          same port, but TCP, must be open on the kharej
+  -h, --help             show this help
 
 Commands (same as gamectl):
   add <name>          new player: config file + QR code
@@ -127,6 +145,7 @@ parse_args() {
       --subnet) NET=${2:?}; SUBNET_SET=1; shift 2 ;;
       --dns) DNS=${2:?}; shift 2 ;;
       --token) TOKEN_IN=${2:?}; shift 2 ;;
+      --faketcp) FAKETCP=1; shift ;;
       --yes) YES=1; shift ;;
       -h | --help) CMD=help; shift ;;
       -*) die "Unknown option: $1 (see --help)" ;;
@@ -206,11 +225,11 @@ post_rules() { # [<players-net> <wan>]: PostUp/PostDown that let %i forward, plu
 }
 
 # The kharej hands Iran everything for its end of the link in one token, so no SSH is needed.
-make_token() { # <kharej-host> <link-port> <kharej-pub> <iran-priv> <psk> <players-net> <junk lines>
-  printf 'KH=%s\nLPORT=%s\nKPUB=%s\nIPRIV=%s\nPSK=%s\nNET=%s\n%s\n' "$@" | base64 -w0
+make_token() { # <kharej-host> <link-port> <kharej-pub> <iran-priv> <psk> <players-net> <junk lines> [<faketcp 0|1>]
+  printf 'KH=%s\nLPORT=%s\nKPUB=%s\nIPRIV=%s\nPSK=%s\nNET=%s\n%s\nFT=%s\n' "$@" | base64 -w0
 }
 
-read_token() { # <token>: sets T_KH T_LPORT T_KPUB T_IPRIV T_PSK T_JUNK and NET, or dies
+read_token() { # <token>: sets T_KH T_LPORT T_KPUB T_IPRIV T_PSK T_JUNK T_FT and NET, or dies
   local t key='^[A-Za-z0-9+/]{43}=$'
   t=$(base64 -d <<< "$1" 2> /dev/null) || die "The token is broken; copy it again from the kharej (gamectl link)."
   T_KH=$(sed -n 's/^KH=//p' <<< "$t")
@@ -220,7 +239,9 @@ read_token() { # <token>: sets T_KH T_LPORT T_KPUB T_IPRIV T_PSK T_JUNK and NET,
   T_PSK=$(sed -n 's/^PSK=//p' <<< "$t")
   NET=$(sed -n 's/^NET=//p' <<< "$t")
   T_JUNK=$(grep -E '^(Jc|Jmin|Jmax|S1|S2|H[1-4]) = [0-9]+$' <<< "$t" || true)
-  [[ $T_KH =~ ^[A-Za-z0-9.-]+$ ]] && valid_port "$T_LPORT" &&
+  T_FT=$(sed -n 's/^FT=//p' <<< "$t")
+  T_FT=${T_FT:-0} # tokens from before --faketcp have no FT line
+  [[ $T_FT =~ ^[01]$ ]] && [[ $T_KH =~ ^[A-Za-z0-9.-]+$ ]] && valid_port "$T_LPORT" &&
     [[ $T_KPUB =~ $key && $T_IPRIV =~ $key && $T_PSK =~ $key ]] &&
     [[ $NET =~ ^[0-9]{1,3}\.[0-9]{1,3}\.[0-9]{1,3}$ ]] && [[ $(wc -l <<< "$T_JUNK") == 9 ]] ||
     die "The token is incomplete; copy it again from the kharej (gamectl link)."
@@ -287,6 +308,66 @@ install_awg() {
   say "Installing amneziawg (builds the kernel module, takes a minute)"
   apt-get -o DPkg::Lock::Timeout=120 install -y -qq amneziawg > /dev/null
   modprobe amneziawg || die "The amneziawg kernel module did not load. Check: dkms status"
+}
+
+install_phantun() { # pinned release; GitHub, then the ghfast.top mirror, then /root/<zip>; always sha256-checked
+  local arch zip sum url tmp
+  arch=$(uname -m)
+  sum=${PHANTUN_SHA[$arch]:-}
+  [[ -n $sum ]] || die "Fake TCP (phantun) is set up for x86_64 and aarch64 only (this server: ${arch})."
+  zip="phantun_${arch}-unknown-linux-musl.zip"
+  url="https://github.com/dndx/phantun/releases/download/${PHANTUN_VER}/${zip}"
+  command -v unzip > /dev/null 2>&1 || apt-get -o DPkg::Lock::Timeout=120 install -y -qq unzip > /dev/null
+  tmp=$(mktemp -d)
+  if [[ -f /root/$zip ]]; then
+    cp "/root/$zip" "$tmp/$zip"
+  else
+    say "Downloading phantun ${PHANTUN_VER}"
+    curl -fsSL --max-time 120 -o "$tmp/$zip" "$url" || curl -fsSL --max-time 120 -o "$tmp/$zip" "https://ghfast.top/$url" || true
+  fi
+  if [[ $(sha256sum "$tmp/$zip" 2> /dev/null | cut -d' ' -f1) != "$sum" ]]; then
+    rm -rf "$tmp"
+    die "Could not get a verified ${zip}. Download ${url} on another machine, copy it to /root here and run again."
+  fi
+  unzip -qjo "$tmp/$zip" -d "$tmp/x"
+  install -m 0755 "$tmp/x/phantun_client" "$tmp/x/phantun_server" /usr/local/bin/ ||
+    { rm -rf "$tmp"; die "${zip} has no phantun_client / phantun_server"; }
+  rm -rf "$tmp"
+}
+
+ft_unit() { # <phantun command line> <"table chain spec">...: the fake-TCP carrier, its iptables rules added and removed with it
+  local ipt r rules=""
+  ipt=$(command -v iptables)
+  for r in "${@:2}"; do # "+" runs the rule as root; phantun itself only gets CAP_NET_ADMIN
+    rules+="ExecStartPre=-+${ipt} -t ${r%% *} -D ${r#* }
+ExecStartPre=+${ipt} -t ${r%% *} -I ${r#* }
+ExecStopPost=-+${ipt} -t ${r%% *} -D ${r#* }
+"
+  done
+  cat > "$FT_UNIT_FILE" <<UNIT
+[Unit]
+Description=Fake TCP (phantun) for the game-setup link
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Environment=RUST_LOG=warn
+DynamicUser=yes
+AmbientCapabilities=CAP_NET_ADMIN
+CapabilityBoundingSet=CAP_NET_ADMIN
+${rules}ExecStart=$1
+Restart=always
+RestartSec=3
+
+[Install]
+WantedBy=multi-user.target
+UNIT
+}
+
+start_phantun() {
+  systemctl daemon-reload
+  systemctl enable "$FT_UNIT" > /dev/null 2>&1
+  systemctl restart "$FT_UNIT" || die "${FT_UNIT} did not start: journalctl -u ${FT_UNIT}"
 }
 
 write_client() { # <name> <ip> <private key> <psk>
@@ -358,6 +439,9 @@ cmd_list() {
 
 cmd_status() {
   [[ -f $LINK_CONF || -f $SERVER_CONF ]] || die "Nothing is installed. Run: bash game-setup.sh --help"
+  if [[ -f $FT_UNIT_FILE ]]; then
+    systemctl --no-pager status "$FT_UNIT" | head -n 3 || true
+  fi
   if [[ -f $LINK_CONF ]]; then
     systemctl --no-pager status "$LINK_UNIT" | head -n 3 || true
     awg show "$LINK_IFACE" || warn "Interface ${LINK_IFACE} is down: systemctl restart ${LINK_UNIT}"
@@ -376,7 +460,9 @@ cmd_link() { # kharej: server end of the link; the players' subnet from Iran lea
     return 0
   fi
   [[ $SUBNET_SET == 1 ]] || NET=$BRIDGE_NET
+  [[ $FAKETCP == 0 ]] || LINK_MTU=$FT_MTU
   install_awg
+  [[ $FAKETCP == 0 ]] || install_phantun
   subnet_free "$LINK_NET" || die "${LINK_NET}.0/30 is already used on this server."
   subnet_free "$NET" || die "${NET}.0/24 is already used on this server. Pick another --subnet."
   pick_port
@@ -401,13 +487,21 @@ cmd_link() { # kharej: server end of the link; the players' subnet from Iran lea
       "$(awg pubkey <<< "$ipriv")" "$psk" "$LINK_NET" "$NET"
   } > "$LINK_CONF"
   enable_forwarding
-  open_port "${PORT}/udp"
+  local proto=udp c="-m comment --comment game-setup"
+  if [[ $FAKETCP == 1 ]]; then # Iran's fake TCP on PORT is DNATed to phantun, which hands the UDP to awg-link
+    proto=tcp
+    ft_unit "/usr/local/bin/phantun_server --local ${PORT} --remote 127.0.0.1:${PORT} --tun ${FT_IFACE} --tun-local ${FT_KH}.1 --tun-peer ${FT_KH}.2 --ipv4-only" \
+      "nat PREROUTING -i ${wan} -p tcp --dport ${PORT} $c -j DNAT --to-destination ${FT_KH}.2" \
+      "filter FORWARD -i ${FT_IFACE} $c -j ACCEPT" "filter FORWARD -o ${FT_IFACE} $c -j ACCEPT"
+    start_phantun
+  fi
+  open_port "${PORT}/${proto}"
   systemctl enable --now "$LINK_UNIT" > /dev/null 2>&1 || die "${LINK_UNIT} did not start: journalctl -u ${LINK_UNIT}"
-  TOKEN=$(make_token "$ENDPOINT" "$PORT" "$(awg pubkey <<< "$kpriv")" "$ipriv" "$psk" "$NET" "$junk")
+  TOKEN=$(make_token "$ENDPOINT" "$PORT" "$(awg pubkey <<< "$kpriv")" "$ipriv" "$psk" "$NET" "$junk" "$FAKETCP")
   printf 'LINK_PORT=%q\nTOKEN=%q\n' "$PORT" "$TOKEN" > "$LINK_ENV"
   install_self
 
-  say "Link ready on ${ENDPOINT}:${PORT}/udp. Open this UDP port in the kharej provider's firewall too."
+  say "Link ready on ${ENDPOINT}:${PORT}/${proto}. Open this ${proto^^} port in the kharej provider's firewall too."
   say "Now run this on the IRAN server (the token holds Iran's key: keep it private):"
   printf '\n  bash game-setup.sh bridge --token %s\n\n' "$TOKEN"
 }
@@ -418,6 +512,22 @@ cmd_bridge() { # Iran: client end of the link + the players' server; only the pl
   read_token "$TOKEN_IN"
   install_awg
   subnet_free "$LINK_NET" || die "${LINK_NET}.0/30 is already used on this server."
+  local endpoint="${T_KH}:${T_LPORT}" lp wan wait=15 c="-m comment --comment game-setup"
+  if [[ $T_FT == 1 ]]; then # awg-link talks UDP to the local phantun client, which carries it to the kharej as fake TCP
+    LINK_MTU=$FT_MTU wait=30
+    install_phantun
+    wan=$(wan_iface)
+    [[ -n $wan ]] || die "No default IPv4 route found."
+    lp=$(shuf -i 20000-60000 -n 1)
+    while port_busy "$lp"; do lp=$(shuf -i 20000-60000 -n 1); done
+    ft_unit "/usr/local/bin/phantun_client --local 127.0.0.1:${lp} --remote ${T_KH}:${T_LPORT} --tun ${FT_IFACE} --tun-local ${FT_IR}.1 --tun-peer ${FT_IR}.2 --ipv4-only" \
+      "nat POSTROUTING -s ${FT_IR}.2 -o ${wan} $c -j MASQUERADE" \
+      "filter FORWARD -i ${FT_IFACE} $c -j ACCEPT" "filter FORWARD -o ${FT_IFACE} $c -j ACCEPT"
+    enable_forwarding
+    start_phantun
+    endpoint="127.0.0.1:${lp}"
+    say "Fake TCP to ${T_KH}:${T_LPORT}/tcp (phantun, local UDP ${lp})"
+  fi
 
   say "Writing ${LINK_CONF} (to ${T_KH}:${T_LPORT})"
   umask 077
@@ -431,14 +541,14 @@ cmd_bridge() { # Iran: client end of the link + the players' server; only the pl
     printf 'PostUp = ip rule add from %s.0/24 to %s.0/24 lookup main priority %s; ip rule add from %s.0/24 lookup %s priority %s\n' \
       "$NET" "$NET" "$((p - 1))" "$NET" "$p" "$p"
     printf 'PostDown = ip rule del priority %s; ip rule del priority %s; ip route flush table %s\n' "$p" "$((p - 1))" "$p"
-    printf '\n[Peer]\nPublicKey = %s\nPresharedKey = %s\nEndpoint = %s:%s\nAllowedIPs = 0.0.0.0/0\nPersistentKeepalive = 25\n' \
-      "$T_KPUB" "$T_PSK" "$T_KH" "$T_LPORT"
+    printf '\n[Peer]\nPublicKey = %s\nPresharedKey = %s\nEndpoint = %s\nAllowedIPs = 0.0.0.0/0\nPersistentKeepalive = 25\n' \
+      "$T_KPUB" "$T_PSK" "$endpoint"
   } > "$LINK_CONF"
   enable_forwarding
   systemctl enable --now "$LINK_UNIT" > /dev/null 2>&1 || die "${LINK_UNIT} did not start: journalctl -u ${LINK_UNIT}"
 
   say "Waiting for the link handshake with the kharej"
-  for _ in $(seq 15); do
+  for _ in $(seq "$wait"); do
     hs=$(awg show "$LINK_IFACE" latest-handshakes | awk '{print $2}')
     [[ ${hs:-0} != 0 ]] && break
     sleep 1
@@ -446,7 +556,13 @@ cmd_bridge() { # Iran: client end of the link + the players' server; only the pl
   if [[ ${hs:-0} != 0 ]]; then
     say "Link is up."
   else
-    warn "No handshake with ${T_KH}:${T_LPORT} yet (UDP blocked on the way, or the kharej firewall)."
+    if [[ $T_FT == 1 ]]; then
+      warn "No handshake with ${T_KH}:${T_LPORT} over fake TCP yet (TCP port closed on the kharej, or filtered)."
+      warn "Logs: journalctl -u ${FT_UNIT} (both servers)"
+    else
+      warn "No handshake with ${T_KH}:${T_LPORT} yet (UDP blocked on the way, or the kharej firewall)."
+      warn "If UDP is blocked: gamectl uninstall on both servers, then on the kharej: bash game-setup.sh link --faketcp"
+    fi
     warn "Players can connect, but get no internet until it works. Check: gamectl status"
   fi
 
@@ -466,9 +582,12 @@ cmd_uninstall() {
   # PostDown removes the NAT, forward and routing rules
   systemctl disable --now "$UNIT" > /dev/null 2>&1 || true
   systemctl disable --now "$LINK_UNIT" > /dev/null 2>&1 || true
+  systemctl disable --now "$FT_UNIT" > /dev/null 2>&1 || true # ExecStopPost removes its NAT rules
   [[ -n $PORT ]] && close_port "${PORT}/udp"
-  [[ -n $LINK_PORT ]] && close_port "${LINK_PORT}/udp"
+  [[ -n $LINK_PORT ]] && close_port "${LINK_PORT}/udp" && close_port "${LINK_PORT}/tcp"
   rm -rf "$GS_DIR" "$SERVER_CONF" "$LINK_CONF" "$SYSCTL_FILE" /usr/local/bin/gamectl /usr/local/sbin/game-setup
+  rm -f "$FT_UNIT_FILE" /usr/local/bin/phantun_client /usr/local/bin/phantun_server
+  systemctl daemon-reload
   say "Removed. The amneziawg packages and the PPA stay installed."
 }
 

@@ -13,6 +13,8 @@
 #       TCP, WS and XHTTP (no TLS, no SNI), and attaches the client to them
 #    4. makes one tunnel per BackPack transport whose route passed step 1:
 #       tcp tcpmux stealth pck kcp quic ws wsmux wss wssmux xdi
+#       plus "xray": an Xray VLESS reverse tunnel over REALITY (bpt-xray),
+#       using the panel's Xray binary on both servers
 #    5. tests every tunnel end to end, adds one panel Host per working
 #       transport (Iran IP + that tunnel's port), and serves the panel's
 #       subscription from the Iran IP (it travels through the tunnels too)
@@ -43,7 +45,8 @@ INFO_FILE="/root/backpack-tunnel-info.env"
 LOG_FILE="/var/log/backpack-setup.log"
 SUB_PY="/usr/local/lib/bpt-sub.py"
 PREFIX="bpt" # tunnel names: bpt-tcp, bpt-kcp, ...
-ALL_TRANSPORTS=(tcp tcpmux stealth pck kcp quic ws wsmux wss wssmux xdi)
+ALL_TRANSPORTS=(tcp tcpmux stealth pck kcp quic ws wsmux wss wssmux xdi xray)
+XR_SNIS=(www.microsoft.com www.apple.com www.speedtest.net dl.google.com) # REALITY targets tried from Iran
 
 XUI_SETUP_URL="${XUI_SETUP_URL:-https://raw.githubusercontent.com/FarzinNs83/my-scripts/main/3xui-setup.sh}"
 
@@ -55,6 +58,7 @@ SSH_HOST=""
 SSH_PORT=""
 IRAN_IP=""
 SUB_PORT=""
+XR_SNI=""
 CTL="/root/.ssh/bpt-%r@%h:%p"
 TEST_PID=""
 
@@ -86,7 +90,10 @@ Options:
   --iran-ip <ip>   Public IP of this server for the configs (default: the
                    address the kharej sees)
   --sub-port <n>   Subscription port on this server (default 2095)
-  -h, --help       Show this help
+  --sni <name>     REALITY target of the xray tunnel (a TLS 1.3 site this
+                   server reaches; default: the first that answers of
+                   www.microsoft.com www.apple.com www.speedtest.net dl.google.com)
+  -h, --help      Show this help
 EOF
 }
 
@@ -112,6 +119,38 @@ bp_clear() { # remove the tunnels an earlier run made
     systemctl disable --now "backpack-$n.service" > /dev/null 2>&1 || true
     rm -f "$f" "/etc/systemd/system/backpack-$n.service"
   done
+  systemctl disable --now bpt-xray.service > /dev/null 2>&1 || true
+  rm -f /etc/systemd/system/bpt-xray.service /etc/bpt-xray/config.json
+}
+
+xr_apply() { # <json>: the Xray reverse tunnel, its own unit next to the BackPack ones
+  local conf=/etc/bpt-xray/config.json out
+  install -d -m 0700 /etc/bpt-xray
+  install -m 0600 /dev/null "$conf"
+  printf '%s' "$1" > "$conf"
+  if ! out=$(/usr/local/bin/bpt-xray run -test -c "$conf" 2>&1); then
+    echo "[!] bpt-xray: config rejected: $(tail -n 3 <<< "$out")" >&2
+    rm -f "$conf"
+    return 0
+  fi
+  cat > /etc/systemd/system/bpt-xray.service <<UNIT
+[Unit]
+Description=Xray VLESS reverse tunnel over REALITY (bpt)
+After=network.target
+
+[Service]
+Type=simple
+ExecStart=/usr/local/bin/bpt-xray run -c $conf
+Restart=always
+RestartSec=3
+LimitNOFILE=1048576
+
+[Install]
+WantedBy=multi-user.target
+UNIT
+  systemctl daemon-reload
+  systemctl enable bpt-xray.service > /dev/null 2>&1
+  systemctl restart bpt-xray.service
 }
 
 bp_apply() { # <name> <toml>; same unit BackPack writes, so its menu manages it
@@ -193,7 +232,26 @@ k_download() { # <arch>...: release files into /root/BackPack
   done
 }
 
-KFUNCS=(bp_install bp_clear bp_apply pkg_install bp_arch k_prep k_probe k_download)
+k_xray() { # <arch>...: /root/BackPack/xray-<arch> (the panel's Xray, or the Xray-core release); first arch = this server
+  local a z d url="https://github.com/XTLS/Xray-core/releases/latest/download"
+  mkdir -p /root/BackPack
+  for a in "$@"; do
+    if [[ -x /usr/local/x-ui/bin/xray-linux-$a ]]; then
+      cp "/usr/local/x-ui/bin/xray-linux-$a" "/root/BackPack/xray-$a"
+      continue
+    fi
+    z="Xray-linux-$([[ $a == amd64 ]] && echo 64 || echo arm64-v8a).zip" d=/root/BackPack
+    curl -fsSL --connect-timeout 15 --speed-limit 1024 --speed-time 20 -m 300 -o "$d/$z" "$url/$z"
+    curl -fsSL --connect-timeout 15 -m 60 -o "$d/$z.dgst" "$url/$z.dgst"
+    [[ $(sed -n 's/^SHA2-256= *//p' "$d/$z.dgst") == "$(sha256sum "$d/$z" | cut -d' ' -f1)" ]] ||
+      { echo "[x] checksum mismatch for $z" >&2; return 1; }
+    python3 -c 'import sys, zipfile; open(sys.argv[2], "wb").write(zipfile.ZipFile(sys.argv[1]).read("xray"))' "$d/$z" "$d/xray-$a"
+    rm -f "$d/$z" "$d/$z.dgst"
+  done
+  install -m 0755 "/root/BackPack/xray-$1" /usr/local/bin/bpt-xray
+}
+
+KFUNCS=(bp_install bp_clear bp_apply xr_apply pkg_install bp_arch k_prep k_probe k_download k_xray)
 
 # Runs on the kharej through the 3x-ui API (same login flow as 3xui-setup.sh).
 #   prep                          -> TCP / WS / XHTTP inbounds + client; prints KEY=VALUE
@@ -581,6 +639,7 @@ parse_args() {
       --sub-port) SUB_PORT=${2:?}; shift 2 ;;
       --domain) IR_DOMAIN=${2:?}; shift 2 ;;
       --kharej-domain) KH_DOMAIN=${2:?}; shift 2 ;;
+      --sni) XR_SNI=${2:?}; shift 2 ;;
       -h | --help) usage; exit 0 ;;
       install | update | uninstall) ACTION=$1; shift ;;
       -*) die "Unknown option: $1 (see --help)" ;;
@@ -590,6 +649,7 @@ parse_args() {
   [[ -z $KH_IP || $KH_IP =~ ^[0-9]{1,3}(\.[0-9]{1,3}){3}$ ]] || die "Not an IPv4 address: $KH_IP"
   is_domain "$IR_DOMAIN" || die "Not a domain: $IR_DOMAIN"
   is_domain "$KH_DOMAIN" || die "Not a domain: $KH_DOMAIN"
+  is_domain "$XR_SNI" || die "Not a domain: $XR_SNI"
   [[ -z $SSH_HOST || $SSH_HOST =~ ^[0-9]{1,3}(\.[0-9]{1,3}){3}$ ]] || die "Not an IPv4 SSH address: $SSH_HOST"
   [[ -z $IRAN_IP || $IRAN_IP =~ ^[0-9]{1,3}(\.[0-9]{1,3}){3}$ ]] || die "Not an IPv4 address: $IRAN_IP"
   FIXED_IRAN_IP=$IRAN_IP # only a given one is saved; otherwise it is re-detected each run
@@ -754,9 +814,40 @@ install_backpack() {
   say "BackPack $(/usr/local/bin/backpack version 2> /dev/null | head -n 1)"
 }
 
+# The xray transport: the panel's Xray on both servers (copied over SSH, so Iran needs no GitHub).
+install_xray() {
+  [[ " ${TRANSPORTS[*]} " == *" xray "* ]] || return 0
+  local archs=("$KH_ARCH") s out
+  [[ $IR_ARCH == "$KH_ARCH" ]] || archs+=("$IR_ARCH")
+  kfn k_xray "${archs[@]}"
+  kh cat "/root/BackPack/xray-$IR_ARCH" > /root/BackPack/xray.new
+  install -m 0755 /root/BackPack/xray.new /usr/local/bin/bpt-xray
+  rm -f /root/BackPack/xray.new
+  say "Xray for the reverse tunnel: $(/usr/local/bin/bpt-xray version 2> /dev/null | head -n 1)"
+  if [[ -z $XR_SNI ]]; then # the REALITY target must answer TLS 1.3 from Iran: Xray forwards probes there
+    for s in "${XR_SNIS[@]}"; do
+      curl -so /dev/null -m 8 --tlsv1.3 "https://$s/" && { XR_SNI=$s; break; }
+    done
+  fi
+  if [[ -z $XR_SNI ]]; then
+    warn "None of ${XR_SNIS[*]} answers TLS 1.3 from this server: the xray tunnel is skipped (pass --sni <site>)."
+    local keep=() t
+    for t in "${TRANSPORTS[@]}"; do [[ $t == xray ]] || keep+=("$t"); done
+    TRANSPORTS=("${keep[@]}")
+    return 0
+  fi
+  if [[ -z ${XR_PRIV:-} || -z ${XR_PUB:-} ]]; then
+    out=$(/usr/local/bin/bpt-xray x25519)
+    XR_PRIV=$(awk -F': ' 'NR == 1 {print $2}' <<< "$out")
+    XR_PUB=$(awk -F': ' 'NR == 2 {print $2}' <<< "$out") # "Password (PublicKey): …" or "Public key: …"
+    [[ -n $XR_PRIV && -n $XR_PUB ]] || die "Could not make a REALITY key pair with $(/usr/local/bin/bpt-xray version | head -n 1)"
+  fi
+  say "REALITY target for the xray tunnel: $XR_SNI"
+}
+
 load_saved() {
   [[ -f $INFO_FILE ]] || return 0
-  local saved_kh cli_ip=$IRAN_IP cli_sub=$SUB_PORT cli_dom=$IR_DOMAIN cli_sp=$SSH_PORT cli_sh=$SSH_HOST
+  local saved_kh cli_ip=$IRAN_IP cli_sub=$SUB_PORT cli_dom=$IR_DOMAIN cli_sp=$SSH_PORT cli_sh=$SSH_HOST cli_sni=$XR_SNI
   saved_kh=$(sed -n 's/^KH_IP=//p' "$INFO_FILE")
   if [[ -n $KH_IP && $saved_kh != "$KH_IP" ]]; then
     warn "Saved settings are for kharej $saved_kh; starting fresh for $KH_IP."
@@ -770,6 +861,7 @@ load_saved() {
   [[ -n $cli_dom ]] && IR_DOMAIN=$cli_dom
   [[ -n $cli_sp ]] && SSH_PORT=$cli_sp
   [[ -n $cli_sh ]] && SSH_HOST=$cli_sh
+  [[ -n $cli_sni ]] && XR_SNI=$cli_sni
   # old REALITY ports (PUB_<transport>) are free again once the tunnels are rebuilt
   TAKEN+=" $(grep -E '^(TUN_|SFW_|PUB_(tcp|ws|xh)_)' "$INFO_FILE" | cut -d= -f2 | tr '\n' ' ')"
   say "Reusing the tunnel ports and subscription port from $INFO_FILE"
@@ -838,6 +930,54 @@ render() { # <server|client> <transport>
   return 0
 }
 
+# VLESS reverse (Xray-core's replacement for the removed "reverse" object): the
+# kharej's outbound registers the tunnel at Iran's REALITY inbound; Iran's
+# dokodemo ports are routed into it and the kharej sends them to 127.0.0.1 only.
+render_xray() { # <server|client>
+  local h id sid k v x pubs="" locals=""
+  h=$(token_for xray-id)
+  id="${h:0:8}-${h:8:4}-${h:12:4}-${h:16:4}-${h:20:12}"
+  sid=$(token_for xray-sid | cut -c1-16)
+  if [[ $1 == client ]]; then
+    for k in "${KINDS[@]}"; do v="XP_$k" locals+="${!v},"; done
+    cat <<JSON
+{"log": {"loglevel": "warning"},
+ "outbounds": [
+  {"tag": "block", "protocol": "blackhole"},
+  {"tag": "bpt-local", "protocol": "freedom"},
+  {"tag": "bpt-tunnel", "protocol": "vless",
+   "settings": {"address": "$IRAN_IP", "port": $TUN_xray, "id": "$id", "flow": "xtls-rprx-vision",
+                "encryption": "none", "reverse": {"tag": "bpt-rev"}},
+   "streamSettings": {"network": "tcp", "security": "reality",
+                      "realitySettings": {"serverName": "$XR_SNI", "fingerprint": "chrome", "publicKey": "$XR_PUB",
+                                          "shortId": "$sid", "spiderX": "/"}}}],
+ "routing": {"rules": [
+  {"type": "field", "inboundTag": ["bpt-rev"], "ip": ["127.0.0.1"], "port": "$locals$KSUB_PORT", "outboundTag": "bpt-local"}]}}
+JSON
+    return 0
+  fi
+  for k in "${KINDS[@]}"; do
+    v="PUB_${k}_xray" x="XP_$k"
+    pubs+="  {\"tag\": \"bpt-pub-$k\", \"listen\": \"0.0.0.0\", \"port\": ${!v}, \"protocol\": \"dokodemo-door\",
+   \"settings\": {\"address\": \"127.0.0.1\", \"port\": ${!x}, \"network\": \"tcp\"}},
+"
+  done
+  cat <<JSON
+{"log": {"loglevel": "warning"},
+ "inbounds": [
+  {"tag": "bpt-in", "listen": "0.0.0.0", "port": $TUN_xray, "protocol": "vless",
+   "settings": {"clients": [{"id": "$id", "flow": "xtls-rprx-vision", "reverse": {"tag": "bpt-rev"}}], "decryption": "none"},
+   "streamSettings": {"network": "tcp", "security": "reality",
+                      "realitySettings": {"target": "$XR_SNI:443", "serverNames": ["$XR_SNI"],
+                                          "privateKey": "$XR_PRIV", "shortIds": ["$sid"]}}},
+$pubs  {"tag": "bpt-pub-sub", "listen": "127.0.0.1", "port": $SFW_xray, "protocol": "dokodemo-door",
+   "settings": {"address": "127.0.0.1", "port": $KSUB_PORT, "network": "tcp"}}],
+ "outbounds": [{"tag": "block", "protocol": "blackhole"}],
+ "routing": {"rules": [
+  {"type": "field", "inboundTag": ["bpt-pub-tcp", "bpt-pub-ws", "bpt-pub-xh", "bpt-pub-sub"], "outboundTag": "bpt-rev"}]}}
+JSON
+}
+
 setup_tunnels() {
   say "Step 4: tunnels (${TRANSPORTS[*]})"
   command -v iptables > /dev/null 2>&1 || warn "iptables is missing on Iran: pck will be unreliable."
@@ -858,8 +998,13 @@ setup_tunnels() {
       xdi) ;;
       *) open_port "${!tun_var}" tcp ;;
     esac
-    bp_apply "$PREFIX-$t" "$(render server "$t")"
-    kfn bp_apply "$PREFIX-$t" "$(render client "$t")"
+    if [[ $t == xray ]]; then
+      xr_apply "$(render_xray server)"
+      kfn xr_apply "$(render_xray client)"
+    else
+      bp_apply "$PREFIX-$t" "$(render server "$t")"
+      kfn bp_apply "$PREFIX-$t" "$(render client "$t")"
+    fi
   done
 }
 
@@ -962,6 +1107,7 @@ write_info() {
     printf 'KH_IP=%s\nTOKEN_BASE=%s\nSUB_PORT=%s\n' "$KH_IP" "$TOKEN_BASE" "${SUB_PORT:-}"
     printf 'SSH_PORT=%s\nSSH_HOST=%s\nIR_DOMAIN=%s\nFIXED_IRAN_IP=%s\n' "$SSH_PORT" "$SSH_HOST" "$IR_DOMAIN" "$FIXED_IRAN_IP"
     printf 'SUB_URL=%q\nPANEL_SUB_URL=%q\n' "${SUB_URL:-}" "${PANEL_SUB_URL:-}"
+    printf 'XR_SNI=%s\nXR_PRIV=%s\nXR_PUB=%s\n' "$XR_SNI" "${XR_PRIV:-}" "${XR_PUB:-}"
     for t in "${ALL_TRANSPORTS[@]}"; do
       for v in "TUN_$t" "SFW_$t" "PUB_tcp_$t" "PUB_ws_$t" "PUB_xh_$t"; do
         [[ -n ${!v:-} ]] && printf '%s=%s\n' "$v" "${!v}"
@@ -1007,6 +1153,7 @@ print_summary() {
     warn "No link passed the end-to-end test. Logs: journalctl -u backpack-$PREFIX-tcp -n 50 (on both servers)"
   fi
   printf '\n Settings: %s   Manage tunnels: backpack tunnel list, sudo backpack\n' "$INFO_FILE"
+  printf ' xray tunnel: systemctl status bpt-xray, journalctl -u bpt-xray (both servers)\n'
   printf ' Open the user ports (TCP) and tunnel ports (TCP, UDP for kcp/quic)\n'
   printf ' in the Iran provider firewall too. A FAIL link may still come up;\n'
   printf ' run the update to retest and refresh the panel Hosts.\n'
@@ -1027,6 +1174,7 @@ do_install() { # install, or update: newest BackPack, configs added since, every
   ADDR=${IR_DOMAIN:-$IRAN_IP}
   [[ $XUI == 1 ]] || install_xui
   install_backpack
+  install_xray
   setup_panel
   setup_tunnels
   write_info
@@ -1052,6 +1200,8 @@ do_uninstall() {
     say "Panel: $(kv REMOVED "$(kpanel remove)") BackPack inbound(s) and their Hosts removed (clients keep their other inbounds)"
   fi
   kfn bp_clear
+  rm -f /usr/local/bin/bpt-xray
+  kh rm -f /usr/local/bin/bpt-xray
   rm -f "$INFO_FILE" # last, so a failed run can be repeated
   say "Done. BackPack and 3x-ui stay installed (sudo backpack -> Uninstall removes BackPack)."
 }

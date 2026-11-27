@@ -151,8 +151,10 @@ once, or uses your SSH key) and sets up both servers:
    or creates one.
 4. Makes one tunnel per BackPack transport, named `bpt-<transport>`, using
    BackPack's `turbo` preset: `tcp tcpmux stealth pck kcp quic ws wsmux wss
-   wssmux xdi`. Each tunnel forwards three Iran ports, one per inbound, so
-   there are up to 33 links (11 transports x TCP / WS / XHTTP).
+   wssmux xdi`, plus `xray`: an Xray-core VLESS reverse tunnel over REALITY
+   (service `bpt-xray`, the panel's Xray binary on both servers). Each tunnel
+   forwards three Iran ports, one per inbound, so there are up to 36 links
+   (12 transports x TCP / WS / XHTTP).
 5. Waits for each tunnel to connect, then tests every link with a real VLESS
    client through its Iran port to the internet. Each passing link gets a
    3x-ui Host, named like `🎒 BP kcp · WS`. The panel's subscription is
@@ -188,6 +190,7 @@ its place, so clients only refresh the subscription.
 | `--ssh-host <ip>` | SSH management address through a relay; the kharej IP stays unchanged |
 | `--iran-ip <ip>` | Iran IP for the configs (default: the address the kharej sees) |
 | `--sub-port <n>` | Subscription port on Iran (default 2095) |
+| `--sni <name>` | REALITY target of the `xray` tunnel. It must answer TLS 1.3 from Iran. Default: the first of `www.microsoft.com www.apple.com www.speedtest.net dl.google.com` that does; when none does, `xray` is skipped |
 
 If Iran cannot reach the kharej's SSH port, start a temporary management
 relay on the **kharej** (leave it running until setup finishes):
@@ -228,6 +231,14 @@ directly and keeps running without it.
   same Iran configs.
 - The tunnels use BackPack's own unit names (`backpack-bpt-*.service`), so
   `sudo backpack` shows and manages them.
+- The `xray` tunnel is VLESS reverse (`reverse` on the VLESS client and
+  outbound; Xray-core removed the old top-level `reverse` object). The kharej
+  dials Iran's REALITY inbound with Vision, so the international hop looks
+  like TLS 1.3 to the `--sni` site. Iran's user ports are routed into it, and
+  the kharej forwards only to the panel's loopback inbounds and
+  subscription. The panel's Xray must support VLESS reverse; if it is too
+  old, `xray` shows "did not connect" (update Xray in the panel, then run the
+  update). Logs: `journalctl -u bpt-xray` on both servers.
 - The `udp` transport is left out because it carries UDP only. The
   experimental Naive / XHTTP / REALITY helpers are left out because they need
   a source build.
@@ -308,6 +319,18 @@ gamectl add ali
 - `bridge` waits for the link handshake and warns if it does not come
   (UDP blocked on the way, or the kharej firewall). `gamectl status` shows
   both tunnels.
+- When UDP between the servers is blocked or throttled, run
+  `bash game-setup.sh link --faketcp` on the kharej instead. The link's UDP
+  then travels as fake TCP ([phantun](https://github.com/dndx/phantun)
+  v0.8.1, unit `game-phantun`): same port number, but **TCP** must be open on
+  the kharej. The token tells `bridge` to use it, so the Iran command does
+  not change. Phantun adds only a 20-byte TCP header with no retransmits or
+  extra encryption, so the ping stays close to plain UDP. The link MTU is
+  1400 on both ends. The zip is checked against a pinned sha256; Iran tries
+  GitHub, then the ghfast.top mirror, then `/root/phantun_<arch>-unknown-linux-musl.zip`
+  if you copied it there. x86_64 and aarch64 only. To switch an existing link,
+  run `gamectl uninstall` on both servers and set it up again (players get new
+  configs).
 - Iran needs the amneziawg package as well. When Launchpad is filtered
   there, set an apt/https proxy for the install step.
 - Compare the ping with the direct layout, because the Iran route is not
