@@ -823,7 +823,7 @@ install_xray() {
   kh cat "/root/BackPack/xray-$IR_ARCH" > /root/BackPack/xray.new
   install -m 0755 /root/BackPack/xray.new /usr/local/bin/bpt-xray
   rm -f /root/BackPack/xray.new
-  say "Xray for the reverse tunnel: $(/usr/local/bin/bpt-xray version 2> /dev/null | head -n 1)"
+  say "Xray for the reverse tunnel: $(/usr/local/bin/bpt-xray version 2> /dev/null | sed -n 1p)"
   if [[ -z $XR_SNI ]]; then # the REALITY target must answer TLS 1.3 from Iran: Xray forwards probes there
     for s in "${XR_SNIS[@]}"; do
       curl -so /dev/null -m 8 --tlsv1.3 "https://$s/" && { XR_SNI=$s; break; }
@@ -840,7 +840,7 @@ install_xray() {
     out=$(/usr/local/bin/bpt-xray x25519)
     XR_PRIV=$(awk -F': ' 'NR == 1 {print $2}' <<< "$out")
     XR_PUB=$(awk -F': ' 'NR == 2 {print $2}' <<< "$out") # "Password (PublicKey): …" or "Public key: …"
-    [[ -n $XR_PRIV && -n $XR_PUB ]] || die "Could not make a REALITY key pair with $(/usr/local/bin/bpt-xray version | head -n 1)"
+    [[ -n $XR_PRIV && -n $XR_PUB ]] || die "Could not make a REALITY key pair with $(/usr/local/bin/bpt-xray version 2> /dev/null | sed -n 1p)"
   fi
   say "REALITY target for the xray tunnel: $XR_SNI"
 }
@@ -933,6 +933,8 @@ render() { # <server|client> <transport>
 # VLESS reverse (Xray-core's replacement for the removed "reverse" object): the
 # kharej's outbound registers the tunnel at Iran's REALITY inbound; Iran's
 # dokodemo ports are routed into it and the kharej sends them to 127.0.0.1 only.
+# Freedom blocks every target of reverse traffic by default (it holds the
+# connection 30-90 s), so the kharej's freedom needs an explicit "firewall" allow.
 render_xray() { # <server|client>
   local h id sid k v x pubs="" locals=""
   h=$(token_for xray-id)
@@ -944,7 +946,8 @@ render_xray() { # <server|client>
 {"log": {"loglevel": "warning"},
  "outbounds": [
   {"tag": "block", "protocol": "blackhole"},
-  {"tag": "bpt-local", "protocol": "freedom"},
+  {"tag": "bpt-local", "protocol": "freedom", "settings": {"firewall": [
+   {"action": "allow", "network": "tcp", "ip": ["127.0.0.1/32"], "port": "$locals$KSUB_PORT"}]}},
   {"tag": "bpt-tunnel", "protocol": "vless",
    "settings": {"address": "$IRAN_IP", "port": $TUN_xray, "id": "$id", "flow": "xtls-rprx-vision",
                 "encryption": "none", "reverse": {"tag": "bpt-rev"}},

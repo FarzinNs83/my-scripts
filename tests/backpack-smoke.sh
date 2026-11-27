@@ -29,5 +29,7 @@ assert s["inbounds"][0]["streamSettings"]["realitySettings"]["shortIds"] == [c["
 assert {(i["port"], i["settings"]["port"]) for i in s["inbounds"][1:]} == {(2101, 20443), (2102, 20450), (2103, 20457), (4211, 2096)}
 assert set(s["routing"]["rules"][0]["inboundTag"]) == {i["tag"] for i in s["inbounds"][1:]}
 assert c["routing"]["rules"][0]["port"] == "20443,20450,20457,2096" and c["outbounds"][0]["protocol"] == "blackhole"
+# reverse traffic is blocked by freedom unless allowed explicitly
+assert c["outbounds"][1]["settings"]["firewall"] == [{"action": "allow", "network": "tcp", "ip": ["127.0.0.1/32"], "port": "20443,20450,20457,2096"}]
 PY
 echo 'Bash argument and empty-state checks passed'
