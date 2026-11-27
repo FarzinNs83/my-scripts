@@ -263,6 +263,12 @@ gamectl list          # players, IPs, last handshake
 gamectl show ali | remove ali | status | uninstall
 ```
 
+The installer asks for a **required domain** (for example `game.example.com`)
+and whether to enable download links. Its DNS A record must point to the
+player server (Iran in the bridge layout); use DNS-only mode, without a CDN
+proxy. Remove an incorrect AAAA record. For unattended installs, pass
+`--domain game.example.com`, and optionally `--download`.
+
 - Installs `amneziawg` from the Amnezia PPA (Ubuntu, or Debian through the
   `focal` suite) and builds the kernel module with DKMS. It needs a KVM or
   dedicated VPS with the distribution kernel and its headers (not
@@ -271,15 +277,37 @@ gamectl show ali | remove ali | status | uninstall
   It uses its own interface (`awg-game`), subnet (`10.66.66.0/24`,
   `--subnet`) and unit (`awg-quick@awg-game`), plus its own NAT rules,
   tagged `game-setup`. The UDP port is a random free port from 20000-60000
-  unless you pass `--port`, and a port in use is refused.
+  unless you pass `--port`, and a port in use is refused. Ports 80 and 443
+  are reserved for your other services and rejected even with `--port`.
 - Opens the UDP port in ufw/firewalld when active. Open it in your
   provider's firewall too.
 - Players use AmneziaVPN or AmneziaWG: import
   `/etc/game-setup/clients/<name>.conf` or scan the QR code. Client MTU is
   1280, all IPv4 traffic goes through the tunnel, and DNS is
-  `1.1.1.1, 8.8.8.8` (`--dns`).
-- `--endpoint game.example.com` puts a domain in the player configs
-  instead of the detected public IPv4.
+  `1.1.1.1, 8.8.8.8` (`--dns`). IPv6 is captured and dropped because this
+  server only provides IPv4 egress; clients fall back to IPv4. TCP MSS is
+  capped to the player MTU in both directions for HTTPS/downloads.
+- `--domain game.example.com` (`--endpoint` also works) uses that domain in
+  every player's `Endpoint`, instead of the server's raw IP.
+- With `--download`, `add` and `show` also print an HTTPS download link.
+  The **same required domain** is used for the config and download URL.
+  Links expire after exactly 24 hours; `gamectl download ali` issues a new
+  link and revokes the previous one. Removing a player revokes downloads
+  too. Expiry affects only the link, not the player's VPN access.
+- Downloads run separately in `game-download.service` using Python's
+  standard library, on a random free TCP port printed at setup. Open it in
+  the provider firewall. Neither downloads nor certbot bind 80 or 443;
+  certificate validation has a separate free port from downloads. Certbot
+  gets a Let's Encrypt certificate by temporarily forwarding incoming
+  TCP/80 to that validation port (also open TCP/80 at the provider). The
+  forward is removed after issuance/renewal, including failed validation;
+  preparing it again does not add duplicates. Existing services keep
+  running, but their HTTP traffic on port 80 is diverted during validation.
+  There is no forward on 443. A valid existing certificate is reused without
+  setting up a forward. Nginx configs stay untouched.
+  Certificates are reloaded for new connections. Download tokens are
+  random, stored as hashes, checked on every request, and omitted from
+  access logs. Keep the links private: they allow downloading a private key.
 
 ### Through the Iran server
 
@@ -299,7 +327,7 @@ Each leg is encrypted once.
 # 1. on the kharej: the link's server end; prints a one-line token
 bash game-setup.sh link
 # 2. on the Iran server (copy the script over if Iran cannot reach GitHub)
-bash game-setup.sh bridge --token <token>
+bash game-setup.sh bridge --token <token> --domain game.example.com --download
 # 3. players are managed on Iran from now on
 gamectl add ali
 ```
@@ -315,26 +343,63 @@ gamectl add ali
 - On Iran, policy routing (table and rule priority `6767`) sends only the
   players' subnet into the link. The Iran server's own traffic and
   BackPack keep the normal route. Iran does no NAT: if the link is down,
-  players get no internet rather than leaking out of Iran.
+  a forwarding guard blocks traffic that would leave outside `awg-link`
+  (except traffic within the player subnet), even if another routing rule
+  overrides the tunnel. Players get no internet rather than Iran egress.
 - `bridge` waits for the link handshake and warns if it does not come
   (UDP blocked on the way, or the kharej firewall). `gamectl status` shows
   both tunnels.
-- When UDP between the servers is blocked or throttled, run
-  `bash game-setup.sh link --faketcp` on the kharej instead. The link's UDP
-  then travels as fake TCP ([phantun](https://github.com/dndx/phantun)
-  v0.8.1, unit `game-phantun`): same port number, but **TCP** must be open on
-  the kharej. The token tells `bridge` to use it, so the Iran command does
-  not change. Phantun adds only a 20-byte TCP header with no retransmits or
-  extra encryption, so the ping stays close to plain UDP. The link MTU is
-  1400 on both ends. The zip is checked against a pinned sha256; Iran tries
-  GitHub, then the ghfast.top mirror, then `/root/phantun_<arch>-unknown-linux-musl.zip`
-  if you copied it there. x86_64 and aarch64 only. To switch an existing link,
-  run `gamectl uninstall` on both servers and set it up again (players get new
-  configs).
+- The link has two routes on the same port number: UDP, and fake TCP
+  ([phantun](https://github.com/dndx/phantun) v0.8.1, unit `game-phantun`)
+  for when UDP between the servers is blocked or throttled. The kharej takes
+  both all the time, so open the port for **UDP and TCP** there. Iran starts
+  on UDP (`link --faketcp` makes it start on fake TCP) and switches with:
+
+  ```bash
+  gamectl mode            # which route is in use
+  gamectl mode faketcp    # or: gamectl mode udp
+  ```
+
+  Switching keeps the session, so players stay connected and their configs
+  do not change. Phantun adds only a 20-byte TCP header with no retransmits
+  or extra encryption, so the ping stays close to plain UDP (tested: 229 ms
+  UDP, 237 ms fake TCP on a 228 ms route). The link MTU is 1400 on both ends,
+  which fits both routes. The zip is checked against a pinned sha256; Iran
+  tries GitHub, then the ghfast.top mirror, then
+  `/root/phantun_<arch>-unknown-linux-musl.zip` if you copied it there.
+  x86_64 and aarch64 only; elsewhere the link is UDP only. A link set up by an
+  older version has no switch: run `gamectl uninstall` on both servers and
+  set it up again (players get new configs).
 - Iran needs the amneziawg package as well. When Launchpad is filtered
   there, set an apt/https proxy for the install step.
 - Compare the ping with the direct layout, because the Iran route is not
   faster on every ISP. `gamectl uninstall` on each server removes its side.
+
+### Repair an existing installation
+
+Copy the updated `game-setup.sh` to both machines. On the kharej, run
+`bash game-setup.sh repair`; on Iran, run:
+
+```bash
+bash game-setup.sh repair --domain game.example.com --download
+gamectl show ali       # re-import the updated config on the client
+gamectl download ali   # a fresh 24-hour download link
+gamectl status
+```
+
+Repair keeps player/server keys and addresses, backs up the server config
+as `.conf.bak`, replaces its own firewall hooks and restarts the affected
+interfaces (a brief interruption). Clients need the updated config to get
+the domain and IPv6 capture. A failed interface start restores the previous
+server config. The download service and its links are removed on uninstall;
+certbot and certificates remain installed.
+
+`status` prints the route selected for a player address, plus the public IP
+and country reached by HTTPS sourced from the player subnet. On Iran, the
+route should use `awg-link` and the exit country should be outside Iran.
+This checks server-side egress; also verify the IP on the connected client
+and disable client app/site exclusions if it still exits locally. A
+handshake alone does not prove internet connectivity or Epic availability.
 
 ## dns-setup.sh
 
